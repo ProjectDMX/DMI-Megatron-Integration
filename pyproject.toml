@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77.0.3,<81.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "DMI-Megatron-Integration"
+version = "0.17.1"
+description = "DMI integration for Megatron-LM core_v0.17.1"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "ProjectDMX"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "DMI>=1.2.0,<2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ProjectDMX/DMI-Megatron-Integration"
+Repository = "https://github.com/ProjectDMX/DMI-Megatron-Integration"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["dmi_megatron_integration*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

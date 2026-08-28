@@ -1,0 +1,8 @@
+include LICENSE
+include NOTICE
+include README.md
+recursive-include examples *.md *.py *.txt
+recursive-include tests *.json *.py *.sh
+recursive-include tools *.md *.patch *.py *.sh *.txt LICENSE
+prune third_party
+global-exclude __pycache__ *.py[cod]
