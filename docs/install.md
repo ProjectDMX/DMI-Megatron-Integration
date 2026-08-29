@@ -67,16 +67,34 @@ NVTE_FRAMEWORK=pytorch python -m pip install --no-build-isolation \
 
 The source build requires Git, CMake, Ninja, a compatible C++ compiler, pybind11, the CUDA toolkit, cuDNN, and NVCC. Refer to Transformer Engine's source installation requirements at the revision selected by the fork when those prerequisites are not already available.
 
-## Install the fork and integration
+## Install the pinned fork
 
-Install the pinned fork with its training dependencies, then install this integration. Installing the integration resolves its declared DMI requirement, `DMI>=1.2.0,<2.0`:
+Install the pinned fork with its training dependencies:
 
 ```bash
 python -m pip install -e "third_party/megatron-lm[training]"
-python -m pip install -e .
 ```
 
-Installing Transformer Engine or the Megatron packages does not require rebuilding DMI unless the installation changes the active PyTorch or CUDA ABI.
+## Build or install DMI
+
+Finalize the PyTorch, CUDA, Transformer Engine, and Megatron dependency versions before building DMI's native extension. When using a DMI source checkout, complete its core installation in this environment after installing the framework dependencies above.
+
+If a later package installation upgrades or replaces PyTorch or its NVIDIA CUDA runtime packages, or if the CUDA toolkit used for compilation changes, rebuild the native extension from the DMI source root:
+
+```bash
+make -C native clean
+make -C native -j
+```
+
+Installing Megatron or Transformer Engine does not by itself require rebuilding DMI when the active PyTorch and CUDA ABI remains unchanged.
+
+## Install the integration
+
+Install this integration after DMI. If a compatible DMI package is not already installed, this command resolves the declared requirement `DMI>=1.2.0,<2.0`:
+
+```bash
+python -m pip install -e .
+```
 
 ## Verify the installation
 
