@@ -817,6 +817,63 @@ def test_explicit_config_overrides_cli_and_env():
     assert cfg is explicit
 
 
+@pytest.mark.parametrize("value,expected", [("0", False), ("false", False), ("1", True), ("true", True)])
+def test_window_boolean_environment_and_cli_precedence(value, expected):
+    env = {"DMI_RECURRING_D2H_WINDOWS": value, "DMI_D2H_WINDOW_DEBUG": value}
+    cfg = resolve_megatron_dmi_config(environ=env)
+    assert cfg.recurring_d2h_windows_enabled is expected
+    assert cfg.d2h_window_debug is expected
+    cli = SimpleNamespace(dmi_recurring_d2h_windows=not expected, dmi_d2h_window_debug=not expected)
+    cfg = resolve_megatron_dmi_config(cli, environ=env)
+    assert cfg.recurring_d2h_windows_enabled is (not expected)
+    assert cfg.d2h_window_debug is (not expected)
+    explicit = MegatronDMIConfig()
+    assert resolve_megatron_dmi_config(cli, environ=env, explicit=explicit) is explicit
+
+
+def test_window_defaults_and_numeric_precedence():
+    cfg = resolve_megatron_dmi_config(environ={})
+    assert not cfg.recurring_d2h_windows_enabled and not cfg.d2h_window_debug
+    fields = {
+        "d2h_window_timing_revalidation_retry_interval_occurrences": 4,
+        "d2h_window_minimum_record_probe_retry_interval_occurrences": 4,
+        "d2h_window_capacity_flush_fallback_threshold": 3,
+        "d2h_window_capacity_flush_count_reset_interval_periods": 32,
+    }
+    for field, default in fields.items():
+        assert getattr(cfg, field) == default
+    env = {"DMI_" + field.upper(): "7" for field in fields}
+    from_env = resolve_megatron_dmi_config(environ=env)
+    from_cli = resolve_megatron_dmi_config(
+        SimpleNamespace(**{"dmi_" + field: 9 for field in fields}), environ=env,
+    )
+    for field in fields:
+        assert getattr(from_env, field) == 7
+        assert getattr(from_cli, field) == 9
+
+
+def test_default_builder_wires_window_config_and_record_mode(monkeypatch):
+    from dmi_megatron_integration import startup
+
+    engines = []
+    monkeypatch.setattr(startup, "MonitoringEngine", lambda **kw: engines.append(kw) or kw)
+    cfg = MegatronDMIConfig(
+        recurring_d2h_windows_enabled=True, d2h_window_debug=True,
+        d2h_window_timing_revalidation_retry_interval_occurrences=6,
+        d2h_window_minimum_record_probe_retry_interval_occurrences=7,
+        d2h_window_capacity_flush_fallback_threshold=8,
+        d2h_window_capacity_flush_count_reset_interval_periods=9,
+    )
+    startup._build_engine(cfg, "test", None)
+    assert engines[0]["record_mode_v1"] is True
+    windows = engines[0]["ring_config"].recurring_d2h_windows
+    assert windows.enabled and windows.debug_enabled
+    assert windows.timing_revalidation_retry_interval_occurrences == 6
+    assert windows.minimum_record_probe_retry_interval_occurrences == 7
+    assert windows.capacity_flush_fallback_threshold == 8
+    assert windows.capacity_flush_count_reset_interval_periods == 9
+
+
 def test_resolve_model_id_generates_and_broadcasts():
     dist = FakeDist(rank=0)
     seen = []
@@ -931,7 +988,8 @@ def test_setup_writes_frozen_ep_topology_manifest(tmp_path):
         handle.close()
 
 
-def test_setup_enabled_builds_runtime_and_attaches_model():
+@pytest.mark.parametrize("pp,windows", [(1, False), (1, True), (2, False), (2, True)])
+def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows):
     model = [TinyModel()]
     runtime_contexts = []
 
@@ -953,23 +1011,35 @@ def test_setup_enabled_builds_runtime_and_attaches_model():
         enabled=True,
         model_id="run",
         dataset_provenance_mode=CONSTANT_PROVENANCE,
+        recurring_d2h_windows_enabled=windows,
     )
-    args = SimpleNamespace(global_batch_size=8, micro_batch_size=2)
+    args = SimpleNamespace(global_batch_size=8, micro_batch_size=2, pipeline_model_parallel_size=pp)
+    factory_configs = []
+
+    def engine_factory(config, model_id, record_format, rank):
+        factory_configs.append(config)
+        return _fake_engine_factory(config, model_id, record_format, rank)
+
     handle = setup_megatron_dmi(
         model,
         args=args,
         model_config=SimpleNamespace(num_moe_experts=4),
         explicit_config=cfg,
-        parallel_state_module=FakeParallelState(dp_world=2, vp_world=3),
+        parallel_state_module=FakeParallelState(dp_world=2, vp_world=3, pp_world=pp),
         dist_module=FakeDist(initialized=False),
         unwrap_fn=lambda x: x,
-        engine_factory=_fake_engine_factory,
+        engine_factory=engine_factory,
         runtime_factory=runtime_factory,
         adaptor_cls=FakeAdaptor,
         device="cpu",
     )
 
     assert handle is not None
+    assert cfg.recurring_d2h_windows_enabled is windows
+    assert handle.config.recurring_d2h_windows_enabled is (windows and pp > 1)
+    assert factory_configs[0].recurring_d2h_windows_enabled is (windows and pp > 1)
+    assert handle.schedule_runtime._d2h_windows_enabled is (windows and pp > 1)
+    assert not handle.schedule_runtime.d2h_windows_active  # Lazy definition.
     assert handle.model_id == "run"
     assert get_active_megatron_schedule_runtime() is handle.schedule_runtime
     assert handle.current_phase_tensor.device.type == "cpu"
@@ -983,8 +1053,10 @@ def test_setup_enabled_builds_runtime_and_attaches_model():
     assert adaptor.dims[DimSpec.NUM_EXPERTS] == 4
     attach_kwargs = adaptor.attach_calls[0]
     assert attach_kwargs["model_hooks"] == []
-    assert len(attach_kwargs["iteration_hooks"]) == 1
-    assert attach_kwargs["iteration_hooks"][0].hook.spec.name == "iteration_attempt_status"
+    # Attempt status is emitted only by the last pipeline stage.
+    assert len(attach_kwargs["iteration_hooks"]) == (1 if pp == 1 else 0)
+    if pp == 1:
+        assert attach_kwargs["iteration_hooks"][0].hook.spec.name == "iteration_attempt_status"
     assert attach_kwargs["metadata_context"] is runtime_contexts[0]
     assert attach_kwargs["current_phase_tensor"] is handle.current_phase_tensor
     assert not hasattr(model[0], "dmi_lm_per_sample_loss")

@@ -83,6 +83,12 @@ class MegatronDMIConfig:
     ring_payload_mb: int = 4096
     ring_pinned_mb: int = 4096
     ring_task_entries: int = 65536
+    recurring_d2h_windows_enabled: bool = False
+    d2h_window_minimum_record_probe_retry_interval_occurrences: int = 4
+    d2h_window_timing_revalidation_retry_interval_occurrences: int = 4
+    d2h_window_capacity_flush_fallback_threshold: int = 3
+    d2h_window_capacity_flush_count_reset_interval_periods: int = 32
+    d2h_window_debug: bool = False
     drain_flush_payload_ratio: float = 0.0
     drain_flush_task_ratio: float = 0.0
     drain_flush_byte_threshold: int = 0
@@ -236,6 +242,8 @@ def resolve_megatron_dmi_config(
     environ = os.environ if environ is None else environ
     cli_enabled = getattr(args, "dmi_enable", None) if args is not None else None
     env_enabled = _env_bool(environ, "DMI_ENABLE")
+    cli_windows = getattr(args, "dmi_recurring_d2h_windows", None)
+    cli_window_debug = getattr(args, "dmi_d2h_window_debug", None)
     cfg = MegatronDMIConfig(
         enabled=bool(cli_enabled if cli_enabled is not None else (env_enabled or False)),
         exact_resume=bool(getattr(args, "dmi_exact_resume", False)),
@@ -289,6 +297,30 @@ def resolve_megatron_dmi_config(
         ),
         ring_task_entries=int(
             _env_value(args, "dmi_ring_task_entries", environ, "DMI_RING_TASK_ENTRIES", 65536, int)
+        ),
+        recurring_d2h_windows_enabled=bool(
+            cli_windows if cli_windows is not None
+            else (_env_bool(environ, "DMI_RECURRING_D2H_WINDOWS") or False)
+        ),
+        d2h_window_minimum_record_probe_retry_interval_occurrences=_env_value(
+            args, "dmi_d2h_window_minimum_record_probe_retry_interval_occurrences", environ,
+            "DMI_D2H_WINDOW_MINIMUM_RECORD_PROBE_RETRY_INTERVAL_OCCURRENCES", 4, int,
+        ),
+        d2h_window_timing_revalidation_retry_interval_occurrences=_env_value(
+            args, "dmi_d2h_window_timing_revalidation_retry_interval_occurrences", environ,
+            "DMI_D2H_WINDOW_TIMING_REVALIDATION_RETRY_INTERVAL_OCCURRENCES", 4, int,
+        ),
+        d2h_window_capacity_flush_fallback_threshold=_env_value(
+            args, "dmi_d2h_window_capacity_flush_fallback_threshold", environ,
+            "DMI_D2H_WINDOW_CAPACITY_FLUSH_FALLBACK_THRESHOLD", 3, int,
+        ),
+        d2h_window_capacity_flush_count_reset_interval_periods=_env_value(
+            args, "dmi_d2h_window_capacity_flush_count_reset_interval_periods", environ,
+            "DMI_D2H_WINDOW_CAPACITY_FLUSH_COUNT_RESET_INTERVAL_PERIODS", 32, int,
+        ),
+        d2h_window_debug=bool(
+            cli_window_debug if cli_window_debug is not None
+            else (_env_bool(environ, "DMI_D2H_WINDOW_DEBUG") or False)
         ),
         drain_flush_payload_ratio=float(
             _env_value(
@@ -1772,6 +1804,7 @@ def _build_engine(
     from dmi.api.v1 import (
         ClickHouseClientConfig,
         DMXHostEngine,
+        RecurringD2HWindowConfig,
         RingConfig,
         StageConfig,
     )
@@ -1786,6 +1819,20 @@ def _build_engine(
     ring_cfg.drain_flush_byte_threshold = int(cfg.drain_flush_byte_threshold)
     ring_cfg.drain_flush_entry_threshold = int(cfg.drain_flush_entry_threshold)
     ring_cfg.drain_flush_timeout_us = int(cfg.drain_flush_timeout_us)
+    window_cfg = RecurringD2HWindowConfig()
+    window_cfg.enabled = cfg.recurring_d2h_windows_enabled
+    window_cfg.minimum_record_probe_retry_interval_occurrences = (
+        cfg.d2h_window_minimum_record_probe_retry_interval_occurrences
+    )
+    window_cfg.timing_revalidation_retry_interval_occurrences = (
+        cfg.d2h_window_timing_revalidation_retry_interval_occurrences
+    )
+    window_cfg.capacity_flush_fallback_threshold = cfg.d2h_window_capacity_flush_fallback_threshold
+    window_cfg.capacity_flush_count_reset_interval_periods = (
+        cfg.d2h_window_capacity_flush_count_reset_interval_periods
+    )
+    window_cfg.debug_enabled = cfg.d2h_window_debug
+    ring_cfg.recurring_d2h_windows = window_cfg
 
     host_engine = None
     if cfg.db_host:
@@ -1811,6 +1858,7 @@ def _build_engine(
             model_id=model_id,
             host_engine=host_engine,
             ring_config=ring_cfg,
+            record_mode_v1=True,
         ),
         host_engine,
     )
@@ -1957,6 +2005,13 @@ def setup_megatron_dmi(
     cfg = resolve_megatron_dmi_config(args, explicit=explicit_config, environ=environ)
     if not cfg.enabled:
         return None
+    cfg = replace(
+        cfg,
+        recurring_d2h_windows_enabled=(
+            cfg.recurring_d2h_windows_enabled
+            and int(getattr(args, "pipeline_model_parallel_size", 1)) > 1
+        ),
+    )
     if int(cfg.flush_every_n_train_iters) < 0:
         raise ValueError("DMI iteration flush interval must be nonnegative")
 
@@ -2241,6 +2296,9 @@ def setup_megatron_dmi(
             ),
             field_specs=field_specs,
             host_engine=host_engine,
+        )
+        runtime.configure_d2h_windows(
+            enabled=cfg.recurring_d2h_windows_enabled, debug=cfg.d2h_window_debug,
         )
         flush_interval = int(cfg.flush_every_n_train_iters)
         if flush_interval == 0:

@@ -32,6 +32,8 @@ from dmi_megatron_integration.schedule_runtime import (
     dmi_take_local_backward_token,
     set_active_megatron_schedule_runtime,
     _rank_groups_for_token,
+    dmi_advance_d2h_boundary,
+    non_interleaved_d2h_window_pattern,
 )
 from dmi_megatron_integration.adapter import (
     MegatronEventCoordinates,
@@ -71,6 +73,62 @@ class FakePropagator:
 
     def end_iteration(self):
         self.calls.append(("end",))
+
+
+@pytest.mark.parametrize("p,r,m", [(1, 0, 1), (2, -1, 2), (2, 2, 2), (2, 0, 0)])
+def test_d2h_pattern_rejects_invalid_coordinates(p, r, m):
+    with pytest.raises(ValueError):
+        non_interleaved_d2h_window_pattern(p, r, m)
+
+
+def test_d2h_pattern_preparation_reuses_redefines_and_latches_fallback(capsys):
+    calls = []
+    answers = iter([True, True, False])
+
+    def define(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    runtime = MegatronScheduleRuntime(FakePropagator())
+    runtime.adaptor = SimpleNamespace(record_runtime=SimpleNamespace(
+        define_d2h_window_pattern=define,
+        advance_boundary=lambda: calls.append("boundary"),
+    ))
+    runtime.configure_d2h_windows(enabled=True, debug=True)
+    runtime.global_batch_id = 7
+    runtime._active_attempt_id = 2
+    set_active_megatron_schedule_runtime(runtime)
+    try:
+        dmi_advance_d2h_boundary()  # No definition yet.
+        runtime.prepare_d2h_windows(4, 1, 2)
+        runtime.prepare_d2h_windows(4, 1, 2)  # Same M, including a retry.
+        runtime.prepare_d2h_windows(4, 1, 3)  # Need not wait for old GPU version.
+        runtime.prepare_d2h_windows(4, 1, 4)  # Core reports terminal fallback.
+        runtime.prepare_d2h_windows(4, 1, 5)  # Latch prevents further definitions.
+        assert [call["period"] for call in calls] == [8, 12, 16]
+        assert all(call["initial_counter"] == 0 for call in calls)
+        dmi_advance_d2h_boundary()  # Existing markers remain harmless after fallback.
+        assert calls[-1] == "boundary"
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 3
+        assert "iteration=7 attempt=2 P=4 r=1 M=2 W=4 period=8 accepted=True" in lines[0]
+        assert "accepted=False" in lines[2]
+    finally:
+        set_active_megatron_schedule_runtime(None)
+
+
+def test_d2h_preparation_is_silent_by_default(capsys):
+    calls = []
+    runtime = MegatronScheduleRuntime(FakePropagator())
+    runtime.adaptor = SimpleNamespace(record_runtime=SimpleNamespace(
+        define_d2h_window_pattern=lambda **kw: calls.append(kw) or True,
+    ))
+    runtime.prepare_d2h_windows(2, 0, 2)
+    assert calls == []
+    runtime.configure_d2h_windows(enabled=True)
+    runtime.prepare_d2h_windows(2, 0, 2)
+    assert len(calls) == 1
+    assert capsys.readouterr().out == ""
 
 
 class FakeContext:

@@ -82,6 +82,11 @@ class MegatronScheduleRuntime:
         self._logical_training_iteration_id: int | None = None
         self._active_attempt_id: int | None = None
         self._next_attempt_id = 0
+        self._d2h_windows_enabled = False
+        self._d2h_window_debug = False
+        self._d2h_window_signature: tuple[int, int, int] | None = None
+        self._d2h_window_definition_rejected = False
+        self._d2h_window_unsupported_warned = False
         self._attempt_statuses: dict[int, int] = {}
         self._flush_every_n_train_iters = 0
         self._iteration_flush_callback: Callable[[], None] | None = None
@@ -107,6 +112,50 @@ class MegatronScheduleRuntime:
     @property
     def current_attempt_id(self) -> int:
         return 0 if self._active_attempt_id is None else int(self._active_attempt_id)
+
+    def configure_d2h_windows(self, *, enabled: bool, debug: bool = False) -> None:
+        """Configure the recurring-window opt-in at engine startup."""
+        self._d2h_windows_enabled = bool(enabled)
+        self._d2h_window_debug = bool(debug)
+
+    @property
+    def d2h_windows_active(self) -> bool:
+        # Keep publishing after terminal fallback; core ignores window grants
+        # there. The signature also prevents publication before a definition.
+        return self._d2h_windows_enabled and self._d2h_window_signature is not None
+
+    def prepare_d2h_windows(self, pp_size: int, pp_rank: int, num_microbatches: int) -> None:
+        """Install a pattern before the schedule, only when its signature changes."""
+        if not self._d2h_windows_enabled or self._d2h_window_definition_rejected:
+            return
+        signature = (int(pp_size), int(pp_rank), int(num_microbatches))
+        if signature == self._d2h_window_signature:
+            return
+        period, windows = non_interleaved_d2h_window_pattern(*signature)
+        accepted = self.adaptor.record_runtime.define_d2h_window_pattern(
+            period=period, windows=windows, initial_counter=0,
+        )
+        if self._d2h_window_debug:
+            print(
+                "[DMI] d2h_window define "
+                f"iteration={self.global_batch_id} attempt={self.current_attempt_id} "
+                f"P={signature[0]} r={signature[1]} M={signature[2]} "
+                f"W={len(windows)} period={period} accepted={accepted}",
+                flush=True,
+            )
+        if accepted:
+            self._d2h_window_signature = signature
+        else:
+            self._d2h_window_definition_rejected = True
+
+    def warn_d2h_windows_unsupported(self) -> None:
+        if self._d2h_windows_enabled and not self._d2h_window_unsupported_warned:
+            print(
+                "[DMI] WARNING: recurring D2H windows are unsupported for "
+                "interleaved/VPP scheduling; using normal batched D2H.",
+                flush=True,
+            )
+            self._d2h_window_unsupported_warned = True
 
     def configure_iteration_flush(
         self,
@@ -1111,6 +1160,48 @@ def build_megatron_schedule_runtime(
 
 def dmi_is_enabled() -> bool:
     return _active_runtime is not None
+
+
+def non_interleaved_d2h_window_pattern(
+    pp_size: int, pp_rank: int, num_microbatches: int,
+) -> tuple[int, tuple[tuple[int, int], ...]]:
+    """Return the period and offsets for one rank's non-interleaved 1F1B."""
+    if pp_size <= 1 or not 0 <= pp_rank < pp_size or num_microbatches < 1:
+        raise ValueError("D2H windows require PP>1, a valid PP rank, and M>=1")
+    count = num_microbatches if pp_rank in (0, pp_size - 1) else 2 * num_microbatches
+    return 2 * count, tuple((2 * i + 1, 2 * i + 2) for i in range(count))
+
+
+def dmi_prepare_d2h_windows(forward_backward_func: Any, num_microbatches: int) -> None:
+    """Prepare only for Megatron's selected non-interleaved training schedule."""
+    runtime = _active_runtime
+    if runtime is None or not runtime._d2h_windows_enabled:
+        return
+    from megatron.core import parallel_state
+    from megatron.core.pipeline_parallel.schedules import (
+        forward_backward_pipelining_with_interleaving,
+        forward_backward_pipelining_without_interleaving,
+    )
+
+    if forward_backward_func is forward_backward_pipelining_with_interleaving:
+        runtime.warn_d2h_windows_unsupported()
+        return
+    if forward_backward_func is not forward_backward_pipelining_without_interleaving:
+        return
+    runtime.prepare_d2h_windows(
+        parallel_state.get_pipeline_model_parallel_world_size(),
+        parallel_state.get_pipeline_model_parallel_rank(),
+        num_microbatches,
+    )
+
+
+def dmi_d2h_windows_active() -> bool:
+    return _active_runtime is not None and _active_runtime.d2h_windows_active
+
+
+def dmi_advance_d2h_boundary() -> None:
+    if dmi_d2h_windows_active():
+        _active_runtime.adaptor.record_runtime.advance_boundary()
 
 
 def dmi_guard_schedule_supported(config: Any, forward_only: bool) -> None:
