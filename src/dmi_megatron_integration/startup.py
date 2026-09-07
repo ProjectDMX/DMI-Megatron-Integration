@@ -2023,6 +2023,18 @@ def setup_megatron_dmi(
         from megatron.core.utils import get_model_config
 
         model_config = get_model_config(model[0] if isinstance(model, list) else model)
+    if cfg.recurring_d2h_windows_enabled and bool(
+        getattr(model_config, "batch_p2p_sync", False)
+    ):
+        message = (
+            "[DMI] WARNING: recurring D2H windows require Megatron "
+            "batch_p2p_sync=False; disabling recurring D2H windows"
+        )
+        if printer is None:
+            print(message, flush=True)
+        else:
+            printer(message)
+        cfg = replace(cfg, recurring_d2h_windows_enabled=False)
 
     model_id = resolve_model_id(cfg, dist_module=dist_module, environ=environ, printer=printer)
     dist_for_rank = torch.distributed if dist_module is None else dist_module

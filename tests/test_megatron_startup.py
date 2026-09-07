@@ -988,8 +988,11 @@ def test_setup_writes_frozen_ep_topology_manifest(tmp_path):
         handle.close()
 
 
-@pytest.mark.parametrize("pp,windows", [(1, False), (1, True), (2, False), (2, True)])
-def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows):
+@pytest.mark.parametrize(
+    "pp,windows,batch_p2p_sync",
+    [(1, False, False), (1, True, False), (2, False, False), (2, True, False), (2, True, True)],
+)
+def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows, batch_p2p_sync):
     model = [TinyModel()]
     runtime_contexts = []
 
@@ -1015,6 +1018,7 @@ def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows):
     )
     args = SimpleNamespace(global_batch_size=8, micro_batch_size=2, pipeline_model_parallel_size=pp)
     factory_configs = []
+    messages = []
 
     def engine_factory(config, model_id, record_format, rank):
         factory_configs.append(config)
@@ -1023,7 +1027,9 @@ def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows):
     handle = setup_megatron_dmi(
         model,
         args=args,
-        model_config=SimpleNamespace(num_moe_experts=4),
+        model_config=SimpleNamespace(
+            num_moe_experts=4, batch_p2p_sync=batch_p2p_sync,
+        ),
         explicit_config=cfg,
         parallel_state_module=FakeParallelState(dp_world=2, vp_world=3, pp_world=pp),
         dist_module=FakeDist(initialized=False),
@@ -1032,14 +1038,25 @@ def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows):
         runtime_factory=runtime_factory,
         adaptor_cls=FakeAdaptor,
         device="cpu",
+        printer=messages.append,
     )
 
     assert handle is not None
+    effective_windows = windows and pp > 1 and not batch_p2p_sync
     assert cfg.recurring_d2h_windows_enabled is windows
-    assert handle.config.recurring_d2h_windows_enabled is (windows and pp > 1)
-    assert factory_configs[0].recurring_d2h_windows_enabled is (windows and pp > 1)
-    assert handle.schedule_runtime._d2h_windows_enabled is (windows and pp > 1)
+    assert handle.config.recurring_d2h_windows_enabled is effective_windows
+    assert factory_configs[0].recurring_d2h_windows_enabled is effective_windows
+    assert handle.schedule_runtime._d2h_windows_enabled is effective_windows
     assert not handle.schedule_runtime.d2h_windows_active  # Lazy definition.
+    expected_messages = (
+        [
+            "[DMI] WARNING: recurring D2H windows require Megatron "
+            "batch_p2p_sync=False; disabling recurring D2H windows"
+        ]
+        if windows and pp > 1 and batch_p2p_sync
+        else []
+    )
+    assert messages == expected_messages
     assert handle.model_id == "run"
     assert get_active_megatron_schedule_runtime() is handle.schedule_runtime
     assert handle.current_phase_tensor.device.type == "cpu"
