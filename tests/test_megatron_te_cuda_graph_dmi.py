@@ -9,6 +9,7 @@ import torch
 from megatron.core.transformer import cuda_graphs as cuda_graphs_module
 from megatron.core.transformer import module as module_under_test
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
@@ -181,3 +182,13 @@ def test_hidden_state_hook_is_owned_by_common_attention_entry():
 
     assert "self.dmi_hidden_states(hidden_states)" in attention_source
     assert "self.dmi_hidden_states" not in forward_source
+
+
+def test_resid_final_hook_is_immediately_before_final_layernorm():
+    forward_source = inspect.getsource(TransformerBlock.forward)
+
+    hook_call = "self.dmi_resid_final(cast(Tensor, hidden_states))"
+    norm_call = "hidden_states = apply_module(self.final_layernorm)"
+    assert hook_call in forward_source
+    assert norm_call in forward_source
+    assert forward_source.index(hook_call) < forward_source.index(norm_call)

@@ -1215,6 +1215,107 @@ def test_real_megatron_hidden_states_clickhouse_rows(tmp_path):
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Real Megatron resid-final PP2 E2E needs CUDA"
+)
+def test_real_megatron_resid_final_pp2_clickhouse_rows(tmp_path):
+    """Run real Megatron PP2 train/eval and verify final-stage pre-norm residual rows."""
+
+    if _available_cuda_devices() < 2:
+        pytest.skip("resid_final PP2 E2E requires two CUDA devices")
+
+    client = _clickhouse_client_or_skip()
+    database = os.environ.get("DMX_DB_DATABASE", "default")
+    table = f"dmi_megatron_resid_final_e2e_{uuid.uuid4().hex}"
+    model_id = f"megatron-resid-final-e2e-{uuid.uuid4().hex}"
+    log_path = tmp_path / "megatron_real_training_resid_final.log"
+
+    train_iters = 1
+    eval_iters = 1
+    micro_batch_size = 1
+    global_batch_size = 2
+    expected_rows = _expected_total_sample_rows(
+        train_iters=train_iters,
+        eval_iters=eval_iters,
+        global_batch_size=global_batch_size,
+    )
+
+    client.execute(f"CREATE DATABASE IF NOT EXISTS `{database}`")
+    client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+    _create_training_table(client, database=database, table=table)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{ROOT}:{MEGATRON_ROOT}:{env.get('PYTHONPATH', '')}"
+    env["DMI_ENABLE"] = "1"
+    env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    if "DMI_REAL_E2E_CUDA_VISIBLE_DEVICES" in env:
+        env["CUDA_VISIBLE_DEVICES"] = env["DMI_REAL_E2E_CUDA_VISIBLE_DEVICES"]
+
+    cmd = _tiny_megatron_router_summary_cmd(
+        model_id=model_id,
+        train_iters=train_iters,
+        eval_iters=eval_iters,
+        micro_batch_size=micro_batch_size,
+        global_batch_size=global_batch_size,
+        nproc_per_node=2,
+        pp_size=2,
+        database=database,
+        table=table,
+        extra_args=[
+            "--dmi-hook-selection",
+            "resid_final",
+            "--dmi-no-recompute-hook",
+            "resid_final",
+            "--recompute-granularity",
+            "full",
+            "--recompute-method",
+            "uniform",
+            "--recompute-num-layers",
+            "1",
+        ],
+    )
+
+    try:
+        _run_megatron_cmd(cmd, env=env, log_path=log_path)
+        _wait_for_exact_act_rows(
+            client,
+            database=database,
+            table=table,
+            model_id=model_id,
+            act_name="hook_resid_final",
+            expected=expected_rows,
+        )
+        rows = client.execute(
+            f"""
+            SELECT dtype, shape, length(bytes), layer_no
+            FROM `{database}`.`{table}`
+            WHERE model_id = %(model_id)s
+              AND act_name = 'hook_resid_final'
+              AND direction = 'fwd'
+            """,
+            {"model_id": model_id},
+        )
+        assert len(rows) == expected_rows
+        assert {row[0] for row in rows} == {"torch.bfloat16"}
+        assert {tuple(row[1]) for row in rows} == {(16, 64)}
+        assert {int(row[2]) for row in rows} == {16 * 64 * 2}
+        assert {int(row[3]) for row in rows} == {-1}
+        assert _query_count(
+            client,
+            database=database,
+            table=table,
+            model_id=model_id,
+            act_name="hidden_states",
+        ) == 0
+    finally:
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_float`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_int`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_eval_phase_boundary`")
+        client.disconnect()
+
+
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Real Megatron vocabulary-logit E2E needs CUDA")
 def test_real_megatron_vocab_logits_training_clickhouse_rows_and_boundary_flush(tmp_path):
     """Run real Megatron training and verify raw vocabulary logits plus boundary flushes."""

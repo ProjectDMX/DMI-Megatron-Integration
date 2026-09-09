@@ -1399,6 +1399,50 @@ def _install_hidden_state_hooks(model: Any) -> None:
             )
 
 
+def _install_resid_final_hooks(model: Any) -> int:
+    roots = model if isinstance(model, list) else [model]
+    blocks = []
+    for root in roots:
+        for module in root.modules():
+            if module.__class__.__name__ != "TransformerBlock":
+                continue
+            blocks.append(module)
+
+    final_blocks = [block for block in blocks if block.final_layernorm is not None]
+    # A non-last pipeline stage has no final norm, but recompute policy names are
+    # parsed on every rank. Give that stage one placement-disabled HookPoint so
+    # the globally selected name still resolves locally. It is never invoked:
+    # TransformerBlock.forward calls dmi_resid_final only with final_layernorm.
+    targets = final_blocks if final_blocks else blocks[:1]
+    for module in targets:
+        existing = module.dmi_resid_final
+        if existing is not None:
+            if not isinstance(existing, HookPointV1):
+                raise TypeError("block.dmi_resid_final exists but is not HookPointV1")
+            continue
+        module.dmi_resid_final = _make_hook(
+            MegatronHookSpec(
+                name="resid_final",
+                layer_no=-1,
+                outputs=[
+                    MegatronOutputSpec(
+                        name="hook_resid_final",
+                        input_shape=[DimSpec.SEQ, DimSpec.BATCH, DimSpec.HIDDEN],
+                        output_shape=[DimSpec.ACTUAL_TOKEN_PACKED, DimSpec.HIDDEN],
+                        dtype=module.config.params_dtype,
+                        transport_type=TransportType.SEQ_PREFIX_PACK,
+                    )
+                ],
+                preprocess=None,
+                shard_policy=ShardPolicy.REPLICATED,
+                layer_placement=HookLayerPlacement.NO_LAYER_LAST_PP,
+                enabled_by=frozenset({"resid_final"}),
+            ),
+            hook_phase=HookPhase.FWD,
+        )
+    return len(final_blocks)
+
+
 def _make_grad_norm_hook() -> HookPointV1:
     hook = _make_hook(
         MegatronHookSpec(
@@ -2137,9 +2181,14 @@ def setup_megatron_dmi(
         "router-weights",
     } & selected_hooks:
         dims[DimSpec.NUM_EXPERTS] = _num_experts(model_config)
-    if {"hidden-states", "router-weights", "moe-packed-weighted-output"} & selected_hooks:
+    if {
+        "hidden-states",
+        "resid_final",
+        "router-weights",
+        "moe-packed-weighted-output",
+    } & selected_hooks:
         dims[DimSpec.HIDDEN] = _hidden_size(model_config)
-    if {"router-logits", "router-topk", "hidden-states"} & selected_hooks:
+    if {"router-logits", "router-topk", "hidden-states", "resid_final"} & selected_hooks:
         dims[DimSpec.SEQ] = _seq_length(args)
     if selected_vocab_hooks:
         dims[DimSpec.SEQ] = _seq_length(args)
@@ -2191,6 +2240,9 @@ def setup_megatron_dmi(
             )
         if "hidden-states" in selected_hooks:
             _install_hidden_state_hooks(unwrapped)
+        resid_final_hook_count = 0
+        if "resid_final" in selected_hooks:
+            resid_final_hook_count = _install_resid_final_hooks(unwrapped)
 
         rank_ctx = _build_rank_context(
             args,
@@ -2198,6 +2250,15 @@ def setup_megatron_dmi(
             parallel_state_module,
             global_rank=rank,
         )
+        if (
+            "resid_final" in selected_hooks
+            and rank_ctx.pp_rank == rank_ctx.pp_world_size - 1
+            and resid_final_hook_count == 0
+        ):
+            raise RuntimeError(
+                "DMI resid_final requires a TransformerBlock with final_layernorm "
+                "on the last pipeline stage"
+            )
         selected_model_hooks = _collect_selected_hooks(unwrapped, cfg.hook_selection)
         _apply_recompute_hook_policy(
             selected_model_hooks,

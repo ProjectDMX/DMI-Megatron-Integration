@@ -14,6 +14,7 @@ from dmi_megatron_integration.hooks.selection import parse_hook_selection
 from dmi_megatron_integration.hooks.specs import (
     DimSpec,
     HookInputLayout,
+    HookLayerPlacement,
     HookPhase,
     MegatronMetadataField,
     MegatronHookSpec,
@@ -41,6 +42,7 @@ from dmi_megatron_integration.startup import (
     _metadata_field_specs_from_requirements,
     _megatron_hook_spec,
     _install_moe_inverse_map_hooks,
+    _install_resid_final_hooks,
     _vocab_logits_dtype,
     _apply_recompute_hook_policy,
     _resolve_dataset_provenance_modes,
@@ -265,6 +267,20 @@ class TinyGPTModel(nn.Module):
         self.post_process = bool(post_process)
         self.dmi_vocab_logits = None
         self.dmi_vocab_logits_topk = None
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, *, has_final_layernorm: bool = True):
+        super().__init__()
+        self.config = SimpleNamespace(params_dtype=torch.bfloat16)
+        self.final_layernorm = nn.Identity() if has_final_layernorm else None
+        self.dmi_resid_final = None
+
+
+class TinyFinalResidualModel(nn.Module):
+    def __init__(self, *, has_final_layernorm: bool = True):
+        super().__init__()
+        self.decoder = TransformerBlock(has_final_layernorm=has_final_layernorm)
 
 
 class TopKRouter(nn.Module):
@@ -1129,6 +1145,153 @@ def test_setup_hidden_states_resolves_seq_and_hidden_dims():
     assert adaptor.attach_calls[0]["model_hooks"] == []
 
     handle.close()
+
+
+def test_setup_resid_final_installs_pre_norm_v1_hook_on_last_stage():
+    model = [TinyFinalResidualModel()]
+
+    def runtime_factory(**kwargs):
+        context = DMIMetadataContext(
+            max_num_microbatches=kwargs["max_num_microbatches"],
+            max_batch_size=kwargs["max_batch_size"],
+            num_scopes=kwargs["num_scopes"],
+            field_specs=kwargs["field_specs"],
+            device="cpu",
+        )
+        return MegatronScheduleRuntime(
+            LocalMetadataPropagator(context),
+            host_engine=kwargs["host_engine"],
+        )
+
+    cfg = MegatronDMIConfig(
+        enabled=True,
+        hook_selection="resid_final",
+        model_id="resid-final-run",
+        dataset_provenance_mode=CONSTANT_PROVENANCE,
+    )
+    args = SimpleNamespace(global_batch_size=4, micro_batch_size=2, seq_length=16)
+    handle = setup_megatron_dmi(
+        model,
+        args=args,
+        model_config=SimpleNamespace(hidden_size=32),
+        explicit_config=cfg,
+        parallel_state_module=FakeParallelState(pp_rank=1, pp_world=2),
+        dist_module=FakeDist(initialized=False),
+        unwrap_fn=lambda x: x,
+        engine_factory=_fake_engine_factory,
+        runtime_factory=runtime_factory,
+        adaptor_cls=FakeAdaptor,
+        device="cpu",
+    )
+
+    assert handle is not None
+    adaptor = FakeAdaptor.instances[0]
+    assert adaptor.dims[DimSpec.BATCH] == 2
+    assert adaptor.dims[DimSpec.SEQ] == 16
+    assert adaptor.dims[DimSpec.HIDDEN] == 32
+    hook = model[0].decoder.dmi_resid_final
+    assert isinstance(hook, HookPointV1)
+    assert hook.spec is not None
+    assert hook.spec.name == "resid_final"
+    assert hook.spec.outputs[0].name == "hook_resid_final"
+    policy = _megatron_hook_spec(hook)
+    assert policy.layer_no == -1
+    assert policy.outputs[0].dtype is torch.bfloat16
+    assert policy.outputs[0].input_shape == (
+        DimSpec.SEQ,
+        DimSpec.BATCH,
+        DimSpec.HIDDEN,
+    )
+    assert policy.outputs[0].output_shape == (
+        DimSpec.ACTUAL_TOKEN_PACKED,
+        DimSpec.HIDDEN,
+    )
+    assert policy.outputs[0].transport_type is TransportType.SEQ_PREFIX_PACK
+    assert policy.shard_policy is ShardPolicy.REPLICATED
+    assert policy.layer_placement is HookLayerPlacement.NO_LAYER_LAST_PP
+    assert policy.enabled_by == frozenset({"resid_final"})
+    assert hook.hook_phase is HookPhase.FWD
+    model_hooks = adaptor.attach_calls[0]["model_hooks"]
+    assert len(model_hooks) == 1
+    assert model_hooks[0].hook is hook
+
+    handle.close()
+
+
+def test_setup_resid_final_has_no_active_hook_on_non_last_stage():
+    model = [TinyFinalResidualModel(has_final_layernorm=False)]
+    cfg = MegatronDMIConfig(
+        enabled=True,
+        hook_selection="resid_final",
+        model_id="resid-final-non-last",
+        dataset_provenance_mode=CONSTANT_PROVENANCE,
+    )
+    args = SimpleNamespace(global_batch_size=4, micro_batch_size=2, seq_length=16)
+    handle = setup_megatron_dmi(
+        model,
+        args=args,
+        model_config=SimpleNamespace(hidden_size=32),
+        explicit_config=cfg,
+        parallel_state_module=FakeParallelState(pp_rank=0, pp_world=2),
+        dist_module=FakeDist(initialized=False),
+        unwrap_fn=lambda x: x,
+        engine_factory=_fake_engine_factory,
+        runtime_factory=lambda **kwargs: MegatronScheduleRuntime(
+            LocalMetadataPropagator(
+                DMIMetadataContext(
+                    max_num_microbatches=kwargs["max_num_microbatches"],
+                    max_batch_size=kwargs["max_batch_size"],
+                    num_scopes=kwargs["num_scopes"],
+                    field_specs=kwargs["field_specs"],
+                    device="cpu",
+                )
+            ),
+            host_engine=kwargs["host_engine"],
+        ),
+        adaptor_cls=FakeAdaptor,
+        device="cpu",
+    )
+
+    assert handle is not None
+    # The non-last stage keeps a placement-disabled placeholder so globally
+    # configured recomputation policy names resolve on every pipeline rank.
+    assert isinstance(model[0].decoder.dmi_resid_final, HookPointV1)
+    assert FakeAdaptor.instances[0].attach_calls[0]["model_hooks"] == []
+    handle.close()
+
+
+def test_setup_resid_final_rejects_missing_final_norm_on_last_stage():
+    model = [TinyFinalResidualModel(has_final_layernorm=False)]
+    cfg = MegatronDMIConfig(
+        enabled=True,
+        hook_selection="resid_final",
+        model_id="resid-final-missing-norm",
+        dataset_provenance_mode=CONSTANT_PROVENANCE,
+    )
+    args = SimpleNamespace(global_batch_size=4, micro_batch_size=2, seq_length=16)
+
+    with pytest.raises(RuntimeError, match="requires a TransformerBlock with final_layernorm"):
+        setup_megatron_dmi(
+            model,
+            args=args,
+            model_config=SimpleNamespace(hidden_size=32),
+            explicit_config=cfg,
+            parallel_state_module=FakeParallelState(pp_rank=1, pp_world=2),
+            dist_module=FakeDist(initialized=False),
+            unwrap_fn=lambda x: x,
+            engine_factory=_fake_engine_factory,
+            runtime_factory=lambda **_kwargs: None,
+            adaptor_cls=FakeAdaptor,
+            device="cpu",
+        )
+
+
+def test_install_resid_final_rejects_non_v1_hook():
+    model = TinyFinalResidualModel()
+    model.decoder.dmi_resid_final = nn.Identity()
+
+    with pytest.raises(TypeError, match="block.dmi_resid_final exists but is not HookPointV1"):
+        _install_resid_final_hooks(model)
 
 
 def test_setup_vocab_logits_installs_last_stage_raw_identity_hook():
