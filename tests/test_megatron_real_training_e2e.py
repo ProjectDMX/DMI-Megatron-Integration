@@ -840,6 +840,7 @@ def _assert_tensor_maps_close_with_report(
             f"tolerance: max_abs_error={max_abs_error:.8e}, "
             f"max_rel_error={max_rel_error:.8e}, key={max_error_key}, "
             f"atol={atol}, rtol={rtol}",
+            file=sys.stderr,
             flush=True,
         )
 
@@ -881,6 +882,7 @@ def _assert_scalar_maps_close_with_report(
             f"tolerance: max_abs_error={max_abs_error:.8e}, "
             f"max_rel_error={max_rel_error:.8e}, key={max_error_key}, "
             f"atol={atol}, rtol={rtol}",
+            file=sys.stderr,
             flush=True,
         )
 

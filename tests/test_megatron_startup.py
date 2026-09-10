@@ -276,6 +276,29 @@ class TinyHiddenStateModel(nn.Module):
         self.layer = TransformerLayer()
 
 
+class TinyUserSequenceHookModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.user_sequence_hook = _make_hook(
+            MegatronHookSpec(
+                name="user_sequence",
+                layer_no=0,
+                outputs=(
+                    MegatronOutputSpec(
+                        name="user_sequence",
+                        input_shape=(DimSpec.SEQ, DimSpec.BATCH, 4),
+                        output_shape=(DimSpec.ACTUAL_TOKEN_PACKED, 4),
+                        dtype=torch.float32,
+                        transport_type=TransportType.SEQ_PREFIX_PACK,
+                    ),
+                ),
+                shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
+                enabled_by=frozenset({"user-sequence"}),
+            ),
+            hook_phase=HookPhase.FWD,
+        )
+
+
 class TinyGPTModel(nn.Module):
     def __init__(self, *, post_process: bool = True, parallel_output: bool = True):
         super().__init__()
@@ -1065,7 +1088,9 @@ def test_setup_writes_frozen_ep_topology_manifest(tmp_path):
     "pp,windows,batch_p2p_sync",
     [(1, False, False), (1, True, False), (2, False, False), (2, True, False), (2, True, True)],
 )
-def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows, batch_p2p_sync):
+def test_setup_enabled_builds_runtime_and_attaches_model(
+    pp, windows, batch_p2p_sync, capsys
+):
     model = [TinyModel()]
     runtime_contexts = []
 
@@ -1121,7 +1146,7 @@ def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows, batch_p2p_
     assert factory_configs[0].recurring_d2h_windows_enabled is effective_windows
     assert handle.schedule_runtime._d2h_windows_enabled is effective_windows
     assert not handle.schedule_runtime.d2h_windows_active  # Lazy definition.
-    expected_messages = (
+    expected_warnings = (
         [
             "[DMI] WARNING: recurring D2H windows require Megatron "
             "batch_p2p_sync=False; disabling recurring D2H windows"
@@ -1129,7 +1154,8 @@ def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows, batch_p2p_
         if windows and pp > 1 and batch_p2p_sync
         else []
     )
-    assert messages == expected_messages
+    assert messages == []
+    assert capsys.readouterr().err.splitlines() == expected_warnings
     assert handle.model_id == "run"
     assert get_active_megatron_schedule_runtime() is handle.schedule_runtime
     assert handle.current_phase_tensor.device.type == "cpu"
@@ -1632,7 +1658,9 @@ def test_setup_vocab_logits_rejects_unsupported_parallelism(
         )
 
 
-def test_setup_vocab_logits_parallel_output_false_installs_replicated_with_one_warning():
+def test_setup_vocab_logits_parallel_output_false_installs_replicated_with_one_warning(
+    capsys,
+):
     messages = []
     model = [TinyGPTModel(post_process=True, parallel_output=False)]
 
@@ -1675,14 +1703,22 @@ def test_setup_vocab_logits_parallel_output_false_installs_replicated_with_one_w
     try:
         assert _megatron_hook_spec(model[0].dmi_vocab_logits).shard_policy is ShardPolicy.REPLICATED
         assert FakeAdaptor.instances[0].dims[DimSpec.VOCAB] == 16
-        assert len([message for message in messages if "replicated layout" in message]) == 1
+        assert messages == []
+        assert capsys.readouterr().err.splitlines() == [
+            "[DMI] WARNING: vocab-logits uses replicated layout because "
+            "GPTModel.parallel_output=False"
+        ]
     finally:
         handle.close()
 
 
 @pytest.mark.parametrize("hook_selection", ["hidden-states", "resid_final"])
 def test_setup_tp_sequence_hooks_reject_context_parallelism(hook_selection):
-    model = [TinyFinalResidualModel()] if hook_selection == "resid_final" else [TinyModel()]
+    model = (
+        [TinyFinalResidualModel()]
+        if hook_selection == "resid_final"
+        else [TinyHiddenStateModel()]
+    )
     with pytest.raises(NotImplementedError, match="context-parallel size 1"):
         setup_megatron_dmi(
             model,
@@ -1703,25 +1739,92 @@ def test_setup_tp_sequence_hooks_reject_context_parallelism(hook_selection):
         )
 
 
-def test_setup_tp_sequence_hooks_reject_nondivisible_sequence_length():
-    with pytest.raises(ValueError, match="sequence length divisible"):
-        setup_megatron_dmi(
-            [TinyHiddenStateModel()],
-            args=SimpleNamespace(
-                global_batch_size=2,
-                micro_batch_size=1,
-                seq_length=7,
-            ),
-            model_config=SimpleNamespace(hidden_size=4),
-            explicit_config=MegatronDMIConfig(
-                enabled=True,
-                hook_selection="hidden-states",
-                model_id="nondivisible-sequence",
-            ),
-            parallel_state_module=FakeParallelState(tp_world=2),
-            dist_module=FakeDist(initialized=False),
-            unwrap_fn=lambda x: x,
+@pytest.mark.parametrize(
+    ("hook_selection", "hook_name", "model_factory", "hook_getter"),
+    [
+        (
+            "hidden-states",
+            "hidden_states",
+            TinyHiddenStateModel,
+            lambda model: model.layer.dmi_hidden_states,
+        ),
+        (
+            "resid_final",
+            "resid_final",
+            TinyFinalResidualModel,
+            lambda model: model.decoder.dmi_resid_final,
+        ),
+        (
+            "user-sequence",
+            "user_sequence",
+            TinyUserSequenceHookModel,
+            lambda model: model.user_sequence_hook,
+        ),
+    ],
+)
+def test_setup_tp_sequence_hooks_fall_back_to_replicated_when_nondivisible_without_sp(
+    hook_selection,
+    hook_name,
+    model_factory,
+    hook_getter,
+    capsys,
+):
+    model = model_factory()
+    runtime_contexts = []
+    messages = []
+
+    def runtime_factory(**kwargs):
+        context = DMIMetadataContext(
+            max_num_microbatches=kwargs["max_num_microbatches"],
+            max_batch_size=kwargs["max_batch_size"],
+            num_scopes=kwargs["num_scopes"],
+            field_specs=kwargs["field_specs"],
+            dims=kwargs["dims"],
+            megatron_distributed_info=kwargs["megatron_distributed_info"],
+            tp_sequence_sharded_enabled=kwargs["tp_sequence_sharded_enabled"],
+            device="cpu",
         )
+        runtime_contexts.append(context)
+        return MegatronScheduleRuntime(
+            LocalMetadataPropagator(context),
+            host_engine=kwargs["host_engine"],
+        )
+
+    handle = setup_megatron_dmi(
+        [model],
+        args=SimpleNamespace(
+            global_batch_size=2,
+            micro_batch_size=1,
+            seq_length=7,
+        ),
+        model_config=SimpleNamespace(hidden_size=4, sequence_parallel=False),
+        explicit_config=MegatronDMIConfig(
+            enabled=True,
+            hook_selection=hook_selection,
+            model_id="nondivisible-sequence",
+            dataset_provenance_mode=CONSTANT_PROVENANCE,
+        ),
+        parallel_state_module=FakeParallelState(tp_world=2),
+        dist_module=FakeDist(initialized=False),
+        unwrap_fn=lambda x: x,
+        engine_factory=_fake_engine_factory,
+        runtime_factory=runtime_factory,
+        adaptor_cls=FakeAdaptor,
+        device="cpu",
+        printer=messages.append,
+    )
+    try:
+        hook = hook_getter(model)
+        assert _megatron_hook_spec(hook).shard_policy is ShardPolicy.REPLICATED
+        assert not runtime_contexts[0].tp_sequence_sharded_enabled
+        assert messages == []
+        assert capsys.readouterr().err.splitlines() == [
+            f"[DMI] WARNING: {hook_name} use replicated layout because "
+            "sequence length 7 is not divisible by tensor-model-parallel "
+            "size 2 while sequence parallelism is disabled"
+        ]
+    finally:
+        handle.close()
 
 
 def test_vocab_logits_dtype_requires_megatron_parameter_dtype():

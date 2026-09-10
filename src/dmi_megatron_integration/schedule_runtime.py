@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import sys
 import time
 from typing import Any, Callable, Mapping
 
@@ -153,6 +154,7 @@ class MegatronScheduleRuntime:
             print(
                 "[DMI] WARNING: recurring D2H windows are unsupported for "
                 "interleaved/VPP scheduling; using normal batched D2H.",
+                file=sys.stderr,
                 flush=True,
             )
             self._d2h_window_unsupported_warned = True

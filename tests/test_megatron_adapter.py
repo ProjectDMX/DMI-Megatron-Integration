@@ -686,11 +686,11 @@ def test_tp_sequence_sharded_hook_uses_one_local_interval(
     )
     hook = _make_hook(
         MegatronHookSpec(
-            name="hidden_states",
+            name="user_sequence",
             layer_no=2,
             outputs=(
                 MegatronOutputSpec(
-                    name="hidden_states",
+                    name="user_sequence",
                     input_shape=(DimSpec.SEQ, DimSpec.BATCH, 2),
                     output_shape=(DimSpec.ACTUAL_TOKEN_PACKED, 2),
                     dtype=torch.float32,

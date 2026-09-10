@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -62,6 +63,10 @@ from .hooks.specs import (
     ShardPolicy,
 )
 from .records.format import MegatronRecordFormat, required_record_metadata_fields
+
+
+def _print_warning(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 _TRUE_STRINGS = {"1", "true", "yes", "on"}
@@ -594,11 +599,6 @@ def _spec_active_on_rank(spec: MegatronHookSpec, rank_ctx: MegatronRankContext) 
 def _validate_hook_contract(hook: HookPointV1) -> None:
     spec = _megatron_hook_spec(hook)
     if spec.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED:
-        if spec.name not in {"hidden_states", "resid_final"}:
-            raise ValueError(
-                "TP_SEQUENCE_SHARDED is currently supported only for "
-                "hidden_states and resid_final"
-            )
         if spec.record_type is not RecordType.PER_SAMPLE or len(spec.outputs) != 1:
             raise ValueError("TP_SEQUENCE_SHARDED requires one PER_SAMPLE output")
         output = spec.outputs[0]
@@ -1192,7 +1192,6 @@ def _install_vocab_logits_hooks(
     *,
     dtype: torch.dtype,
     rank: int,
-    printer: Any | None,
 ) -> ShardPolicy | None:
     roots = model if isinstance(model, list) else [model]
     effective_policy: ShardPolicy | None = None
@@ -1245,10 +1244,7 @@ def _install_vocab_logits_hooks(
             "[DMI] WARNING: vocab-logits uses replicated layout because "
             "GPTModel.parallel_output=False"
         )
-        if printer is None:
-            print(message, flush=True)
-        else:
-            printer(message)
+        _print_warning(message)
     return effective_policy
 
 
@@ -1666,6 +1662,47 @@ def _collect_selected_hooks(
     return hooks
 
 
+def _resolve_tp_sequence_shard_policies(
+    hooks: list[MegatronHookBinding],
+    *,
+    sequence_parallel_enabled: bool,
+    sequence_length: int,
+    tp_world_size: int,
+    cp_world_size: int,
+    rank: int,
+) -> None:
+    sequence_hooks = [
+        binding.hook
+        for binding in hooks
+        if _megatron_hook_spec(binding.hook).shard_policy
+        is ShardPolicy.TP_SEQUENCE_SHARDED
+    ]
+    if not sequence_hooks:
+        return
+    if cp_world_size != 1:
+        raise NotImplementedError(
+            "DMI TP-sequence-sharded capture requires context-parallel size 1; "
+            f"got {cp_world_size}"
+        )
+    if sequence_parallel_enabled or sequence_length % tp_world_size == 0:
+        return
+
+    names = sorted({_megatron_hook_spec(hook).name for hook in sequence_hooks})
+    for hook in sequence_hooks:
+        hook._dmi_megatron_spec = replace(
+            _megatron_hook_spec(hook),
+            shard_policy=ShardPolicy.REPLICATED,
+        )
+    if rank == 0:
+        message = (
+            f"[DMI] WARNING: {','.join(names)} use replicated layout because "
+            f"sequence length {sequence_length} is not divisible by "
+            f"tensor-model-parallel size {tp_world_size} while sequence "
+            "parallelism is disabled"
+        )
+        _print_warning(message)
+
+
 def _active_hooks_for_rank(
     hooks: list[MegatronHookBinding],
     rank_ctx: MegatronRankContext,
@@ -1710,7 +1747,6 @@ def _hooks_for_input_layout(
     active_layout: HookInputLayout,
     *,
     rank: int,
-    printer: Any | None,
 ) -> list[MegatronHookBinding]:
     active: list[MegatronHookBinding] = []
     for binding in hooks:
@@ -1725,7 +1761,7 @@ def _hooks_for_input_layout(
                 f"{active_layout.value!r} is not in "
                 f"{sorted(item.value for item in spec.supported_layouts)!r}"
             )
-            (printer or print)(message)
+            _print_warning(message)
     return active
 
 
@@ -2117,6 +2153,8 @@ def setup_megatron_dmi(
         from megatron.core.utils import get_model_config
 
         model_config = get_model_config(model[0] if isinstance(model, list) else model)
+    dist_for_rank = torch.distributed if dist_module is None else dist_module
+    rank = int(dist_for_rank.get_rank()) if _dist_ready(dist_for_rank) else 0
     if cfg.recurring_d2h_windows_enabled and bool(
         getattr(model_config, "batch_p2p_sync", False)
     ):
@@ -2124,15 +2162,11 @@ def setup_megatron_dmi(
             "[DMI] WARNING: recurring D2H windows require Megatron "
             "batch_p2p_sync=False; disabling recurring D2H windows"
         )
-        if printer is None:
-            print(message, flush=True)
-        else:
-            printer(message)
+        if rank == 0:
+            _print_warning(message)
         cfg = replace(cfg, recurring_d2h_windows_enabled=False)
 
     model_id = resolve_model_id(cfg, dist_module=dist_module, environ=environ, printer=printer)
-    dist_for_rank = torch.distributed if dist_module is None else dist_module
-    rank = int(dist_for_rank.get_rank()) if _dist_ready(dist_for_rank) else 0
     dp_world = _data_parallel_world_size(args, parallel_state_module)
     max_num_microbatches = _max_num_microbatches(args, dp_world)
     max_batch_size = int(getattr(args, "micro_batch_size"))
@@ -2166,17 +2200,13 @@ def setup_megatron_dmi(
                 f"got {cp_world}"
             )
         padded_vocab_size = _padded_vocab_size(args)
-    selected_tp_sequence_hooks = {"hidden-states", "resid_final"} & selected_hooks
-    if selected_tp_sequence_hooks and cp_world != 1:
-        raise NotImplementedError(
-            "DMI TP-sequence-sharded hidden-state capture requires "
-            f"context-parallel size 1; got {cp_world}"
+    sequence_parallel_enabled = bool(
+        getattr(
+            model_config,
+            "sequence_parallel",
+            getattr(args, "sequence_parallel", False),
         )
-    if selected_tp_sequence_hooks and _seq_length(args) % tp_world != 0:
-        raise ValueError(
-            "DMI TP sequence sharding requires sequence length divisible by "
-            f"tensor-model-parallel size: {_seq_length(args)} % {tp_world} != 0"
-        )
+    )
     top_k = cfg.vocab_logits_top_k
     if "vocab-logits-topk" in selected_hooks:
         if top_k is None:
@@ -2268,7 +2298,6 @@ def setup_megatron_dmi(
                 unwrapped,
                 dtype=_vocab_logits_dtype(model_config),
                 rank=rank,
-                printer=printer,
             )
             if vocab_logits_policy is ShardPolicy.TP_SHARDED:
                 assert padded_vocab_size is not None
@@ -2341,13 +2370,7 @@ def setup_megatron_dmi(
             ep_world_size=rank_ctx.ep_world_size,
             cp_rank=rank_ctx.cp_rank,
             cp_world_size=rank_ctx.cp_world_size,
-            sequence_parallel_enabled=bool(
-                getattr(
-                    model_config,
-                    "sequence_parallel",
-                    getattr(args, "sequence_parallel", False),
-                )
-            ),
+            sequence_parallel_enabled=sequence_parallel_enabled,
         )
         if (
             "resid_final" in selected_hooks
@@ -2359,6 +2382,21 @@ def setup_megatron_dmi(
                 "on the last pipeline stage"
             )
         selected_model_hooks = _collect_selected_hooks(unwrapped, cfg.hook_selection)
+        has_selected_tp_sequence_hook = any(
+            _megatron_hook_spec(binding.hook).shard_policy
+            is ShardPolicy.TP_SEQUENCE_SHARDED
+            for binding in selected_model_hooks
+        )
+        if has_selected_tp_sequence_hook:
+            dims[DimSpec.SEQ] = _seq_length(args)
+            _resolve_tp_sequence_shard_policies(
+                selected_model_hooks,
+                sequence_parallel_enabled=sequence_parallel_enabled,
+                sequence_length=int(dims[DimSpec.SEQ]),
+                tp_world_size=tp_world,
+                cp_world_size=cp_world,
+                rank=rank,
+            )
         _apply_recompute_hook_policy(
             selected_model_hooks,
             selected_names=selected_hooks,
@@ -2370,7 +2408,6 @@ def setup_megatron_dmi(
             active_model_hooks,
             active_input_layout,
             rank=rank,
-            printer=printer,
         )
         local_metadata_report = _local_metadata_requirement_report(
             active_model_hooks,

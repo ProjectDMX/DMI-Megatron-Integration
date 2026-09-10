@@ -798,11 +798,6 @@ class MegatronAdaptor:
     ) -> tuple[int | None, int | None]:
         if policy.shard_policy is not ShardPolicy.TP_SEQUENCE_SHARDED:
             return None, None
-        if policy.name not in {"hidden_states", "resid_final"}:
-            raise ValueError(
-                "TP_SEQUENCE_SHARDED is currently supported only for "
-                "hidden_states and resid_final"
-            )
         if policy.record_type is not RecordType.PER_SAMPLE or len(policy.outputs) != 1:
             raise ValueError(
                 "TP_SEQUENCE_SHARDED requires one PER_SAMPLE output"

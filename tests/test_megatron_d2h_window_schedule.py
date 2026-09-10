@@ -197,7 +197,9 @@ def test_interleaved_opt_in_warns_once_without_defining(schedule_harness, capsys
         dmi_prepare_d2h_windows(schedules.forward_backward_pipelining_with_interleaving, 2)
     assert events == []
     assert not runtime.d2h_windows_active
-    assert capsys.readouterr().out.count("unsupported for interleaved/VPP") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("unsupported for interleaved/VPP") == 1
 
 
 def test_interleaved_disabled_is_silent(schedule_harness, capsys):
