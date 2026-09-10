@@ -55,6 +55,7 @@ from .hooks.specs import (
     HookLayerPlacement,
     HookInputLayout,
     HookPhase,
+    MegatronDistributedInfo,
     MegatronMetadataField,
     MegatronHookSpec,
     MegatronOutputSpec,
@@ -573,7 +574,7 @@ def _shard_policy_allows(spec: MegatronHookSpec, rank_ctx: MegatronRankContext) 
         return rank_ctx.tp_rank == 0 and rank_ctx.ep_rank == 0 and rank_ctx.cp_rank == 0
     if policy == ShardPolicy.GLOBAL_RANK_SHARDED:
         return True
-    if policy == ShardPolicy.TP_SHARDED:
+    if policy in (ShardPolicy.TP_SHARDED, ShardPolicy.TP_SEQUENCE_SHARDED):
         return rank_ctx.ep_rank == 0 and rank_ctx.cp_rank == 0
     if policy == ShardPolicy.EP_SHARDED:
         return rank_ctx.tp_rank == 0 and rank_ctx.cp_rank == 0
@@ -592,6 +593,23 @@ def _spec_active_on_rank(spec: MegatronHookSpec, rank_ctx: MegatronRankContext) 
 
 def _validate_hook_contract(hook: HookPointV1) -> None:
     spec = _megatron_hook_spec(hook)
+    if spec.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED:
+        if spec.name not in {"hidden_states", "resid_final"}:
+            raise ValueError(
+                "TP_SEQUENCE_SHARDED is currently supported only for "
+                "hidden_states and resid_final"
+            )
+        if spec.record_type is not RecordType.PER_SAMPLE or len(spec.outputs) != 1:
+            raise ValueError("TP_SEQUENCE_SHARDED requires one PER_SAMPLE output")
+        output = spec.outputs[0]
+        if (
+            tuple(output.input_shape[:2]) != (DimSpec.SEQ, DimSpec.BATCH)
+            or output.transport_type is not TransportType.SEQ_PREFIX_PACK
+        ):
+            raise ValueError(
+                "TP_SEQUENCE_SHARDED requires [SEQ, BATCH, ...] "
+                "SEQ_PREFIX_PACK input"
+            )
     if spec.record_type == RecordType.PER_SAMPLE:
         if hook.hook_phase not in (HookPhase.FWD, HookPhase.BWD):
             raise ValueError("PER_SAMPLE hooks must use FWD or BWD phase")
@@ -1169,15 +1187,34 @@ def _install_moe_packed_weighted_output_hooks(model: Any) -> None:
             )
 
 
-def _install_vocab_logits_hooks(model: Any, *, dtype: torch.dtype) -> None:
+def _install_vocab_logits_hooks(
+    model: Any,
+    *,
+    dtype: torch.dtype,
+    rank: int,
+    printer: Any | None,
+) -> ShardPolicy | None:
     roots = model if isinstance(model, list) else [model]
+    effective_policy: ShardPolicy | None = None
     for root in roots:
+        root_policy = (
+            ShardPolicy.TP_SHARDED
+            if bool(getattr(root, "parallel_output"))
+            else ShardPolicy.REPLICATED
+        )
+        if effective_policy is not None and root_policy is not effective_policy:
+            raise ValueError("DMI vocab-logits requires one fixed parallel_output layout")
+        effective_policy = root_policy
         if not bool(getattr(root, "post_process", False)):
             continue
         existing = root.dmi_vocab_logits
         if existing is not None:
             if not isinstance(existing, HookPointV1):
                 raise TypeError("model.dmi_vocab_logits exists but is not HookPointV1")
+            if _megatron_hook_spec(existing).shard_policy is not root_policy:
+                raise ValueError(
+                    "existing DMI vocab-logits hook does not match GPTModel.parallel_output"
+                )
             continue
         root.dmi_vocab_logits = _make_hook(
             MegatronHookSpec(
@@ -1193,7 +1230,7 @@ def _install_vocab_logits_hooks(model: Any, *, dtype: torch.dtype) -> None:
                     )
                 ],
                 preprocess=vocab_logits_by_sample,
-                shard_policy=ShardPolicy.REPLICATED,
+                shard_policy=root_policy,
                 layer_placement=HookLayerPlacement.NO_LAYER_LAST_PP,
                 enabled_by=frozenset({"vocab-logits"}),
                 need_token_range=False,
@@ -1203,6 +1240,16 @@ def _install_vocab_logits_hooks(model: Any, *, dtype: torch.dtype) -> None:
             ),
             hook_phase=HookPhase.FWD,
         )
+    if effective_policy is ShardPolicy.REPLICATED and rank == 0:
+        message = (
+            "[DMI] WARNING: vocab-logits uses replicated layout because "
+            "GPTModel.parallel_output=False"
+        )
+        if printer is None:
+            print(message, flush=True)
+        else:
+            printer(message)
+    return effective_policy
 
 
 def _install_vocab_logits_topk_hooks(
@@ -1392,7 +1439,7 @@ def _install_hidden_state_hooks(model: Any) -> None:
                         )
                     ],
                     preprocess=None,
-                    shard_policy=ShardPolicy.REPLICATED,
+                    shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
                     enabled_by=frozenset({"hidden-states"}),
                 ),
                 hook_phase=HookPhase.FWD,
@@ -1434,7 +1481,7 @@ def _install_resid_final_hooks(model: Any) -> int:
                     )
                 ],
                 preprocess=None,
-                shard_policy=ShardPolicy.REPLICATED,
+                shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
                 layer_placement=HookLayerPlacement.NO_LAYER_LAST_PP,
                 enabled_by=frozenset({"resid_final"}),
             ),
@@ -1635,7 +1682,10 @@ def _active_hooks_for_rank(
                 shard_rank = rank_ctx.global_rank
             elif spec.shard_policy == ShardPolicy.GLOBAL_RANK_SHARDED:
                 shard_rank = rank_ctx.global_rank
-            elif spec.shard_policy == ShardPolicy.TP_SHARDED:
+            elif spec.shard_policy in (
+                ShardPolicy.TP_SHARDED,
+                ShardPolicy.TP_SEQUENCE_SHARDED,
+            ):
                 shard_rank = rank_ctx.tp_rank
             elif spec.shard_policy == ShardPolicy.EP_SHARDED:
                 shard_rank = rank_ctx.ep_rank
@@ -2088,6 +2138,12 @@ def setup_megatron_dmi(
     max_batch_size = int(getattr(args, "micro_batch_size"))
     scopes = _num_scopes(parallel_state_module)
     selected_hooks = _selected_hooks(cfg.hook_selection)
+    tp_world = _parallel_world(
+        parallel_state_module, "get_tensor_model_parallel_world_size"
+    )
+    cp_world = _parallel_world(
+        parallel_state_module, "get_context_parallel_world_size"
+    )
     requires_ep_topology_manifest = bool(
         {"moe-inverse-map", "moe-packed-weighted-output"} & selected_hooks
     )
@@ -2099,15 +2155,9 @@ def setup_megatron_dmi(
     selected_vocab_hooks = selected_hooks & vocab_hook_names
     padded_vocab_size = None
     if selected_vocab_hooks:
-        tp_world = _parallel_world(
-            parallel_state_module, "get_tensor_model_parallel_world_size"
-        )
-        cp_world = _parallel_world(
-            parallel_state_module, "get_context_parallel_world_size"
-        )
-        if tp_world != 1:
+        if "vocab-logits-topk" in selected_hooks and tp_world != 1:
             raise NotImplementedError(
-                "DMI vocab-logits requires tensor-model-parallel size 1; "
+                "DMI vocab-logits-topk requires tensor-model-parallel size 1; "
                 f"got {tp_world}"
             )
         if cp_world != 1:
@@ -2116,6 +2166,17 @@ def setup_megatron_dmi(
                 f"got {cp_world}"
             )
         padded_vocab_size = _padded_vocab_size(args)
+    selected_tp_sequence_hooks = {"hidden-states", "resid_final"} & selected_hooks
+    if selected_tp_sequence_hooks and cp_world != 1:
+        raise NotImplementedError(
+            "DMI TP-sequence-sharded hidden-state capture requires "
+            f"context-parallel size 1; got {cp_world}"
+        )
+    if selected_tp_sequence_hooks and _seq_length(args) % tp_world != 0:
+        raise ValueError(
+            "DMI TP sequence sharding requires sequence length divisible by "
+            f"tensor-model-parallel size: {_seq_length(args)} % {tp_world} != 0"
+        )
     top_k = cfg.vocab_logits_top_k
     if "vocab-logits-topk" in selected_hooks:
         if top_k is None:
@@ -2201,11 +2262,23 @@ def setup_megatron_dmi(
     runtime = None
     try:
         unwrapped = unwrap_fn(model)
+        vocab_logits_policy = None
         if "vocab-logits" in selected_hooks:
-            _install_vocab_logits_hooks(
+            vocab_logits_policy = _install_vocab_logits_hooks(
                 unwrapped,
                 dtype=_vocab_logits_dtype(model_config),
+                rank=rank,
+                printer=printer,
             )
+            if vocab_logits_policy is ShardPolicy.TP_SHARDED:
+                assert padded_vocab_size is not None
+                if int(padded_vocab_size) % tp_world != 0:
+                    raise ValueError(
+                        "DMI TP-sharded vocab-logits requires padded vocabulary "
+                        "size divisible by tensor-model-parallel size: "
+                        f"{padded_vocab_size} % {tp_world} != 0"
+                    )
+                dims[DimSpec.VOCAB] = int(padded_vocab_size) // tp_world
         if "vocab-logits-topk" in selected_hooks:
             _install_vocab_logits_topk_hooks(
                 unwrapped,
@@ -2249,6 +2322,32 @@ def setup_megatron_dmi(
             model_config,
             parallel_state_module,
             global_rank=rank,
+        )
+        world_size = (
+            int(dist_for_rank.get_world_size())
+            if _dist_ready(dist_for_rank)
+            else int(getattr(args, "world_size", 1))
+        )
+        distributed_info = MegatronDistributedInfo(
+            global_rank=rank_ctx.global_rank,
+            world_size=world_size,
+            tp_rank=rank_ctx.tp_rank,
+            tp_world_size=rank_ctx.tp_world_size,
+            pp_rank=rank_ctx.pp_rank,
+            pp_world_size=rank_ctx.pp_world_size,
+            dp_rank=rank_ctx.dp_rank,
+            dp_world_size=rank_ctx.dp_world_size,
+            ep_rank=rank_ctx.ep_rank,
+            ep_world_size=rank_ctx.ep_world_size,
+            cp_rank=rank_ctx.cp_rank,
+            cp_world_size=rank_ctx.cp_world_size,
+            sequence_parallel_enabled=bool(
+                getattr(
+                    model_config,
+                    "sequence_parallel",
+                    getattr(args, "sequence_parallel", False),
+                )
+            ),
         )
         if (
             "resid_final" in selected_hooks
@@ -2332,6 +2431,14 @@ def setup_megatron_dmi(
             )
             iteration_hooks.extend(router_hooks)
 
+        for binding in (*active_model_hooks, *iteration_hooks):
+            binding.hook.megatron_distributed_info = distributed_info
+        has_active_tp_sequence_hook = any(
+            _megatron_hook_spec(binding.hook).shard_policy
+            is ShardPolicy.TP_SEQUENCE_SHARDED
+            for binding in active_model_hooks
+        )
+
         metadata_requirements = _resolve_metadata_requirements(
             metadata_reports,
             local_report=local_metadata_report,
@@ -2368,6 +2475,9 @@ def setup_megatron_dmi(
                 else "tp-cp-ep-dp-pp"
             ),
             field_specs=field_specs,
+            dims=dims,
+            megatron_distributed_info=distributed_info,
+            tp_sequence_sharded_enabled=has_active_tp_sequence_hook,
             host_engine=host_engine,
         )
         runtime.configure_d2h_windows(

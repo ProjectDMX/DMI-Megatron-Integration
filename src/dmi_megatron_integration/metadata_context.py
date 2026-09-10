@@ -15,7 +15,7 @@ from typing import Mapping, Sequence
 
 import torch
 
-from .hooks.specs import DimSpec
+from .hooks.specs import DimSpec, MegatronDistributedInfo
 
 
 class DMIMetadataDirection(Enum):
@@ -89,6 +89,8 @@ class DMIMetadataContext:
         num_scopes: int,
         field_specs: Sequence[DMIMetadataFieldSpec] | None = None,
         dims: Mapping[str | DimSpec, int] | None = None,
+        megatron_distributed_info: MegatronDistributedInfo | None = None,
+        tp_sequence_sharded_enabled: bool = False,
         device: torch.device | str | int | None = None,
     ) -> None:
         if max_num_microbatches <= 0:
@@ -110,6 +112,32 @@ class DMIMetadataContext:
             self.dims.update(dict(dims))
         self.dims[DimSpec.BATCH] = self.max_batch_size
         self.dims[DimSpec.BATCH.value] = self.max_batch_size
+        self.megatron_distributed_info = megatron_distributed_info
+        self.tp_sequence_sharded_enabled = bool(tp_sequence_sharded_enabled)
+        self.tp_sequence_start: int | None = None
+        self.tp_sequence_length: int | None = None
+        if self.tp_sequence_sharded_enabled:
+            if not isinstance(megatron_distributed_info, MegatronDistributedInfo):
+                raise TypeError(
+                    "TP-sequence-sharded metadata requires MegatronDistributedInfo"
+                )
+            global_sequence_length = self.dims.get(
+                DimSpec.SEQ, self.dims.get(DimSpec.SEQ.value)
+            )
+            if global_sequence_length is None:
+                raise KeyError("TP-sequence-sharded metadata requires DimSpec.SEQ")
+            tp_world_size = int(megatron_distributed_info.tp_world_size)
+            tp_rank = int(megatron_distributed_info.tp_rank)
+            if tp_world_size <= 0 or not 0 <= tp_rank < tp_world_size:
+                raise ValueError("invalid TP rank or world size in MegatronDistributedInfo")
+            if int(global_sequence_length) % tp_world_size != 0:
+                raise ValueError(
+                    "DMI TP sequence sharding requires sequence length divisible by "
+                    f"tensor-model-parallel size: {global_sequence_length} % "
+                    f"{tp_world_size} != 0"
+                )
+            self.tp_sequence_length = int(global_sequence_length) // tp_world_size
+            self.tp_sequence_start = tp_rank * self.tp_sequence_length
 
         specs = (
             (valid_count_field_spec(),)
@@ -169,6 +197,16 @@ class DMIMetadataContext:
                     dtype=spec.dtype,
                     device=self.device,
                 )
+        if self.tp_sequence_sharded_enabled:
+            if "valid_count" not in self._current_buffers:
+                raise ValueError(
+                    "TP-sequence-sharded metadata requires GPU-visible valid_count"
+                )
+            self._current_buffers["tp_seq_sharded_valid_count"] = torch.zeros(
+                (len(self._direction_to_index), self.num_scopes, self.max_batch_size),
+                dtype=torch.int64,
+                device=self.device,
+            )
         self._active_field_names = frozenset(self.field_specs)
 
     def set_active_fields(self, names: Sequence[str]) -> None:
@@ -178,6 +216,10 @@ class DMIMetadataContext:
         unknown = set(active) - set(self.field_specs)
         if unknown:
             raise KeyError(f"Unknown DMI metadata fields: {sorted(unknown)}")
+        if self.tp_sequence_sharded_enabled and "valid_count" not in active:
+            raise ValueError(
+                "TP-sequence-sharded metadata requires active valid_count"
+            )
         self._active_field_names = frozenset(active)
 
     @property
@@ -278,6 +320,15 @@ class DMIMetadataContext:
             self._current_buffers[name][direction_idx, scope_id].copy_(
                 self._source_buffers[name][microbatch_id]
             )
+        if self.tp_sequence_sharded_enabled:
+            assert self.tp_sequence_start is not None
+            assert self.tp_sequence_length is not None
+            local = self._current_buffers["tp_seq_sharded_valid_count"][
+                direction_idx, scope_id
+            ]
+            local.copy_(self._current_buffers["valid_count"][direction_idx, scope_id])
+            local.sub_(self.tp_sequence_start)
+            local.clamp_(0, self.tp_sequence_length)
 
     def current(
         self,

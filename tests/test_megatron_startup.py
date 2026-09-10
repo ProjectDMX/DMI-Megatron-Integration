@@ -16,6 +16,7 @@ from dmi_megatron_integration.hooks.specs import (
     HookInputLayout,
     HookLayerPlacement,
     HookPhase,
+    MegatronDistributedInfo,
     MegatronMetadataField,
     MegatronHookSpec,
     MegatronOutputSpec,
@@ -261,10 +262,25 @@ class TinyModel(nn.Module):
     pass
 
 
+class TransformerLayer(nn.Module):
+    def __init__(self, layer_number: int = 1):
+        super().__init__()
+        self.layer_number = layer_number
+        self.config = SimpleNamespace(params_dtype=torch.bfloat16)
+        self.dmi_hidden_states = None
+
+
+class TinyHiddenStateModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer = TransformerLayer()
+
+
 class TinyGPTModel(nn.Module):
-    def __init__(self, *, post_process: bool = True):
+    def __init__(self, *, post_process: bool = True, parallel_output: bool = True):
         super().__init__()
         self.post_process = bool(post_process)
+        self.parallel_output = bool(parallel_output)
         self.dmi_vocab_logits = None
         self.dmi_vocab_logits_topk = None
 
@@ -422,6 +438,47 @@ def test_per_execution_hook_records_global_physical_producer_rank():
         "global_sample": None,
         "ep_sample": None,
     }
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_tp_sequence_sharded_policy_activates_each_tp_rank(tp_rank):
+    hook = _make_hook(
+        MegatronHookSpec(
+            name="hidden_states",
+            layer_no=0,
+            outputs=(
+                MegatronOutputSpec(
+                    name="hidden_states",
+                    input_shape=(DimSpec.SEQ, DimSpec.BATCH, 2),
+                    output_shape=(DimSpec.ACTUAL_TOKEN_PACKED, 2),
+                    dtype=torch.float32,
+                    transport_type=TransportType.SEQ_PREFIX_PACK,
+                ),
+            ),
+            shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
+        ),
+        hook_phase=HookPhase.FWD,
+    )
+    rank_ctx = MegatronRankContext(
+        global_rank=tp_rank,
+        tp_rank=tp_rank,
+        tp_world_size=2,
+        pp_rank=0,
+        pp_world_size=1,
+        dp_rank=0,
+        dp_world_size=1,
+        cp_rank=0,
+        cp_world_size=1,
+        ep_rank=0,
+        ep_world_size=1,
+        vp_rank=None,
+        num_layers=1,
+    )
+
+    active = _active_hooks_for_rank([MegatronHookBinding(hook)], rank_ctx)
+
+    assert len(active) == 1
+    assert active[0].record_shard_rank == tp_rank
 
 
 def _policy_binding(
@@ -1100,7 +1157,7 @@ def test_setup_enabled_builds_runtime_and_attaches_model(pp, windows, batch_p2p_
 
 
 def test_setup_hidden_states_resolves_seq_and_hidden_dims():
-    model = [TinyModel()]
+    model = [TinyHiddenStateModel()]
 
     def runtime_factory(**kwargs):
         context = DMIMetadataContext(
@@ -1108,6 +1165,9 @@ def test_setup_hidden_states_resolves_seq_and_hidden_dims():
             max_batch_size=kwargs["max_batch_size"],
             num_scopes=kwargs["num_scopes"],
             field_specs=kwargs["field_specs"],
+            dims=kwargs["dims"],
+            megatron_distributed_info=kwargs["megatron_distributed_info"],
+            tp_sequence_sharded_enabled=kwargs["tp_sequence_sharded_enabled"],
             device="cpu",
         )
         return MegatronScheduleRuntime(
@@ -1125,7 +1185,7 @@ def test_setup_hidden_states_resolves_seq_and_hidden_dims():
     handle = setup_megatron_dmi(
         model,
         args=args,
-        model_config=SimpleNamespace(hidden_size=32),
+        model_config=SimpleNamespace(hidden_size=32, sequence_parallel=False),
         explicit_config=cfg,
         parallel_state_module=FakeParallelState(dp_world=1),
         dist_module=FakeDist(initialized=False),
@@ -1142,7 +1202,10 @@ def test_setup_hidden_states_resolves_seq_and_hidden_dims():
     assert adaptor.dims[DimSpec.SEQ] == 16
     assert adaptor.dims[DimSpec.HIDDEN] == 32
     assert DimSpec.NUM_EXPERTS not in adaptor.dims
-    assert adaptor.attach_calls[0]["model_hooks"] == []
+    model_hooks = adaptor.attach_calls[0]["model_hooks"]
+    assert len(model_hooks) == 1
+    assert _megatron_hook_spec(model_hooks[0].hook).shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
+    assert handle.schedule_runtime.propagator.context.tp_sequence_sharded_enabled
 
     handle.close()
 
@@ -1156,6 +1219,9 @@ def test_setup_resid_final_installs_pre_norm_v1_hook_on_last_stage():
             max_batch_size=kwargs["max_batch_size"],
             num_scopes=kwargs["num_scopes"],
             field_specs=kwargs["field_specs"],
+            dims=kwargs["dims"],
+            megatron_distributed_info=kwargs["megatron_distributed_info"],
+            tp_sequence_sharded_enabled=kwargs["tp_sequence_sharded_enabled"],
             device="cpu",
         )
         return MegatronScheduleRuntime(
@@ -1207,13 +1273,16 @@ def test_setup_resid_final_installs_pre_norm_v1_hook_on_last_stage():
         DimSpec.HIDDEN,
     )
     assert policy.outputs[0].transport_type is TransportType.SEQ_PREFIX_PACK
-    assert policy.shard_policy is ShardPolicy.REPLICATED
+    assert policy.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
     assert policy.layer_placement is HookLayerPlacement.NO_LAYER_LAST_PP
     assert policy.enabled_by == frozenset({"resid_final"})
     assert hook.hook_phase is HookPhase.FWD
     model_hooks = adaptor.attach_calls[0]["model_hooks"]
     assert len(model_hooks) == 1
     assert model_hooks[0].hook is hook
+    iteration_hook = adaptor.attach_calls[0]["iteration_hooks"][0].hook
+    assert isinstance(hook.megatron_distributed_info, MegatronDistributedInfo)
+    assert hook.megatron_distributed_info is iteration_hook.megatron_distributed_info
 
     handle.close()
 
@@ -1327,7 +1396,7 @@ def test_setup_vocab_logits_installs_last_stage_raw_identity_hook():
         args=args,
         model_config=SimpleNamespace(params_dtype=torch.bfloat16),
         explicit_config=cfg,
-        parallel_state_module=FakeParallelState(),
+        parallel_state_module=FakeParallelState(tp_world=2),
         dist_module=FakeDist(initialized=False),
         unwrap_fn=lambda x: x,
         engine_factory=_fake_engine_factory,
@@ -1340,13 +1409,14 @@ def test_setup_vocab_logits_installs_last_stage_raw_identity_hook():
     adaptor = FakeAdaptor.instances[0]
     assert adaptor.dims[DimSpec.BATCH] == 2
     assert adaptor.dims[DimSpec.SEQ] == 16
-    assert adaptor.dims[DimSpec.VOCAB] == 128
+    assert adaptor.dims[DimSpec.VOCAB] == 64
     hook = model[0].dmi_vocab_logits
     assert isinstance(hook, HookPointV1)
     assert hook.spec is not None
     assert hook.spec.name == "vocab_logits"
     assert hook.spec.outputs[0].name == "vocab_logits"
     policy = _megatron_hook_spec(hook)
+    assert policy.shard_policy is ShardPolicy.TP_SHARDED
     assert policy.need_token_range is False
     assert policy.outputs[0].dtype is torch.bfloat16
     assert policy.outputs[0].input_shape == (
@@ -1357,6 +1427,53 @@ def test_setup_vocab_logits_installs_last_stage_raw_identity_hook():
     assert adaptor.attach_calls[0]["model_hooks"][0].hook is hook
 
     handle.close()
+
+
+def test_setup_vocab_logits_has_no_hook_on_non_last_pipeline_stage():
+    model = [TinyGPTModel(post_process=False)]
+
+    def runtime_factory(**kwargs):
+        context = DMIMetadataContext(
+            max_num_microbatches=kwargs["max_num_microbatches"],
+            max_batch_size=kwargs["max_batch_size"],
+            num_scopes=kwargs["num_scopes"],
+            field_specs=kwargs["field_specs"],
+            device="cpu",
+        )
+        return MegatronScheduleRuntime(
+            LocalMetadataPropagator(context), host_engine=kwargs["host_engine"]
+        )
+
+    handle = setup_megatron_dmi(
+        model,
+        args=SimpleNamespace(
+            global_batch_size=2,
+            micro_batch_size=1,
+            seq_length=4,
+            padded_vocab_size=16,
+        ),
+        model_config=SimpleNamespace(params_dtype=torch.bfloat16),
+        explicit_config=MegatronDMIConfig(
+            enabled=True,
+            hook_selection="vocab-logits",
+            model_id="non-last-vocab",
+            dataset_provenance_mode=CONSTANT_PROVENANCE,
+        ),
+        parallel_state_module=FakeParallelState(
+            pp_rank=0, pp_world=2, tp_world=2
+        ),
+        dist_module=FakeDist(initialized=False),
+        unwrap_fn=lambda x: x,
+        engine_factory=_fake_engine_factory,
+        runtime_factory=runtime_factory,
+        adaptor_cls=FakeAdaptor,
+        device="cpu",
+    )
+    try:
+        assert model[0].dmi_vocab_logits is None
+        assert FakeAdaptor.instances[0].attach_calls[0]["model_hooks"] == []
+    finally:
+        handle.close()
 
 
 def test_setup_vocab_logits_topk_installs_two_output_fixed_k_hook():
@@ -1465,17 +1582,26 @@ def test_setup_vocab_logits_topk_rejects_invalid_selection_contract(
 
 
 @pytest.mark.parametrize(
-    ("parallel_state", "message"),
+    ("parallel_state", "hook_selection", "top_k", "message"),
     [
-        (FakeParallelState(tp_world=2), "tensor-model-parallel size 1"),
-        (FakeParallelState(cp_world=2), "context-parallel size 1"),
-    ],
-)
-@pytest.mark.parametrize(
-    ("hook_selection", "top_k"),
-    [
-        ("vocab-logits", None),
-        ("vocab-logits-topk", 4),
+        (
+            FakeParallelState(tp_world=2),
+            "vocab-logits-topk",
+            4,
+            "tensor-model-parallel size 1",
+        ),
+        (
+            FakeParallelState(cp_world=2),
+            "vocab-logits",
+            None,
+            "context-parallel size 1",
+        ),
+        (
+            FakeParallelState(cp_world=2),
+            "vocab-logits-topk",
+            4,
+            "context-parallel size 1",
+        ),
     ],
 )
 def test_setup_vocab_logits_rejects_unsupported_parallelism(
@@ -1501,6 +1627,98 @@ def test_setup_vocab_logits_rejects_unsupported_parallelism(
                 model_id="bad-parallel",
             ),
             parallel_state_module=parallel_state,
+            dist_module=FakeDist(initialized=False),
+            unwrap_fn=lambda x: x,
+        )
+
+
+def test_setup_vocab_logits_parallel_output_false_installs_replicated_with_one_warning():
+    messages = []
+    model = [TinyGPTModel(post_process=True, parallel_output=False)]
+
+    def runtime_factory(**kwargs):
+        context = DMIMetadataContext(
+            max_num_microbatches=kwargs["max_num_microbatches"],
+            max_batch_size=kwargs["max_batch_size"],
+            num_scopes=kwargs["num_scopes"],
+            field_specs=kwargs["field_specs"],
+            device="cpu",
+        )
+        return MegatronScheduleRuntime(
+            LocalMetadataPropagator(context), host_engine=kwargs["host_engine"]
+        )
+
+    handle = setup_megatron_dmi(
+        model,
+        args=SimpleNamespace(
+            global_batch_size=2,
+            micro_batch_size=1,
+            seq_length=4,
+            padded_vocab_size=16,
+        ),
+        model_config=SimpleNamespace(params_dtype=torch.bfloat16),
+        explicit_config=MegatronDMIConfig(
+            enabled=True,
+            hook_selection="vocab-logits",
+            model_id="replicated-vocab",
+            dataset_provenance_mode=CONSTANT_PROVENANCE,
+        ),
+        parallel_state_module=FakeParallelState(tp_world=2),
+        dist_module=FakeDist(initialized=False),
+        unwrap_fn=lambda x: x,
+        engine_factory=_fake_engine_factory,
+        runtime_factory=runtime_factory,
+        adaptor_cls=FakeAdaptor,
+        device="cpu",
+        printer=messages.append,
+    )
+    try:
+        assert _megatron_hook_spec(model[0].dmi_vocab_logits).shard_policy is ShardPolicy.REPLICATED
+        assert FakeAdaptor.instances[0].dims[DimSpec.VOCAB] == 16
+        assert len([message for message in messages if "replicated layout" in message]) == 1
+    finally:
+        handle.close()
+
+
+@pytest.mark.parametrize("hook_selection", ["hidden-states", "resid_final"])
+def test_setup_tp_sequence_hooks_reject_context_parallelism(hook_selection):
+    model = [TinyFinalResidualModel()] if hook_selection == "resid_final" else [TinyModel()]
+    with pytest.raises(NotImplementedError, match="context-parallel size 1"):
+        setup_megatron_dmi(
+            model,
+            args=SimpleNamespace(
+                global_batch_size=2,
+                micro_batch_size=1,
+                seq_length=8,
+            ),
+            model_config=SimpleNamespace(hidden_size=4),
+            explicit_config=MegatronDMIConfig(
+                enabled=True,
+                hook_selection=hook_selection,
+                model_id="cp-unsupported",
+            ),
+            parallel_state_module=FakeParallelState(cp_world=2),
+            dist_module=FakeDist(initialized=False),
+            unwrap_fn=lambda x: x,
+        )
+
+
+def test_setup_tp_sequence_hooks_reject_nondivisible_sequence_length():
+    with pytest.raises(ValueError, match="sequence length divisible"):
+        setup_megatron_dmi(
+            [TinyHiddenStateModel()],
+            args=SimpleNamespace(
+                global_batch_size=2,
+                micro_batch_size=1,
+                seq_length=7,
+            ),
+            model_config=SimpleNamespace(hidden_size=4),
+            explicit_config=MegatronDMIConfig(
+                enabled=True,
+                hook_selection="hidden-states",
+                model_id="nondivisible-sequence",
+            ),
+            parallel_state_module=FakeParallelState(tp_world=2),
             dist_module=FakeDist(initialized=False),
             unwrap_fn=lambda x: x,
         )

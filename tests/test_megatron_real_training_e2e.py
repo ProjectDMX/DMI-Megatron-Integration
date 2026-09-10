@@ -321,7 +321,7 @@ def _tiny_megatron_router_summary_cmd(
     tp_size: int = 1,
     pp_size: int = 1,
     ep_size: int = 1,
-    num_experts: int = 2,
+    num_experts: int | None = 2,
     moe_router_topk: int = 1,
     moe_token_dispatcher_type: str = "allgather",
     transformer_impl: str = "local",
@@ -397,17 +397,6 @@ def _tiny_megatron_router_summary_cmd(
         "--no-gradient-accumulation-fusion",
         "--swiglu",
         "--disable-bias-linear",
-        "--num-experts",
-        str(num_experts),
-        "--moe-router-topk",
-        str(moe_router_topk),
-        "--moe-token-dispatcher-type",
-        str(moe_token_dispatcher_type),
-        "--moe-router-pre-softmax",
-        "--moe-router-load-balancing-type",
-        "aux_loss",
-        "--moe-aux-loss-coeff",
-        "0.01",
         "--no-save-optim",
         "--no-save-rng",
         "--no-load-optim",
@@ -423,6 +412,20 @@ def _tiny_megatron_router_summary_cmd(
         "--dmi-ring-task-entries",
         os.environ.get("DMI_REAL_E2E_RING_TASK_ENTRIES", "1024"),
     ]
+    if num_experts is not None:
+        cmd += [
+            "--num-experts",
+            str(num_experts),
+            "--moe-router-topk",
+            str(moe_router_topk),
+            "--moe-token-dispatcher-type",
+            str(moe_token_dispatcher_type),
+            "--moe-router-pre-softmax",
+            "--moe-router-load-balancing-type",
+            "aux_loss",
+            "--moe-aux-loss-coeff",
+            "0.01",
+        ]
     if database is not None and table is not None:
         cmd += [
             "--dmi-db-host",
@@ -908,6 +911,244 @@ def _file_sink_row_key(row: dict) -> tuple:
         row["attempt_id"],
         row["invocation_id"],
         row["dataset_id"],
+    )
+
+
+def _run_distributed_tensor_file_sink_vs_clickhouse(
+    *,
+    tmp_path: Path,
+    hook_selection: str,
+    act_name: str,
+    train_iters: int,
+    expected_rows: int,
+    extra_args: list[str],
+    graph: bool,
+    transformer_impl: str,
+    expected_local_shape: tuple[int, ...],
+    expected_token_intervals: set[tuple[int, int]],
+) -> None:
+    client = _clickhouse_client_or_skip()
+    database = os.environ.get("DMX_DB_DATABASE", "default")
+    mode = "graph" if graph else "eager"
+    table = f"dmi_megatron_distributed_{act_name}_{mode}_{uuid.uuid4().hex}"
+    model_id = f"megatron-distributed-{act_name}-{mode}-{uuid.uuid4().hex}"
+    file_sink_dir = tmp_path / "file_sink"
+
+    base_env = os.environ.copy()
+    base_env["PYTHONPATH"] = f"{ROOT}:{MEGATRON_ROOT}:{base_env.get('PYTHONPATH', '')}"
+    base_env["DMI_ENABLE"] = "1"
+    base_env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    if "DMI_REAL_E2E_CUDA_VISIBLE_DEVICES" in base_env:
+        base_env["CUDA_VISIBLE_DEVICES"] = base_env["DMI_REAL_E2E_CUDA_VISIBLE_DEVICES"]
+
+    client.execute(f"CREATE DATABASE IF NOT EXISTS `{database}`")
+    client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+    _create_training_table(client, database=database, table=table)
+
+    common_args = ["--dmi-hook-selection", hook_selection, *extra_args]
+    reference_args = list(common_args)
+    target_args = list(common_args)
+    if graph:
+        target_args += [
+            "--cuda-graph-impl",
+            "local",
+            "--cuda-graph-scope",
+            "full_iteration",
+            "--no-check-for-nan-in-loss-and-grad",
+        ]
+
+    try:
+        file_env = dict(base_env)
+        file_env["DMI_TEST_FILE_SINK_DIR"] = str(file_sink_dir)
+        file_cmd = _tiny_megatron_router_summary_cmd(
+            model_id=model_id,
+            train_iters=train_iters,
+            eval_iters=0,
+            micro_batch_size=2,
+            global_batch_size=2,
+            nproc_per_node=2,
+            tp_size=2,
+            num_experts=None,
+            transformer_impl=transformer_impl,
+            extra_args=reference_args,
+        )
+        file_cmd[file_cmd.index("pretrain_gpt.py")] = str(
+            ROOT / "tests" / "oracles" / "run_megatron_file_sink_oracle.py"
+        )
+        _run_megatron_cmd(
+            file_cmd,
+            env=file_env,
+            log_path=tmp_path / f"{act_name}_{mode}_file_sink.log",
+        )
+
+        db_cmd = _tiny_megatron_router_summary_cmd(
+            model_id=model_id,
+            train_iters=train_iters,
+            eval_iters=0,
+            micro_batch_size=2,
+            global_batch_size=2,
+            nproc_per_node=2,
+            tp_size=2,
+            num_experts=None,
+            transformer_impl=transformer_impl,
+            database=database,
+            table=table,
+            extra_args=target_args,
+        )
+        _run_megatron_cmd(
+            db_cmd,
+            env=base_env,
+            log_path=tmp_path / f"{act_name}_{mode}_clickhouse.log",
+        )
+        _wait_for_exact_act_rows(
+            client,
+            database=database,
+            table=table,
+            model_id=model_id,
+            act_name=act_name,
+            expected=expected_rows,
+        )
+
+        db_rows = _read_training_act_rows(
+            model_id=model_id,
+            table=table,
+            database=database,
+            act_name=act_name,
+        )
+        file_rows = [
+            (row, tensor)
+            for row, tensor in _read_file_sink_rows(file_sink_dir)
+            if row["act_name"] == act_name
+        ]
+        assert len(file_rows) == expected_rows
+        assert len(db_rows) == expected_rows
+
+        file_by_key = {_file_sink_row_key(row): tensor for row, tensor in file_rows}
+        db_by_key = {key: tensor for key, tensor in db_rows}
+        assert len(file_by_key) == expected_rows
+        assert len(db_by_key) == expected_rows
+        assert set(file_by_key) == set(db_by_key)
+        assert {tuple(tensor.shape) for tensor in file_by_key.values()} == {
+            expected_local_shape
+        }
+        assert {key[9] for key in file_by_key} == {0, 1}
+        assert {(key[10], key[11]) for key in file_by_key} == expected_token_intervals
+        if graph:
+            _assert_tensor_maps_close_with_report(
+                file_by_key,
+                db_by_key,
+                label=f"eager vs full-iteration graph {act_name}",
+                atol=float(os.environ.get("DMI_GRAPH_NUMERIC_E2E_ATOL", "5e-2")),
+                rtol=float(os.environ.get("DMI_GRAPH_NUMERIC_E2E_RTOL", "1e-1")),
+            )
+        else:
+            _assert_tensor_maps_close_with_report(
+                file_by_key,
+                db_by_key,
+                label=f"eager file sink vs eager ClickHouse {act_name}",
+                atol=0.0,
+                rtol=0.0,
+            )
+    finally:
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_float`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_int`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_eval_phase_boundary`")
+        client.disconnect()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Distributed tensor E2E needs CUDA"
+)
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "full_iteration_graph"])
+@pytest.mark.parametrize(
+    (
+        "case_name",
+        "hook_selection",
+        "act_name",
+        "extra_args",
+        "rows_per_iteration",
+        "transformer_impl",
+        "expected_local_shape",
+        "expected_token_intervals",
+    ),
+    [
+        pytest.param(
+            "hidden_states_sp_off",
+            "hidden-states",
+            "hidden_states",
+            [],
+            8,
+            "local",
+            (8, 64),
+            {(0, 8), (8, 16)},
+            id="hidden_states_sp_off",
+        ),
+        pytest.param(
+            "hidden_states_sp_on",
+            "hidden-states",
+            "hidden_states",
+            ["--sequence-parallel", "--attention-backend", "unfused"],
+            8,
+            "transformer_engine",
+            (8, 64),
+            {(0, 8), (8, 16)},
+            id="hidden_states_sp_on",
+        ),
+        pytest.param(
+            "resid_final",
+            "resid_final",
+            "hook_resid_final",
+            [],
+            4,
+            "local",
+            (8, 64),
+            {(0, 8), (8, 16)},
+            id="resid_final",
+        ),
+        pytest.param(
+            "vocab_logits",
+            "vocab-logits",
+            "vocab_logits",
+            [],
+            4,
+            "local",
+            (16, 128),
+            {(0, 1)},
+            id="vocab_logits",
+        ),
+    ],
+)
+def test_real_megatron_distributed_tensor_eager_and_graph_correctness(
+    tmp_path,
+    graph,
+    case_name,
+    hook_selection,
+    act_name,
+    extra_args,
+    rows_per_iteration,
+    transformer_impl,
+    expected_local_shape,
+    expected_token_intervals,
+):
+    """Compare exact eager rows and tolerant graph rows for TP-distributed tensors."""
+
+    del case_name
+    if _available_cuda_devices() < 2:
+        pytest.skip("distributed tensor E2E requires two CUDA devices")
+    train_iters = 3 if graph else 1
+    _run_distributed_tensor_file_sink_vs_clickhouse(
+        tmp_path=tmp_path,
+        hook_selection=hook_selection,
+        act_name=act_name,
+        train_iters=train_iters,
+        expected_rows=train_iters * rows_per_iteration,
+        extra_args=extra_args,
+        graph=graph,
+        transformer_impl=transformer_impl,
+        expected_local_shape=expected_local_shape,
+        expected_token_intervals=expected_token_intervals,
     )
 
 

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -48,7 +49,7 @@ def _fake_gpt(hook, *, topk_hook=None):
     return model
 
 
-def _postprocess(model, hidden_states):
+def _postprocess(model, hidden_states, *, runtime_gather_output=None):
     return model._postprocess(
         hidden_states=hidden_states,
         input_ids=None,
@@ -64,7 +65,7 @@ def _postprocess(model, hidden_states):
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
-        runtime_gather_output=None,
+        runtime_gather_output=runtime_gather_output,
         extra_block_kwargs=None,
         inference_context=None,
         is_spec_decode=None,
@@ -131,3 +132,14 @@ def test_gpt_vocab_topk_hook_observes_same_post_scale_pre_loss_logits():
     assert len(topk_captured) == 1
     assert torch.equal(dense_captured[0], expected)
     assert torch.equal(topk_captured[0], expected)
+
+
+def test_raw_vocab_hook_rejects_runtime_layout_override_before_output_layer():
+    model = _fake_gpt(lambda _value: None)
+
+    with pytest.raises(AssertionError, match="fixed GPTModel.parallel_output layout"):
+        _postprocess(
+            model,
+            torch.ones((2, 1, 3)),
+            runtime_gather_output=True,
+        )

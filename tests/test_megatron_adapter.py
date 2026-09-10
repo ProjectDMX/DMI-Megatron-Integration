@@ -19,15 +19,18 @@ from dmi_megatron_integration.hooks.specs import (
     HookInputLayout,
     HookPhase,
     HookRuntimeMode,
+    MegatronDistributedInfo,
     MegatronHookSpec,
     MegatronMetadataField,
     MegatronOutputSpec,
+    ShardPolicy,
 )
 from dmi_megatron_integration.metadata_context import (
     DMIMetadataContext,
     segment_metadata_field_spec,
     valid_count_field_spec,
 )
+from dmi_megatron_integration.records.format import MegatronRecordFormat
 from dmi.api.v1 import (
     HookPointV1,
     HookSpecV1,
@@ -171,6 +174,26 @@ def _make_hook(
     hook.hook_phase = hook_phase
     hook.suppress_recompute = bool(suppress_recompute)
     return hook
+
+
+def _tp_sequence_distributed_info(
+    *, tp_rank: int, sequence_parallel_enabled: bool
+) -> MegatronDistributedInfo:
+    return MegatronDistributedInfo(
+        global_rank=tp_rank,
+        world_size=2,
+        tp_rank=tp_rank,
+        tp_world_size=2,
+        pp_rank=0,
+        pp_world_size=1,
+        dp_rank=0,
+        dp_world_size=1,
+        ep_rank=0,
+        ep_world_size=1,
+        cp_rank=0,
+        cp_world_size=1,
+        sequence_parallel_enabled=sequence_parallel_enabled,
+    )
 
 
 class TinyModel(nn.Module):
@@ -644,6 +667,202 @@ def test_resolved_output_shape_matches_presplit_runtime_ownership(
     )
 
     assert resolved.output_shape == expected_output_shape
+
+
+@pytest.mark.parametrize("sequence_parallel_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("tp_rank", "expected_counts", "expected_start"),
+    [(0, (4, 2), 0), (1, (3, 0), 4)],
+)
+def test_tp_sequence_sharded_hook_uses_one_local_interval(
+    sequence_parallel_enabled,
+    tp_rank,
+    expected_counts,
+    expected_start,
+):
+    info = _tp_sequence_distributed_info(
+        tp_rank=tp_rank,
+        sequence_parallel_enabled=sequence_parallel_enabled,
+    )
+    hook = _make_hook(
+        MegatronHookSpec(
+            name="hidden_states",
+            layer_no=2,
+            outputs=(
+                MegatronOutputSpec(
+                    name="hidden_states",
+                    input_shape=(DimSpec.SEQ, DimSpec.BATCH, 2),
+                    output_shape=(DimSpec.ACTUAL_TOKEN_PACKED, 2),
+                    dtype=torch.float32,
+                    transport_type=TransportType.SEQ_PREFIX_PACK,
+                ),
+            ),
+            shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
+        )
+    )
+    hook.megatron_distributed_info = info
+    metadata = DMIMetadataContext(
+        max_num_microbatches=1,
+        max_batch_size=2,
+        num_scopes=1,
+        dims={DimSpec.SEQ: 8},
+        megatron_distributed_info=info,
+        tp_sequence_sharded_enabled=True,
+        device="cpu",
+    )
+    metadata.begin_iteration(1)
+    metadata.ingest_microbatch(0, {"valid_count": [7, 2]})
+    metadata.enter_scope("fwd", 0, 0)
+    engine = FakeEngine()
+    adaptor = _make_adaptor(
+        engine,
+        "train-run",
+        dims={DimSpec.SEQ: 8, DimSpec.BATCH: 2},
+    )
+    adaptor.attach_hooks(
+        model_hooks=(
+            MegatronHookBinding(hook=hook, record_shard_rank=tp_rank),
+        ),
+        iteration_hooks=(),
+        metadata_context=metadata,
+    )
+    adaptor.set_current_event(
+        MegatronTrainingContext(
+            global_batch_id=3,
+            microbatch_id=0,
+            valid_counts=(7, 2),
+            direction="fwd",
+            token_start=0,
+        )
+    )
+    global_input = torch.arange(8 * 2 * 2, dtype=torch.float32).reshape(8, 2, 2)
+    hook_input = (
+        global_input.narrow(0, expected_start, 4)
+        if sequence_parallel_enabled
+        else global_input
+    )
+
+    hook(hook_input)
+
+    entry, record_metadata, output = engine.record_runtime.emit_calls[-1]
+    assert tuple(hook.spec.outputs[0].output_shape) == (-1, 2)
+    assert output.tensor.shape == (4, 2, 2)
+    assert torch.equal(
+        output.tensor,
+        global_input.narrow(0, expected_start, 4),
+    )
+    assert torch.equal(output.producer_meta[0], torch.tensor(expected_counts))
+    assert torch.equal(
+        output.producer_meta[1],
+        torch.tensor((0, expected_counts[0], sum(expected_counts))),
+    )
+    assert record_metadata.valid_counts == expected_counts
+    assert record_metadata.token_start == expected_start
+    assert record_metadata.shard_rank == tp_rank
+    assert hook.valid_count_fwd.data_ptr() == metadata.current(
+        "tp_seq_sharded_valid_count", "fwd", 0
+    ).data_ptr()
+    assert set(metadata.active_cpu_packets(0)) == {torch.int64}
+    assert metadata.active_cpu_packets(0)[torch.int64].numel() == 2
+    descriptor = MegatronRecordFormat("training").encode(record_metadata, entry)
+    slices = tuple(row[-1] for row in descriptor.rows)
+    if tp_rank == 0:
+        assert tuple((item.offset_bytes, item.nbytes, item.shape) for item in slices) == (
+            (0, 32, (4, 2)),
+            (32, 16, (2, 2)),
+        )
+    else:
+        assert tuple((item.offset_bytes, item.nbytes, item.shape) for item in slices) == (
+            (0, 24, (3, 2)),
+        )
+
+
+def test_tp_sequence_interval_is_part_of_captured_semantics():
+    def build_semantics(tp_rank: int):
+        info = _tp_sequence_distributed_info(
+            tp_rank=tp_rank, sequence_parallel_enabled=False
+        )
+        hook = _make_hook(
+            MegatronHookSpec(
+                name="hidden_states",
+                layer_no=0,
+                outputs=(
+                    MegatronOutputSpec(
+                        name="hidden_states",
+                        input_shape=(DimSpec.SEQ, DimSpec.BATCH, 2),
+                        output_shape=(DimSpec.ACTUAL_TOKEN_PACKED, 2),
+                        dtype=torch.float32,
+                        transport_type=TransportType.SEQ_PREFIX_PACK,
+                    ),
+                ),
+                shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
+            )
+        )
+        hook.megatron_distributed_info = info
+        metadata = DMIMetadataContext(
+            max_num_microbatches=1,
+            max_batch_size=1,
+            num_scopes=1,
+            dims={DimSpec.SEQ: 8},
+            megatron_distributed_info=info,
+            tp_sequence_sharded_enabled=True,
+            device="cpu",
+        )
+        adaptor = _make_adaptor(
+            FakeEngine(),
+            "train-run",
+            dims={DimSpec.SEQ: 8, DimSpec.BATCH: 1},
+        )
+        adaptor.attach_hooks(
+            model_hooks=(
+                MegatronHookBinding(hook=hook, record_shard_rank=tp_rank),
+            ),
+            iteration_hooks=(),
+            metadata_context=metadata,
+        )
+        return adaptor._producer_semantics(
+            hook=hook,
+            output_id=FIRST_RECORD_OUTPUT_ID,
+            output_spec=hook.spec.outputs[0],
+        )
+
+    rank0 = build_semantics(0)
+    rank1 = build_semantics(1)
+    assert (rank0.tp_sequence_start, rank0.tp_sequence_length) == (0, 4)
+    assert (rank1.tp_sequence_start, rank1.tp_sequence_length) == (4, 4)
+    assert rank0.signature != rank1.signature
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
+def test_tp_sequence_local_valid_count_updates_inside_cuda_graph():
+    info = _tp_sequence_distributed_info(
+        tp_rank=1, sequence_parallel_enabled=True
+    )
+    metadata = DMIMetadataContext(
+        max_num_microbatches=1,
+        max_batch_size=2,
+        num_scopes=1,
+        dims={DimSpec.SEQ: 8},
+        megatron_distributed_info=info,
+        tp_sequence_sharded_enabled=True,
+        device="cuda",
+    )
+    metadata.begin_iteration(1)
+    metadata.ingest_microbatch(0, {"valid_count": [7, 2]})
+    torch.cuda.synchronize()
+    metadata.enter_scope("fwd", 0, 0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        metadata.enter_scope("fwd", 0, 0)
+
+    metadata.load_source_microbatch(0, {"valid_count": [5, 8]})
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        metadata.current("tp_seq_sharded_valid_count", "fwd", 0).cpu(),
+        torch.tensor([1, 4]),
+    )
 
 
 def test_prepare_immediate_output_pushes_one_metadata_row_for_current_event():

@@ -27,6 +27,7 @@ class ShardPolicy(Enum):
     REPLICATED = "replicated"
     GLOBAL_RANK_SHARDED = "global_rank_sharded"
     TP_SHARDED = "tp_sharded"
+    TP_SEQUENCE_SHARDED = "tp_sequence_sharded"
     EP_SHARDED = "ep_sharded"
     DP_SHARDED = "dp_sharded"
     CP_SHARDED = "cp_sharded"
@@ -72,6 +73,25 @@ class DimSpec(Enum):
 
 
 SymbolicDim = int | DimSpec | str
+
+
+@dataclass(frozen=True, slots=True)
+class MegatronDistributedInfo:
+    """Immutable process-local Megatron parallel coordinates for bound hooks."""
+
+    global_rank: int
+    world_size: int
+    tp_rank: int
+    tp_world_size: int
+    pp_rank: int
+    pp_world_size: int
+    dp_rank: int
+    dp_world_size: int
+    ep_rank: int
+    ep_world_size: int
+    cp_rank: int
+    cp_world_size: int
+    sequence_parallel_enabled: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +335,7 @@ __all__ = [
     "HookPhase",
     "HookRuntimeMode",
     "MegatronMetadataField",
+    "MegatronDistributedInfo",
     "MegatronHookSpec",
     "MegatronOutputSpec",
     "ShardPolicy",

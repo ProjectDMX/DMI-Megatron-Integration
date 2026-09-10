@@ -27,8 +27,10 @@ from .hooks.specs import (
     HookInputLayout,
     HookPhase,
     HookRuntimeMode,
+    MegatronDistributedInfo,
     MegatronHookSpec,
     MegatronMetadataField,
+    ShardPolicy,
 )
 from .metadata_context import DMIMetadataContext
 from .records.format import required_record_metadata_fields
@@ -127,6 +129,8 @@ class _ProducerSemantics:
     need_token_range: bool
     suppress_recompute: bool
     record_direction: str
+    tp_sequence_start: int | None = None
+    tp_sequence_length: int | None = None
 
     @property
     def signature(self) -> tuple[object, ...]:
@@ -141,6 +145,8 @@ class _ProducerSemantics:
             self.need_token_range,
             self.suppress_recompute,
             self.record_direction,
+            self.tp_sequence_start,
+            self.tp_sequence_length,
         )
 
 
@@ -218,6 +224,8 @@ class _ConfiguredHook:
     scope_id: int
     record_dp_rank: int | None
     record_shard_rank: int | None
+    tp_sequence_start: int | None
+    tp_sequence_length: int | None
 
 
 @dataclass(frozen=True)
@@ -660,6 +668,9 @@ class MegatronAdaptor:
         for binding in bindings:
             hook = binding.hook
             policy = self._hook_policy(hook)
+            tp_sequence_start, tp_sequence_length = self._tp_sequence_interval(
+                hook, policy
+            )
             is_iteration = id(hook) in iteration_ids
             self._validate_binding(
                 binding,
@@ -676,6 +687,7 @@ class MegatronAdaptor:
                             metadata_context,
                             binding.scope_id,
                             phase,
+                            policy,
                         )
                     elif metadata_field is MegatronMetadataField.SEGMENT_METADATA:
                         self._bind_segment_context(
@@ -689,11 +701,22 @@ class MegatronAdaptor:
                             "unsupported hook binding metadata field: "
                             f"{metadata_field.value}"
                         )
-            physical = policy.resolve(self.dims)
+            hook_dims = self.dims
+            if tp_sequence_length is not None:
+                hook_dims = dict(self.dims)
+                hook_dims[DimSpec.SEQ] = tp_sequence_length
+                hook_dims[DimSpec.SEQ.value] = tp_sequence_length
+            physical = policy.resolve(hook_dims)
             physical = HookSpecV1(
                 name=physical.name,
                 outputs=physical.outputs,
-                preprocess=self._record_preprocess(hook, physical),
+                preprocess=self._record_preprocess(
+                    hook,
+                    physical,
+                    policy=policy,
+                    tp_sequence_start=tp_sequence_start,
+                    tp_sequence_length=tp_sequence_length,
+                ),
                 enabled_by=physical.enabled_by,
             )
             hook.spec = physical
@@ -704,6 +727,8 @@ class MegatronAdaptor:
                 scope_id=int(binding.scope_id),
                 record_dp_rank=binding.record_dp_rank,
                 record_shard_rank=binding.record_shard_rank,
+                tp_sequence_start=tp_sequence_start,
+                tp_sequence_length=tp_sequence_length,
             )
             self.configured_hooks.append(configured)
             self._configured_by_hook[id(hook)] = configured
@@ -765,6 +790,54 @@ class MegatronAdaptor:
                 f"DMI hook {policy.name!r} does not support input layout "
                 f"{active_input_layout.value!r}"
             )
+
+    def _tp_sequence_interval(
+        self,
+        hook: HookPointV1,
+        policy: MegatronHookSpec,
+    ) -> tuple[int | None, int | None]:
+        if policy.shard_policy is not ShardPolicy.TP_SEQUENCE_SHARDED:
+            return None, None
+        if policy.name not in {"hidden_states", "resid_final"}:
+            raise ValueError(
+                "TP_SEQUENCE_SHARDED is currently supported only for "
+                "hidden_states and resid_final"
+            )
+        if policy.record_type is not RecordType.PER_SAMPLE or len(policy.outputs) != 1:
+            raise ValueError(
+                "TP_SEQUENCE_SHARDED requires one PER_SAMPLE output"
+            )
+        output = policy.outputs[0]
+        if (
+            tuple(output.input_shape[:2]) != (DimSpec.SEQ, DimSpec.BATCH)
+            or output.transport_type is not TransportType.SEQ_PREFIX_PACK
+        ):
+            raise ValueError(
+                "TP_SEQUENCE_SHARDED requires [SEQ, BATCH, ...] "
+                "SEQ_PREFIX_PACK input"
+            )
+        distributed_info = getattr(hook, "megatron_distributed_info", None)
+        if not isinstance(distributed_info, MegatronDistributedInfo):
+            raise TypeError(
+                "TP_SEQUENCE_SHARDED hook requires MegatronDistributedInfo"
+            )
+        global_sequence_length = self.dims.get(
+            DimSpec.SEQ, self.dims.get(DimSpec.SEQ.value)
+        )
+        if global_sequence_length is None:
+            raise KeyError("TP_SEQUENCE_SHARDED requires DimSpec.SEQ")
+        tp_world_size = int(distributed_info.tp_world_size)
+        tp_rank = int(distributed_info.tp_rank)
+        if tp_world_size <= 0 or not 0 <= tp_rank < tp_world_size:
+            raise ValueError("invalid TP rank or world size in MegatronDistributedInfo")
+        if int(global_sequence_length) % tp_world_size != 0:
+            raise ValueError(
+                "DMI TP sequence sharding requires sequence length divisible by "
+                f"tensor-model-parallel size: {global_sequence_length} % "
+                f"{tp_world_size} != 0"
+            )
+        local_length = int(global_sequence_length) // tp_world_size
+        return tp_rank * local_length, local_length
 
     def begin_attempt(self, *, phase: str, global_batch_id: int, attempt_id: int) -> None:
         if self.invocation_allocator is not None:
@@ -1040,6 +1113,17 @@ class MegatronAdaptor:
                 else ()
             )
             token_start = int(ctx.token_start) if semantic.need_token_range else 0
+            if semantic.tp_sequence_start is not None:
+                if semantic.tp_sequence_length is None:
+                    raise RuntimeError("TP sequence semantic is missing its length")
+                start = int(semantic.tp_sequence_start)
+                length = int(semantic.tp_sequence_length)
+                valid_counts = tuple(
+                    max(0, min(length, int(value) - start))
+                    for value in valid_counts
+                )
+                if semantic.need_token_range:
+                    token_start += start
         else:
             if semantic.record_dp_rank is None:
                 raise RuntimeError("non-sample record is missing its semantic DP rank")
@@ -1134,6 +1218,8 @@ class MegatronAdaptor:
                 if hook_phase is HookPhase.ITERATION
                 else hook_phase.name.lower()
             ),
+            tp_sequence_start=configured.tp_sequence_start,
+            tp_sequence_length=configured.tp_sequence_length,
         )
 
     def _remember_plan(
@@ -1223,6 +1309,7 @@ class MegatronAdaptor:
         metadata_context: DMIMetadataContext,
         scope_id: int,
         phase: HookPhase,
+        policy: MegatronHookSpec,
     ) -> None:
         if phase not in (HookPhase.FWD, HookPhase.BWD):
             raise ValueError("valid-count metadata requires an FWD or BWD hook phase")
@@ -1230,7 +1317,15 @@ class MegatronAdaptor:
         setattr(
             hook,
             f"valid_count_{direction}",
-            metadata_context.current("valid_count", direction, scope_id),
+            metadata_context.current(
+                (
+                    "tp_seq_sharded_valid_count"
+                    if policy.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
+                    else "valid_count"
+                ),
+                direction,
+                scope_id,
+            ),
         )
 
     @staticmethod
@@ -1254,22 +1349,69 @@ class MegatronAdaptor:
         self,
         hook: HookPointV1,
         physical: HookSpecV1,
+        *,
+        policy: MegatronHookSpec,
+        tp_sequence_start: int | None,
+        tp_sequence_length: int | None,
     ) -> Any:
         original = physical.preprocess
+        sequence_sharded = policy.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
         if not any(
             item.transport_type in (
                 TransportType.SEQ_PREFIX_PACK,
                 TransportType.SEGMENTED_PACK,
             )
             for item in physical.outputs
-        ):
+        ) and not sequence_sharded:
             return original
 
+        sequence_parallel_enabled = False
+        global_sequence_length = None
+        if sequence_sharded:
+            distributed_info = getattr(hook, "megatron_distributed_info", None)
+            if not isinstance(distributed_info, MegatronDistributedInfo):
+                raise TypeError(
+                    "TP_SEQUENCE_SHARDED hook requires MegatronDistributedInfo"
+                )
+            sequence_parallel_enabled = bool(
+                distributed_info.sequence_parallel_enabled
+            )
+            global_sequence_length = self.dims.get(
+                DimSpec.SEQ, self.dims.get(DimSpec.SEQ.value)
+            )
+            assert tp_sequence_start is not None
+            assert tp_sequence_length is not None
+
         def preprocess(*inputs: Any) -> Any:
+            adjusted_inputs = inputs
+            if sequence_sharded:
+                if not inputs or not isinstance(inputs[0], torch.Tensor):
+                    raise TypeError(
+                        "TP_SEQUENCE_SHARDED preprocessing requires a Tensor input"
+                    )
+                input_tensor = inputs[0]
+                expected_length = (
+                    int(tp_sequence_length)
+                    if sequence_parallel_enabled
+                    else int(global_sequence_length)
+                )
+                if input_tensor.dim() < 2 or int(input_tensor.shape[0]) != expected_length:
+                    raise ValueError(
+                        "TP_SEQUENCE_SHARDED input has the wrong sequence dimension: "
+                        f"expected {expected_length}, got "
+                        f"{tuple(int(value) for value in input_tensor.shape)}"
+                    )
+                if not sequence_parallel_enabled:
+                    input_tensor = input_tensor.narrow(
+                        0, int(tp_sequence_start), int(tp_sequence_length)
+                    )
+                adjusted_inputs = (input_tensor, *inputs[1:])
             raw = (
-                original(*inputs)
+                original(*adjusted_inputs)
                 if original is not None
-                else inputs[0] if len(physical.outputs) == 1 and len(inputs) == 1 else inputs
+                else adjusted_inputs[0]
+                if len(physical.outputs) == 1 and len(adjusted_inputs) == 1
+                else adjusted_inputs
             )
             values = [raw] if len(physical.outputs) == 1 else list(raw)
             if len(values) != len(physical.outputs):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import torch
 
@@ -21,7 +21,7 @@ from .adapter import (
     MegatronTrainingContext,
 )
 from dmi.api.v1 import ProducerPlan, StepReservation
-from .hooks.specs import HookPhase
+from .hooks.specs import DimSpec, HookPhase, MegatronDistributedInfo
 from .records.format import (
     EVALUATION_BOUNDARY_CELL_TYPES,
     EVALUATION_BOUNDARY_LAYOUT_NAME,
@@ -1084,6 +1084,9 @@ def build_megatron_schedule_runtime(
     expert_model_parallel_size: int = 1,
     rank_order: str = "tp-cp-ep-dp-pp",
     field_specs: tuple[DMIMetadataFieldSpec, ...] | list[DMIMetadataFieldSpec] | None = None,
+    dims: Mapping[str | DimSpec, int] | None = None,
+    megatron_distributed_info: MegatronDistributedInfo | None = None,
+    tp_sequence_sharded_enabled: bool = False,
     host_engine: Any | None = None,
 ) -> MegatronScheduleRuntime:
     """Build a Megatron schedule runtime from Megatron parallel-state APIs."""
@@ -1101,6 +1104,9 @@ def build_megatron_schedule_runtime(
         max_batch_size=max_batch_size,
         num_scopes=num_scopes,
         field_specs=field_specs,
+        dims=dims,
+        megatron_distributed_info=megatron_distributed_info,
+        tp_sequence_sharded_enabled=tp_sequence_sharded_enabled,
         device=device,
     )
 
