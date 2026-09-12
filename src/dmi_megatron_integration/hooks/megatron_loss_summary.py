@@ -48,8 +48,8 @@ def per_sample_loss_from_token_loss(
             f"{tuple(output_tensor.shape)} != {tuple(loss_mask.shape)}"
         )
 
-    token_loss = output_tensor.float()
-    mask = loss_mask.float()
+    token_loss = output_tensor.detach().float()
+    mask = loss_mask.detach().float()
     loss_sum = (token_loss * mask).sum(dim=1)
     token_count = mask.sum(dim=1)
     loss_mean = loss_sum / token_count.clamp_min(1)

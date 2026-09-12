@@ -6,6 +6,24 @@ The integration package version is `0.17.1` and requires DMI `>=1.2.0,<2.0`. The
 
 For a source setup, clone this repository recursively and follow the [installation guide](docs/install.md). The guide records the tested Python, PyTorch, CUDA, and Transformer Engine stack and installs the pinned fork rather than an unrelated `megatron-core` release.
 
+## Q/K weight hooks
+
+Select `--dmi-hook-selection q-weights,k-weights` with DMI enabled (either name
+can also be selected independently). These V1 hooks record
+`query_projection_weight` and `key_projection_weight` at initialization/resume
+and after each successful optimizer update, following the router-weight hooks.
+They do not run per microbatch or during recomputation.
+
+Each record contains a contiguous `[local_projection_rows, hidden_size]` tensor
+extracted from the live grouped QKV parameter by the hook's GPU `preprocess`
+callback, without V. The emitter passes QKV directly; only the selected Q or K
+output is offloaded. Global layer IDs
+identify PP ownership; `shard_rank` identifies the TP shard. Standard MHA/GQA
+SelfAttention and its OLMoE subclass are supported. As with router weights,
+DP must be 1; `reuse_grad_buf_for_mxfp8_param_ag` with `overlap_param_gather` is
+unsupported. Q/K extraction also rejects gated attention, FP8/FP4 modes, and
+TP sizes greater than the number of KV heads.
+
 ## Recurring D2H windows
 
 With DMI enabled, opt in with `--dmi-recurring-d2h-windows` (or

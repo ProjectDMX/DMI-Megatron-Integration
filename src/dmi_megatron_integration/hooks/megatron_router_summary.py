@@ -24,6 +24,7 @@ def _validate_logits_and_counts(
 
 
 def _router_probs_from_logits(logits: torch.Tensor, score_function: str) -> torch.Tensor:
+    logits = logits.detach()
     if score_function == "softmax":
         return torch.softmax(logits, dim=-1, dtype=torch.float32)
     if score_function == "sigmoid":

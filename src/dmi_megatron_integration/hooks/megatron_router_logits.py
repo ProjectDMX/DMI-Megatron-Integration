@@ -10,7 +10,7 @@ def router_logits_by_sample(logits: torch.Tensor) -> torch.Tensor:
 
     if logits.dim() != 3:
         raise ValueError(f"Expected router logits [S, B, E], got {tuple(logits.shape)}")
-    return logits.transpose(0, 1)
+    return logits.detach().transpose(0, 1)
 
 
 __all__ = ["router_logits_by_sample"]

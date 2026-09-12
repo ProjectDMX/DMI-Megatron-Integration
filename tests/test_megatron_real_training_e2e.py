@@ -2746,6 +2746,76 @@ def test_real_megatron_router_weights_cover_pipeline_stages_once(tmp_path):
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Real Megatron Q/K E2E needs CUDA")
+@pytest.mark.parametrize("pp_size,tp_size", [(1, 1), (2, 1), (1, 2)])
+def test_real_megatron_qk_weights_once_per_state_with_recompute(tmp_path, pp_size, tp_size):
+    """Q/K only: two microbatches and full recompute must not duplicate weights."""
+    ranks = pp_size * tp_size
+    if _available_cuda_devices() < ranks:
+        pytest.skip(f"Q/K E2E requires {ranks} available CUDA devices")
+    client = _clickhouse_client_or_skip()
+    database = os.environ.get("DMX_DB_DATABASE", "default")
+    table = f"dmi_megatron_qk_weight_e2e_{uuid.uuid4().hex}"
+    model_id = f"megatron-qk-weight-e2e-{uuid.uuid4().hex}"
+    log_path = tmp_path / "megatron_qk_weights.log"
+    train_iters = 2
+    expected_per_projection = (train_iters + 1) * 2 * tp_size
+    client.execute(f"CREATE DATABASE IF NOT EXISTS `{database}`")
+    _create_training_table(client, database=database, table=table)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{ROOT}:{MEGATRON_ROOT}:{env.get('PYTHONPATH', '')}"
+    env["DMI_ENABLE"] = "1"
+    env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    if "DMI_REAL_E2E_CUDA_VISIBLE_DEVICES" in env:
+        env["CUDA_VISIBLE_DEVICES"] = env["DMI_REAL_E2E_CUDA_VISIBLE_DEVICES"]
+    cmd = _tiny_megatron_router_summary_cmd(
+        model_id=model_id, train_iters=train_iters, micro_batch_size=2,
+        global_batch_size=4, nproc_per_node=ranks, pp_size=pp_size,
+        tp_size=tp_size, database=database, table=table,
+        extra_args=[
+            "--dmi-hook-selection", "q-weights,k-weights",
+            "--group-query-attention", "--num-query-groups", "2",
+            "--recompute-granularity", "full", "--recompute-method", "uniform",
+            "--recompute-num-layers", "1",
+        ] + (["--sequence-parallel"] if tp_size > 1 else []),
+    )
+    try:
+        _run_megatron_cmd(cmd, env=env, log_path=log_path)
+        _wait_for_exact_model_rows(
+            client, database=database, table=table, model_id=model_id,
+            expected=2 * expected_per_projection,
+        )
+        for name, projection_rows in (("query_projection_weight", 64), ("key_projection_weight", 32)):
+            rows = _read_training_act_rows(
+                model_id=model_id, table=table, database=database,
+                act_name=name, direction="iter",
+            )
+            assert len(rows) == expected_per_projection
+            assert len({key for key, _value in rows}) == expected_per_projection
+            assert {(key[4], key[8], key[9]) for key, _value in rows} == {
+                (iteration, layer, tp_rank) for iteration in range(train_iters + 1)
+                for layer in range(2) for tp_rank in range(tp_size)
+            }
+            states = {}
+            for key, value in rows:
+                assert key[3] == "train"
+                assert key[5:8] == (-1, -1, -1)
+                assert key[10:12] == (0, 1)
+                assert tuple(value.shape) == (projection_rows // tp_size, 64)
+                assert torch.isfinite(value).all()
+                states[key[4], key[8], key[9]] = value
+            for layer in range(2):
+                for tp_rank in range(tp_size):
+                    assert not torch.equal(states[0, layer, tp_rank], states[train_iters, layer, tp_rank])
+    finally:
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_float`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_int`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_eval_phase_boundary`")
+        client.disconnect()
+
+
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Real Megatron rerun E2E needs CUDA")
 def test_real_megatron_pp2_rerun_reuses_logical_training_ids(tmp_path):
     """Verify in-process reruns duplicate coordinates without shifting later IDs."""

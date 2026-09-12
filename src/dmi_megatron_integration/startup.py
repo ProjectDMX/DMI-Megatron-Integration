@@ -7,6 +7,7 @@ import os
 import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Mapping
 
 import torch
@@ -36,6 +37,7 @@ from .hooks.megatron_loss_summary import (
     per_sample_loss_from_token_loss,
     per_segment_loss_from_token_loss,
 )
+from .hooks.megatron_qk_weights import qk_weight_from_fused_qkv
 from .hooks.megatron_vocab_logits import (
     vocab_logits_by_sample,
     vocab_logits_topk_by_sample,
@@ -119,6 +121,7 @@ class MegatronDMIHandle:
         current_phase_tensor: torch.Tensor,
         grad_norm_hook: HookPointV1 | None = None,
         router_weight_bindings: tuple[MegatronRouterWeightBinding, ...] = (),
+        qk_weight_bindings: tuple[tuple[HookPointV1, torch.nn.Parameter], ...] = (),
     ) -> None:
         self.config = config
         self.model_id = model_id
@@ -128,6 +131,7 @@ class MegatronDMIHandle:
         self.current_phase_tensor = current_phase_tensor
         self.grad_norm_hook = grad_norm_hook
         self.router_weight_bindings = tuple(router_weight_bindings)
+        self.qk_weight_bindings = tuple(qk_weight_bindings)
         self.closed = False
 
     def _emit_iteration_values(
@@ -184,6 +188,20 @@ class MegatronDMIHandle:
 
     def emit_initial_router_weights(self, *, model_state_iteration_id: int) -> None:
         self.emit_router_weights(
+            model_state_iteration_id=model_state_iteration_id,
+            allow_zero=True,
+        )
+
+    def emit_qk_weights(self, *, model_state_iteration_id: int, allow_zero: bool = False) -> None:
+        # Pass live QKV parameters; each hook preprocesses its own Q/K output.
+        self._emit_iteration_values(
+            global_batch_id=model_state_iteration_id,
+            values=self.qk_weight_bindings,
+            allow_zero=allow_zero,
+        )
+
+    def emit_initial_qk_weights(self, *, model_state_iteration_id: int) -> None:
+        self.emit_qk_weights(
             model_state_iteration_id=model_state_iteration_id,
             allow_zero=True,
         )
@@ -1629,6 +1647,109 @@ def _router_weight_bindings(
     return tuple(hook_bindings), tuple(parameter_bindings)
 
 
+def _qk_weight_bindings(
+    model: Any,
+    *,
+    rank_ctx: MegatronRankContext,
+    selected_hooks: set[str],
+) -> tuple[
+    tuple[MegatronHookBinding, ...],
+    tuple[tuple[HookPointV1, torch.nn.Parameter], ...],
+]:
+    """Bind standard Megatron/OLMoE self-attention Q/K weights, never V."""
+    hook_bindings: list[MegatronHookBinding] = []
+    parameter_bindings: list[tuple[HookPointV1, torch.nn.Parameter]] = []
+    seen_modules: set[int] = set()
+    seen_layers: set[int] = set()
+    for root in _model_roots(model):
+        for module in root.modules():
+            # Include subclasses such as OlmoeSelfAttention, but not the nested
+            # DotProductAttention, which also has attention_type="self".
+            if not any(cls.__name__ == "SelfAttention" for cls in type(module).__mro__):
+                continue
+            if id(module) in seen_modules:
+                continue
+            seen_modules.add(id(module))
+            layer_number = getattr(module, "layer_number", None)
+            if layer_number is None or int(layer_number) <= 0:
+                raise ValueError("DMI Q/K weights require a positive global layer number")
+            layer_no = int(layer_number) - 1
+            if layer_no in seen_layers:
+                raise ValueError(f"Duplicate local self-attention layer number: {layer_number}")
+            seen_layers.add(layer_no)
+            config = module.config
+            if bool(getattr(config, "attention_output_gate", False)):
+                raise NotImplementedError("DMI Q/K weights do not support gated attention")
+            if int(config.num_query_groups) < rank_ctx.tp_world_size:
+                raise NotImplementedError("DMI Q/K weights require TP size <= number of KV heads")
+            if getattr(config, "fp8", None) or getattr(config, "fp4", None):
+                raise NotImplementedError("DMI Q/K weights require non-quantized QKV parameters")
+            linear = getattr(module, "linear_qkv", None)
+            weight = getattr(linear, "weight", None)
+            if not isinstance(weight, torch.nn.Parameter):
+                raise TypeError(f"Self-attention layer {layer_no} requires a fused QKV Parameter")
+            if not weight.is_cuda:
+                raise RuntimeError(f"Self-attention layer {layer_no} QKV weight must be CUDA-resident")
+            groups = int(module.num_query_groups_per_partition)
+            heads = int(module.num_attention_heads_per_partition)
+            head_dim = int(module.hidden_size_per_attention_head)
+            if min(groups, heads, head_dim) <= 0 or heads % groups:
+                raise ValueError(f"Invalid local QKV head layout at layer {layer_no}")
+            query_rows = (heads // groups) * head_dim
+            hidden_size = int(config.hidden_size)
+            expected = (groups * (query_rows + 2 * head_dim), hidden_size)
+            if tuple(weight.shape) != expected or not weight.is_contiguous():
+                raise ValueError(
+                    f"Self-attention layer {layer_no} requires contiguous grouped QKV "
+                    f"shape {expected}, got {tuple(weight.shape)}"
+                )
+            for projection, name, width in (
+                ("q", "query_projection_weight", query_rows),
+                ("k", "key_projection_weight", head_dim),
+            ):
+                selection = f"{projection}-weights"
+                if selection not in selected_hooks:
+                    continue
+                shape = [groups * width, hidden_size]
+                hook = _make_hook(
+                    MegatronHookSpec(
+                        name=name,
+                        layer_no=layer_no,
+                        outputs=[MegatronOutputSpec(
+                            name=name,
+                            input_shape=shape,
+                            output_shape=shape,
+                            dtype=weight.dtype,
+                            transport_type=TransportType.IDENTITY,
+                            storage=OutputStorage.TENSOR,
+                        )],
+                        preprocess=partial(
+                            qk_weight_from_fused_qkv,
+                            num_query_groups=groups,
+                            query_rows_per_group=query_rows,
+                            head_dim=head_dim,
+                            projection=projection,
+                        ),
+                        shard_policy=ShardPolicy.TP_SHARDED,
+                        layer_placement=HookLayerPlacement.EVERY_LAYER,
+                        enabled_by=frozenset({selection}),
+                        need_token_range=False,
+                        record_type=RecordType.PER_ITERATION,
+                        dp_emission=DPEmissionPolicy.DP_RANK_0,
+                    ),
+                    hook_phase=HookPhase.ITERATION,
+                )
+                _validate_hook_contract(hook)
+                if not _spec_active_on_rank(_megatron_hook_spec(hook), rank_ctx):
+                    hook.enabled = False
+                    continue
+                hook_bindings.append(MegatronHookBinding(
+                    hook=hook, record_dp_rank=-1, record_shard_rank=rank_ctx.tp_rank,
+                ))
+                parameter_bindings.append((hook, weight))
+    return tuple(hook_bindings), tuple(parameter_bindings)
+
+
 def _model_roots(model: Any) -> list[torch.nn.Module]:
     if isinstance(model, torch.nn.Module):
         return [model]
@@ -2245,22 +2366,24 @@ def setup_megatron_dmi(
         raise NotImplementedError(
             "DMI exact loss-summary materialization currently requires context parallel size 1"
         )
-    if "router-weights" in selected_hooks:
-        router_dp_world = int(
+    weight_selections = {"router-weights", "q-weights", "k-weights"} & selected_hooks
+    if weight_selections:
+        weight_names = ",".join(sorted(weight_selections))
+        weight_dp_world = int(
             parallel_state_module.get_data_parallel_world_size(
                 with_context_parallel=False
             )
         )
-        if router_dp_world != 1:
+        if weight_dp_world != 1:
             raise NotImplementedError(
-                "DMI router-weights requires data-parallel world size exactly 1; "
-                f"got {router_dp_world}"
+                f"DMI {weight_names} requires data-parallel world size exactly 1; "
+                f"got {weight_dp_world}"
             )
         if bool(getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)) and bool(
             getattr(args, "overlap_param_gather", False)
         ):
             raise NotImplementedError(
-                "DMI router-weights does not support "
+                f"DMI {weight_names} does not support "
                 "reuse_grad_buf_for_mxfp8_param_ag + overlap_param_gather"
             )
     dims: dict[Any, int] = {DimSpec.BATCH: max_batch_size}
@@ -2468,6 +2591,13 @@ def setup_megatron_dmi(
             )
             iteration_hooks.extend(router_hooks)
 
+        qk_weight_bindings: tuple[tuple[HookPointV1, torch.nn.Parameter], ...] = ()
+        if {"q-weights", "k-weights"} & selected_hooks:
+            qk_hooks, qk_weight_bindings = _qk_weight_bindings(
+                unwrapped, rank_ctx=rank_ctx, selected_hooks=selected_hooks,
+            )
+            iteration_hooks.extend(qk_hooks)
+
         for binding in (*active_model_hooks, *iteration_hooks):
             binding.hook.megatron_distributed_info = distributed_info
         has_active_tp_sequence_hook = any(
@@ -2587,6 +2717,7 @@ def setup_megatron_dmi(
             current_phase_tensor=current_phase_tensor,
             grad_norm_hook=grad_norm_hook,
             router_weight_bindings=router_weight_bindings,
+            qk_weight_bindings=qk_weight_bindings,
         )
         if requires_ep_topology_manifest:
             assert cfg.topology_manifest_path is not None
