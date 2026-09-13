@@ -447,6 +447,30 @@ def test_iteration_boundary_flush_runs_after_configured_accepted_iterations():
     assert calls[5][1] >= 0.0
 
 
+def test_optional_measurement_callbacks_cover_full_logical_iterations(monkeypatch):
+    import dmi_megatron_integration.schedule_runtime as module
+    def forbidden():
+        raise AssertionError("disabled measurement clock read")
+    monkeypatch.setattr(module.time, "monotonic", forbidden)
+    runtime = MegatronScheduleRuntime(FakePropagator())
+    runtime.begin_logical_iteration(1)
+    runtime.begin_attempt(0)
+    runtime.finish_attempt(1)
+    runtime.finish_logical_iteration()
+    calls = []
+    runtime.configure_measurements(
+        lambda iteration: calls.append(("start", iteration)),
+        lambda iteration: calls.append(("end", iteration)),
+    )
+    runtime.begin_logical_iteration(2)
+    runtime.begin_attempt(0)
+    runtime.finish_attempt(0)
+    runtime.begin_attempt(1)
+    runtime.finish_attempt(1)
+    runtime.finish_logical_iteration()
+    assert calls == [("start", 2), ("end", 2)]
+
+
 def test_iteration_boundary_flush_runs_once_after_rerun_is_accepted():
     runtime = MegatronScheduleRuntime(FakePropagator())
     calls = []

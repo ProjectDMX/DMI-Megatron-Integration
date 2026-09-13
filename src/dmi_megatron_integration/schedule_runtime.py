@@ -93,6 +93,8 @@ class MegatronScheduleRuntime:
         self._iteration_flush_callback: Callable[[], None] | None = None
         self._iteration_flush_barrier: Callable[[], None] | None = None
         self._iteration_flush_logger: Callable[[int, float], None] | None = None
+        self._measurement_start: Callable[[int], None] | None = None
+        self._measurement_end: Callable[[int], None] | None = None
         self.attempt_status_hook: Any | None = None
         self._attempt_status_tensor: torch.Tensor | None = None
         self.dataset_provenance_modes: dict[str, str] = {
@@ -329,6 +331,12 @@ class MegatronScheduleRuntime:
             )
         self._dataset_id_override = dataset_id
 
+    def configure_measurements(
+        self, start: Callable[[int], None], end: Callable[[int], None],
+    ) -> None:
+        self._measurement_start = start
+        self._measurement_end = end
+
     def begin_logical_iteration(self, global_batch_id: int) -> None:
         if self.phase != "train":
             raise RuntimeError("DMI logical training iteration requires train phase")
@@ -342,6 +350,8 @@ class MegatronScheduleRuntime:
         self._active_attempt_id = None
         self._next_attempt_id = 0
         self._attempt_statuses.clear()
+        if self._measurement_start is not None:
+            self._measurement_start(global_batch_id)
 
     def begin_attempt(self, attempt_id: int) -> None:
         if self._logical_training_iteration_id is None:
@@ -435,6 +445,8 @@ class MegatronScheduleRuntime:
             logger = self._iteration_flush_logger
             if logger is not None:
                 logger(completed_iteration, time.monotonic() - start)
+        if self._measurement_end is not None:
+            self._measurement_end(completed_iteration)
 
     def begin_iteration(self, active_num_microbatches: int, *, forward_only: bool = False) -> None:
         del forward_only

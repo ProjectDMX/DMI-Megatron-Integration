@@ -5,7 +5,7 @@ from __future__ import annotations
 import atexit
 import os
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any, Mapping
@@ -14,6 +14,8 @@ import torch
 
 from dmi.api.v1 import (
     HookPointV1,
+    DropConfig,
+    MonitoringConfig,
     MonitoringEngine,
     OutputStorage,
     RecordType,
@@ -105,6 +107,8 @@ class MegatronDMIConfig:
     flush_every_n_train_iters: int = 0
     vocab_logits_top_k: int | None = None
     topology_manifest_path: str | None = None
+    storage_backend: str = "auto"
+    drop: DropConfig = field(default_factory=DropConfig)
 
 
 class MegatronDMIHandle:
@@ -269,6 +273,24 @@ def resolve_megatron_dmi_config(
     cli_windows = getattr(args, "dmi_recurring_d2h_windows", None)
     cli_window_debug = getattr(args, "dmi_d2h_window_debug", None)
     cfg = MegatronDMIConfig(
+        storage_backend=str(_env_value(
+            args, "dmi_storage_backend", environ, "DMI_STORAGE_BACKEND", "auto",
+        )),
+        drop=DropConfig(
+            base_folder=str(_env_value(
+                args, "dmi_drop_base_folder", environ, "DMI_DROP_BASE_FOLDER", "",
+            )),
+            timing_enabled=bool(
+                getattr(args, "dmi_timing_enabled", None)
+                if getattr(args, "dmi_timing_enabled", None) is not None
+                else (_env_bool(environ, "DMI_TIMING_ENABLED") or False)
+            ),
+            ring_metrics_enabled=bool(
+                getattr(args, "dmi_ring_metrics_enabled", None)
+                if getattr(args, "dmi_ring_metrics_enabled", None) is not None
+                else (_env_bool(environ, "DMI_RING_METRICS_ENABLED") or False)
+            ),
+        ),
         enabled=bool(cli_enabled if cli_enabled is not None else (env_enabled or False)),
         exact_resume=bool(getattr(args, "dmi_exact_resume", False)),
         hook_selection=str(
@@ -2060,7 +2082,19 @@ def _build_engine(
         StageConfig,
     )
 
-    del rank
+    monitoring_config = None
+    if cfg.storage_backend == "drop":
+        if cfg.exact_resume:
+            raise ValueError("DMI exact resume requires ClickHouse, not the drop sink")
+        monitoring_config = MonitoringConfig(
+            storage_backend="drop", drop=replace(cfg.drop, rank=rank),
+        )
+    elif cfg.storage_backend not in ("auto", "native"):
+        raise ValueError("Megatron storage_backend must be auto, native, or drop")
+    elif cfg.storage_backend == "native" or cfg.drop.timing_enabled or cfg.drop.ring_metrics_enabled:
+        monitoring_config = MonitoringConfig(
+            storage_backend=cfg.storage_backend, drop=cfg.drop,
+        )
     ring_cfg = RingConfig()
     ring_cfg.payload_ring_bytes = int(cfg.ring_payload_mb) * 1024 * 1024
     ring_cfg.pinned_staging_bytes = int(cfg.ring_pinned_mb) * 1024 * 1024
@@ -2086,7 +2120,7 @@ def _build_engine(
     ring_cfg.recurring_d2h_windows = window_cfg
 
     host_engine = None
-    if cfg.db_host:
+    if cfg.db_host and cfg.storage_backend != "drop":
         ch_cfg = ClickHouseClientConfig()
         ch_cfg.host = cfg.db_host
         ch_cfg.port = int(cfg.db_port)
@@ -2105,7 +2139,7 @@ def _build_engine(
 
     return (
         MonitoringEngine(
-            config=None,
+            config=monitoring_config,
             model_id=model_id,
             host_engine=host_engine,
             ring_config=ring_cfg,
@@ -2650,6 +2684,10 @@ def setup_megatron_dmi(
         runtime.configure_d2h_windows(
             enabled=cfg.recurring_d2h_windows_enabled, debug=cfg.d2h_window_debug,
         )
+        if cfg.storage_backend == "drop" and (cfg.drop.timing_enabled or cfg.drop.ring_metrics_enabled):
+            runtime.configure_measurements(
+                engine.record_iteration_start, engine.record_iteration_end,
+            )
         flush_interval = int(cfg.flush_every_n_train_iters)
         if flush_interval == 0:
             runtime.configure_iteration_flush(0)
