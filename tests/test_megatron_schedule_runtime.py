@@ -149,6 +149,9 @@ class FakeContext:
         assert name == "valid_count"
         return tuple(self.counts[microbatch_id])
 
+    def prepared_packing(self, microbatch_id):
+        return None
+
 
 class FakePropagatorWithContext(FakePropagator):
     def __init__(self, counts) -> None:

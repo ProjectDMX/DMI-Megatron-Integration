@@ -561,7 +561,7 @@ class MegatronScheduleRuntime:
                 MegatronTrainingContext(
                     global_batch_id=int(self.global_batch_id),
                     microbatch_id=int(item.event.microbatch_id),
-                    valid_counts=tuple(int(x) for x in valid_counts),
+                    valid_counts=valid_counts,
                     dataset_ids=self._dataset_ids_for_microbatch(microbatch_id),
                     attempt_id=self.current_attempt_id,
                     direction=str(item.event.direction),
@@ -571,6 +571,7 @@ class MegatronScheduleRuntime:
                     shard_rank=int(item.event.shard_rank),
                     token_start=int(item.event.token_start),
                     model_id=item.event.model_id,
+                    _packing=self.propagator.context.prepared_packing(microbatch_id),
                 )
             )
         return contexts
@@ -820,7 +821,7 @@ class MegatronScheduleRuntime:
                         "DMI full-iteration capture missing valid counts for "
                         f"microbatch {microbatch_id}"
                     )
-                valid_counts = tuple(int(x) for x in raw_valid_counts)
+                valid_counts = raw_valid_counts
             adaptor.set_current_event(
                 MegatronTrainingContext(
                     global_batch_id=int(self.global_batch_id),
@@ -834,6 +835,7 @@ class MegatronScheduleRuntime:
                     dp_rank=int(self.dp_rank),
                     shard_rank=int(self.shard_rank),
                     token_start=int(self.token_start),
+                    _packing=self.propagator.context.prepared_packing(event.microbatch_id),
                 )
             )
             return
@@ -848,6 +850,7 @@ class MegatronScheduleRuntime:
             dp_rank=int(self.dp_rank),
             shard_rank=int(self.shard_rank),
             token_start=int(self.token_start),
+            _packing=self.propagator.context.prepared_packing(event.microbatch_id),
         )
         adaptor.set_current_event(ctx)
 

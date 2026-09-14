@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from math import prod
+from typing import Any, Callable, Mapping, Sequence
+import weakref
 
 import torch
+from dmi.hooks.producer_plan import _align_up, _dtype_element_size, _payload_alignment
 
 from dmi.api.v1 import (
     HookOutput,
@@ -32,7 +35,9 @@ from .hooks.specs import (
     MegatronMetadataField,
     ShardPolicy,
 )
-from .metadata_context import DMIMetadataContext
+from .metadata_context import (
+    DMIMetadataContext, _PreparedPacking, _normalize_int_tuple, _prepare_valid_counts,
+)
 from .records.format import required_record_metadata_fields
 from .records.metadata import MegatronRecordMetadata
 
@@ -53,6 +58,24 @@ class MegatronTrainingContext:
     shard_rank: int = 0
     token_start: int = 0
     model_id: str | None = None
+    _packing: _PreparedPacking | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        counts = _normalize_int_tuple(self.valid_counts)
+        object.__setattr__(self, "valid_counts", counts)
+        object.__setattr__(self, "dataset_ids", _normalize_int_tuple(self.dataset_ids))
+        for name in (
+            "global_batch_id", "microbatch_id", "attempt_id", "scope_id", "dp_rank",
+            "shard_rank", "token_start",
+        ):
+            object.__setattr__(self, name, int(getattr(self, name)))
+        object.__setattr__(self, "phase", str(self.phase))
+        if self.model_id is not None:
+            object.__setattr__(self, "model_id", str(self.model_id))
+        if self._packing is None:
+            object.__setattr__(self, "_packing", _PreparedPacking(_prepare_valid_counts(counts)))
+        elif self._packing.global_counts.counts != counts:
+            raise ValueError("schedule valid counts disagree with prepared CPU packing metadata")
 
 
 @dataclass(frozen=True)
@@ -92,8 +115,8 @@ class MegatronEventCoordinates:
         return MegatronTrainingContext(
             global_batch_id=int(global_batch_id),
             microbatch_id=int(self.microbatch_id),
-            valid_counts=tuple(int(value) for value in valid_counts),
-            dataset_ids=tuple(int(value) for value in dataset_ids),
+            valid_counts=valid_counts,
+            dataset_ids=dataset_ids,
             attempt_id=int(attempt_id),
             direction=str(self.direction),
             phase=str(self.phase),
@@ -131,6 +154,9 @@ class _ProducerSemantics:
     record_direction: str
     tp_sequence_start: int | None = None
     tp_sequence_length: int | None = None
+    packed_size_fn: Callable[[int, int], int] | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     @property
     def signature(self) -> tuple[object, ...]:
@@ -164,6 +190,8 @@ class MegatronFullIterationPlan:
     _semantics: tuple[_ProducerSemantics, ...] = field(
         default=(), repr=False, compare=False
     )
+    _producer_plan: ProducerPlan = field(init=False, repr=False, compare=False)
+    _sizing: _CapturedSizing = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "entries", tuple(self.entries))
@@ -172,6 +200,11 @@ class MegatronFullIterationPlan:
             raise ValueError(
                 "full-iteration plan entry and semantic counts must match"
             )
+        plan = ProducerPlan(tuple(item.producer for item in self.entries))
+        object.__setattr__(self, "_producer_plan", plan)
+        object.__setattr__(self, "_sizing", _CapturedSizing(
+            plan.entries, self._semantics, tuple(item.event.microbatch_id for item in self.entries),
+        ))
 
     @classmethod
     def from_plan_and_events(
@@ -202,7 +235,7 @@ class MegatronFullIterationPlan:
 
     @property
     def producer_plan(self) -> ProducerPlan:
-        return ProducerPlan(tuple(item.producer for item in self.entries))
+        return self._producer_plan
 
     @property
     def signature(self) -> tuple[tuple[object, ...], ...]:
@@ -226,6 +259,119 @@ class _ConfiguredHook:
     record_shard_rank: int | None
     tp_sequence_start: int | None
     tp_sequence_length: int | None
+    output_semantics: tuple[_ProducerSemantics, ...] = ()
+
+
+def _make_packed_size_fn(feature_bytes: int, *, local: bool) -> Callable[[int, int], int]:
+    alignment = _payload_alignment()
+    if local:
+        def size_fn(token_count: int, local_token_count: int) -> int:
+            return _align_up(local_token_count * feature_bytes, alignment)
+    else:
+        def size_fn(token_count: int, local_token_count: int) -> int:
+            return _align_up(token_count * feature_bytes, alignment)
+    return size_fn
+
+
+class _CapturedSizing:
+    """Graph-owned sizing function; live counts exist only during resolve()."""
+
+    def __init__(self, entries, semantics, microbatches=None):
+        self.entries = tuple(entries)
+        self.semantics = tuple(semantics)
+        groups = tuple(0 for _ in entries) if microbatches is None else tuple(microbatches)
+        self.groups = groups
+        self._representatives = tuple(dict.fromkeys(groups))
+        alignment = _payload_alignment()
+        coefficients = {key: [0, 0] for key in self._representatives}
+        constant = 0
+        eligible = True
+        local_intervals = set()
+        for entry, semantic, group in zip(entries, semantics, groups):
+            if entry.transport_type is TransportType.IDENTITY:
+                value = prod(entry.input_shape) * entry.element_size
+                constant += value
+                eligible &= value % alignment == 0
+            elif entry.transport_type is TransportType.SEQ_PREFIX_PACK:
+                value = int(entry.transport_args[0])
+                local = semantic.tp_sequence_start is not None
+                coefficients[group][int(local)] += value
+                eligible &= value % alignment == 0
+                if local:
+                    local_intervals.add((semantic.tp_sequence_start, semantic.tp_sequence_length))
+            else:
+                eligible = False
+        pairs = tuple(tuple(pair) for pair in coefficients.values())
+        eligible &= len(set(pairs)) <= 1 and len(local_intervals) <= 1
+        self._local_interval = next(iter(local_intervals), None)
+        self._parameters = None
+        self._resolved = None
+        if eligible:
+            a, c = pairs[0] if pairs else (0, 0)
+            self.mode = "simplified"
+            self.coefficients = (a, c, constant)
+
+            def size_fn(token_count, local_token_count):
+                return a * token_count + c * local_token_count + constant
+        else:
+            self.mode = "recursive"
+            self.coefficients = None
+
+            def child(index):
+                def leaf(token_count, local_token_count):
+                    value = MegatronAdaptor._resolved_output_bytes(
+                        self.entries[index], self.semantics[index], self._parameters[index],
+                    )
+                    self._resolved.append(value)
+                    return value
+                return leaf
+
+            children = tuple(child(index) for index in range(len(entries)))
+
+            def size_fn(token_count, local_token_count):
+                return sum(leaf(token_count, local_token_count) for leaf in children)
+        self.size_fn = size_fn
+
+    def resolve(self, packings):
+        if len(packings) != len(self.entries):
+            raise ValueError("graph sizing context count mismatch")
+        if self.mode == "recursive":
+            self._parameters = tuple(packings)
+            self._resolved = []
+            try:
+                total = self.size_fn(0, 0)
+                return total, tuple(self._resolved)
+            finally:
+                self._parameters = None
+                self._resolved = None
+        representatives = {}
+        for group, packing in zip(self.groups, packings):
+            representatives.setdefault(group, packing)
+        global_total = 0
+        local_total = 0
+        for packing in representatives.values():
+            if packing is not None:
+                global_total += packing.global_counts.token_count
+                if self._local_interval is not None:
+                    start, length = self._local_interval
+                    key = (start, length)
+                    if key not in packing.local_counts:
+                        packing.local_counts[key] = _prepare_valid_counts(
+                            packing.global_counts.counts, sequence_start=start, sequence_length=length,
+                        )
+                    local_total += packing.local_counts[key].token_count
+        total = self.size_fn(global_total, local_total)
+        sizes = tuple(MegatronAdaptor._resolved_output_bytes(entry, semantic, packing)
+                      for entry, semantic, packing in zip(self.entries, self.semantics, packings))
+        return total, sizes
+
+
+@dataclass
+class _CapturedPlanState:
+    owner: Any
+    semantics: tuple[_ProducerSemantics, ...]
+    sizing: _CapturedSizing
+    selected: dict[tuple[HookPhase, HookPhase], ProducerPlan] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -490,11 +636,7 @@ class MegatronHookRuntime:
         output_spec: TransportSpec,
         output: HookOutput,
     ) -> StepReservation | None:
-        semantics = self.adaptor._producer_semantics(
-            hook=hook,
-            output_id=output_id,
-            output_spec=output_spec,
-        )
+        semantics = self.adaptor._configured_hook(hook).output_semantics[output_index]
         builder = self._capture_builder
         if builder is None:
             return self.adaptor.emit_immediate_output(
@@ -547,12 +689,7 @@ class MegatronIterationHookRuntime:
         output_spec: TransportSpec,
         output: HookOutput,
     ) -> StepReservation:
-        del output_index
-        semantics = self.adaptor._producer_semantics(
-            hook=hook,
-            output_id=output_id,
-            output_spec=output_spec,
-        )
+        semantics = self.adaptor._configured_hook(hook).output_semantics[output_index]
         return self.adaptor.emit_iteration_output(semantics, output_spec, output)
 
 
@@ -573,8 +710,9 @@ class MegatronAdaptor:
         self.dims: dict[str | DimSpec, int] = dict(dims or {})
         self.configured_hooks: list[_ConfiguredHook] = []
         self._configured_by_hook: dict[int, _ConfiguredHook] = {}
-        self._plan_semantics_by_id: dict[int, tuple[_ProducerSemantics, ...]] = {}
+        self._plan_states_by_id: dict[int, _CapturedPlanState] = {}
         self.current_context: MegatronTrainingContext | None = None
+        self._event_packing: _PreparedPacking | None = None
         self.current_iteration_context: MegatronTrainingContext | None = None
         self.hook_runtime = MegatronHookRuntime(self)
         self.iteration_hook_runtime = MegatronIterationHookRuntime(self)
@@ -665,6 +803,7 @@ class MegatronAdaptor:
             raise ValueError("DMI hook bindings contain a duplicate HookPointV1")
         self.configured_hooks = []
         self._configured_by_hook = {}
+        self._plan_states_by_id.clear()
         for binding in bindings:
             hook = binding.hook
             policy = self._hook_policy(hook)
@@ -744,6 +883,16 @@ class MegatronAdaptor:
                 gate_tensor=gate_tensor,
                 gate_value=int(self._hook_phase(hook).value),
             )
+            for output in policy.outputs:
+                _dtype_element_size(output.dtype)
+            configured = replace(configured, output_semantics=tuple(
+                self._producer_semantics(
+                    hook=hook, output_id=output_id, output_spec=output_spec,
+                )
+                for output_id, output_spec in zip(hook._output_ids, physical.outputs)
+            ))
+            self.configured_hooks[-1] = configured
+            self._configured_by_hook[id(hook)] = configured
         retain_recompute = any(
             item.policy.record_type in (RecordType.PER_SAMPLE, RecordType.PER_EXECUTION)
             and not self._hook_suppress_recompute(item.hook)
@@ -856,9 +1005,11 @@ class MegatronAdaptor:
 
     def set_current_event(self, ctx: MegatronTrainingContext) -> None:
         self.current_context = ctx
+        self._event_packing = ctx._packing
 
     def clear_current_event(self) -> None:
         self.current_context = None
+        self._event_packing = None
 
     def set_current_iteration(self, ctx: MegatronTrainingContext) -> None:
         if self.current_iteration_context is not None:
@@ -890,7 +1041,7 @@ class MegatronAdaptor:
         output_spec: TransportSpec,
         output: HookOutput,
     ) -> StepReservation:
-        entry = ProducerPlanBuilder().record_output(
+        entry = ProducerPlanEntry.from_output(
             output_id=semantics.output_id,
             output_spec=output_spec,
             output=output,
@@ -907,7 +1058,10 @@ class MegatronAdaptor:
         if ctx is None:
             raise RuntimeError("Megatron DMI hook emitted without a schedule event")
         metadata = self._record_metadata(ctx, semantics)
-        return self.record_runtime.emit_output(entry, metadata, output)
+        return self.record_runtime._emit_prepared_output(
+            entry, metadata, output,
+            reservation_bytes=self._resolved_output_bytes(entry, semantics, self._event_packing),
+        )
 
     def emit_iteration_output(
         self,
@@ -923,37 +1077,66 @@ class MegatronAdaptor:
         if output_spec.storage in (OutputStorage.SCALAR_FLOAT, OutputStorage.SCALAR_INT):
             if output.tensor.numel() != 1:
                 raise ValueError("PER_ITERATION scalar output must contain one value")
-        entry = ProducerPlanBuilder().record_output(
+        entry = ProducerPlanEntry.from_output(
             output_id=semantics.output_id,
             output_spec=output_spec,
             output=output,
         )
-        return self.record_runtime.emit_output(
-            entry, self._record_metadata(ctx, semantics), output
+        return self.record_runtime._emit_prepared_output(
+            entry, self._record_metadata(ctx, semantics), output,
+            reservation_bytes=_align_up(output.tensor.numel() * output.tensor.element_size()),
         )
+
+    @staticmethod
+    def _resolved_output_bytes(
+        entry: ProducerPlanEntry, semantic: _ProducerSemantics,
+        packing: _PreparedPacking | None,
+    ) -> int:
+        if entry.transport_type is TransportType.IDENTITY:
+            return _align_up(prod(entry.input_shape) * entry.element_size)
+        if packing is None or not packing.global_counts.counts:
+            raise ValueError("packed outputs require current CPU packing metadata")
+        counts = packing.counts_for(semantic.tp_sequence_start, semantic.tp_sequence_length)
+        if entry.transport_type is TransportType.SEQ_PREFIX_PACK:
+            if len(entry.input_shape) < 2 or len(counts.counts) != entry.input_shape[1]:
+                raise ValueError("CPU valid-count length does not match packed input batch")
+            if any(value > entry.input_shape[0] for value in counts.counts):
+                raise ValueError("CPU valid count exceeds packed input sequence length")
+            if prod(entry.input_shape[2:]) * entry.element_size != entry.transport_args[0]:
+                raise ValueError("packed feature bytes do not match current tensor metadata")
+            if semantic.packed_size_fn is None:
+                raise RuntimeError("packed output has no bound sizing function")
+            return semantic.packed_size_fn(packing.global_counts.token_count, counts.token_count)
+        if entry.transport_type is TransportType.SEGMENTED_PACK:
+            return _align_up(counts.token_count * entry.transport_args[0])
+        if entry.transport_type is TransportType.PREFIX_STRIP:
+            return _align_up(sum(value > 0 for value in counts.counts) * entry.transport_args[0])
+        raise NotImplementedError(f"no CPU sizing contract for {entry.transport_type.value}")
 
     def prepare_replay_capacity_only(
         self,
         plan: ProducerPlan,
+        ctx: MegatronTrainingContext | None = None,
         *,
         plan_direction: HookPhase | str,
         live_direction: HookPhase | str,
         expected_plan: ProducerPlan | None = None,
     ) -> StepReservation:
-        entries, _ = self._select_replay_entries(
+        selected = self._select_replay_plan(
             plan,
             plan_direction=plan_direction,
             live_direction=live_direction,
             expected_plan=expected_plan,
         )
-        if not entries:
+        if not selected.entries:
             return StepReservation.SKIPPED
-        selected = ProducerPlan(entries)
-        capacities = self.engine.ring_capacities()
-        if (
-            selected.total_reservation_bytes > capacities.effective_bytes
-            or selected.task_count > capacities.task_entries
-        ):
+        # A backward preflight at its paired forward boundary uses that same
+        # microbatch's counts, not the last backward event from another batch.
+        packing = self._event_packing if ctx is None else self._prepare_packing(ctx)
+        total, _ = self._plan_state(selected).sizing.resolve(
+            (packing,) * len(selected.entries),
+        )
+        if self._plan_is_oversized(selected, total):
             return StepReservation.OVERSIZED
         return StepReservation.RESERVED
 
@@ -969,7 +1152,7 @@ class MegatronAdaptor:
         replay_ctx = self.current_context if ctx is None else ctx
         if replay_ctx is None:
             raise RuntimeError("Megatron DMI replay requires an active schedule event")
-        entries, semantics = self._select_replay_entries(
+        selected = self._select_replay_plan(
             plan,
             plan_direction=plan_direction,
             live_direction=(
@@ -977,13 +1160,15 @@ class MegatronAdaptor:
             ),
             expected_plan=expected_plan,
         )
-        if not entries:
+        if not selected.entries:
             return StepReservation.SKIPPED
-        selected = ProducerPlan(entries)
-        if self._plan_is_oversized(selected):
+        state = self._plan_state(selected)
+        packing = self._event_packing if ctx is None else self._prepare_packing(replay_ctx)
+        total, sizes = state.sizing.resolve((packing,) * len(selected.entries))
+        if self._plan_is_oversized(selected, total):
             return StepReservation.OVERSIZED
-        metadata = tuple(self._record_metadata(replay_ctx, item) for item in semantics)
-        return self.record_runtime.prepare_replay(selected, metadata)
+        metadata = tuple(self._record_metadata(replay_ctx, item) for item in state.semantics)
+        return self.record_runtime.prepare_replay(selected, metadata, reservation_bytes=sizes)
 
     def prepare_full_iteration_replay(
         self,
@@ -1000,45 +1185,66 @@ class MegatronAdaptor:
         self._validate_full_iteration_contexts(plan, contexts)
         if not plan.entries:
             return StepReservation.SKIPPED
-        if self._plan_is_oversized(plan.producer_plan):
+        prepared = {}
+        packings = []
+        for ctx in contexts:
+            key = (ctx.model_id, ctx.phase, ctx.global_batch_id, ctx.attempt_id, ctx.microbatch_id)
+            packing = prepared.get(key)
+            if packing is None:
+                packing = prepared[key] = self._prepare_packing(ctx)
+            elif packing.global_counts.counts != tuple(ctx.valid_counts):
+                raise ValueError("full-iteration contexts disagree on one microbatch's valid counts")
+            packings.append(packing)
+        total, sizes = plan._sizing.resolve(packings)
+        if self._plan_is_oversized(plan.producer_plan, total):
             return StepReservation.OVERSIZED
         metadata = tuple(
             self._record_metadata(ctx, semantic)
             for ctx, semantic in zip(contexts, plan._semantics)
         )
-        return self.record_runtime.prepare_replay(plan.producer_plan, metadata)
+        return self.record_runtime.prepare_replay(
+            plan.producer_plan, metadata, reservation_bytes=sizes,
+        )
 
-    def _plan_is_oversized(self, plan: ProducerPlan) -> bool:
+    def _plan_is_oversized(self, plan: ProducerPlan, total_bytes: int) -> bool:
         capacities = self.engine.ring_capacities()
         return bool(
-            plan.total_reservation_bytes > capacities.effective_bytes
+            total_bytes > capacities.effective_bytes
             or plan.task_count > capacities.task_entries
         )
 
-    def _select_replay_entries(
+    @staticmethod
+    def _prepare_packing(ctx: MegatronTrainingContext) -> _PreparedPacking:
+        return ctx._packing
+
+    def _select_replay_plan(
         self,
         plan: ProducerPlan,
         *,
         plan_direction: HookPhase | str,
         live_direction: HookPhase | str,
         expected_plan: ProducerPlan | None,
-    ) -> tuple[tuple[ProducerPlanEntry, ...], tuple[_ProducerSemantics, ...]]:
+    ) -> ProducerPlan:
         self._validate_replay_plan(plan, expected_plan=expected_plan)
         semantics = self._plan_semantics(plan)
         planned = self.normalize_direction(plan_direction)
         live = self.normalize_direction(live_direction)
         if planned is live:
-            return plan.entries, semantics
+            return plan
         if planned is HookPhase.FWD and live is HookPhase.BWD:
+            state = self._plan_state(plan)
+            key = (planned, live)
+            if key in state.selected:
+                return state.selected[key]
             selected = tuple(
                 (entry, semantic)
                 for entry, semantic in zip(plan.entries, semantics)
                 if not semantic.suppress_recompute
             )
-            return (
-                tuple(item[0] for item in selected),
-                tuple(item[1] for item in selected),
-            )
+            subset = ProducerPlan(tuple(item[0] for item in selected))
+            self._remember_plan(subset, tuple(item[1] for item in selected))
+            state.selected[key] = subset
+            return subset
         raise RuntimeError(
             "Megatron DMI local CUDA graph direction mismatch: "
             f"captured={planned.name.lower()} live={live.name.lower()}"
@@ -1103,29 +1309,23 @@ class MegatronAdaptor:
             dynamic_dataset_provenance=bool(ctx.dataset_ids),
         )
         if semantic.record_type is RecordType.PER_SAMPLE:
-            dp_rank = int(ctx.dp_rank)
+            dp_rank = ctx.dp_rank
             valid_counts = (
-                tuple(int(value) for value in ctx.valid_counts)
+                ctx._packing.counts_for(
+                    semantic.tp_sequence_start, semantic.tp_sequence_length,
+                ).counts
                 if MegatronMetadataField.VALID_COUNT in required_fields
                 else ()
             )
             dataset_ids = (
-                tuple(int(value) for value in ctx.dataset_ids)
+                ctx.dataset_ids
                 if MegatronMetadataField.DATASET_ID in required_fields
                 else ()
             )
-            token_start = int(ctx.token_start) if semantic.need_token_range else 0
+            token_start = ctx.token_start if semantic.need_token_range else 0
             if semantic.tp_sequence_start is not None:
-                if semantic.tp_sequence_length is None:
-                    raise RuntimeError("TP sequence semantic is missing its length")
-                start = int(semantic.tp_sequence_start)
-                length = int(semantic.tp_sequence_length)
-                valid_counts = tuple(
-                    max(0, min(length, int(value) - start))
-                    for value in valid_counts
-                )
                 if semantic.need_token_range:
-                    token_start += start
+                    token_start += semantic.tp_sequence_start
         else:
             if semantic.record_dp_rank is None:
                 raise RuntimeError("non-sample record is missing its semantic DP rank")
@@ -1134,11 +1334,11 @@ class MegatronAdaptor:
             dataset_ids = ()
             token_start = -1 if semantic.record_type is RecordType.PER_EXECUTION else 0
         shard_rank = (
-            int(ctx.shard_rank)
+            ctx.shard_rank
             if semantic.record_shard_rank is None
             else int(semantic.record_shard_rank)
         )
-        model_id = self.model_id if ctx.model_id is None else str(ctx.model_id)
+        model_id = self.model_id if ctx.model_id is None else ctx.model_id
         invocation_id = self._allocate_invocation_id(
             ctx,
             semantic=semantic,
@@ -1147,20 +1347,20 @@ class MegatronAdaptor:
             token_start=token_start,
             model_id=model_id,
         )
-        return MegatronRecordMetadata(
+        return MegatronRecordMetadata._from_normalized(
             model_id=model_id,
             act_name=semantic.act_name,
             direction=semantic.record_direction,
-            phase=str(ctx.phase),
-            global_batch_id=int(ctx.global_batch_id),
+            phase=ctx.phase,
+            global_batch_id=ctx.global_batch_id,
             dp_rank=dp_rank,
-            microbatch_id=int(ctx.microbatch_id),
+            microbatch_id=ctx.microbatch_id,
             layer_no=int(semantic.layer_no),
             shard_rank=shard_rank,
             token_start=token_start,
             valid_counts=valid_counts,
             dataset_ids=dataset_ids,
-            attempt_id=int(ctx.attempt_id),
+            attempt_id=ctx.attempt_id,
             invocation_id=invocation_id,
         )
 
@@ -1222,6 +1422,11 @@ class MegatronAdaptor:
             ),
             tp_sequence_start=configured.tp_sequence_start,
             tp_sequence_length=configured.tp_sequence_length,
+            packed_size_fn=(
+                _make_packed_size_fn(
+                    int(output_spec.feature_bytes), local=configured.tp_sequence_start is not None,
+                ) if output_spec.transport_type is TransportType.SEQ_PREFIX_PACK else None
+            ),
         )
 
     def _remember_plan(
@@ -1231,15 +1436,28 @@ class MegatronAdaptor:
     ) -> None:
         if len(plan.entries) != len(semantics):
             raise ValueError("producer plan semantic count mismatch")
-        self._plan_semantics_by_id[id(plan)] = tuple(semantics)
+        key = id(plan)
+        adaptor_ref = weakref.ref(self)
+
+        def released(plan_ref):
+            adaptor = adaptor_ref()
+            if adaptor is not None:
+                state = adaptor._plan_states_by_id.get(key)
+                if state is not None and state.owner is plan_ref:
+                    del adaptor._plan_states_by_id[key]
+
+        self._plan_states_by_id[key] = _CapturedPlanState(
+            weakref.ref(plan, released), tuple(semantics), _CapturedSizing(plan.entries, semantics),
+        )
+
+    def _plan_state(self, plan: ProducerPlan) -> _CapturedPlanState:
+        state = self._plan_states_by_id.get(id(plan))
+        if state is None or state.owner() is not plan:
+            raise RuntimeError("Megatron producer plan is not owned by this adaptor")
+        return state
 
     def _plan_semantics(self, plan: ProducerPlan) -> tuple[_ProducerSemantics, ...]:
-        semantics = self._plan_semantics_by_id.get(id(plan))
-        if semantics is None:
-            # Subsets are constructed only immediately before a public runtime
-            # call; persistent replay plans must originate from this adaptor.
-            raise RuntimeError("Megatron producer plan is not owned by this adaptor")
-        return semantics
+        return self._plan_state(plan).semantics
 
     def _configured_hook(self, hook: HookPointV1) -> _ConfiguredHook:
         configured = self._configured_by_hook.get(id(hook))
@@ -1329,6 +1547,12 @@ class MegatronAdaptor:
                 scope_id,
             ),
         )
+        if any(output.transport_type is TransportType.SEQ_PREFIX_PACK for output in policy.outputs):
+            prefix_name = metadata_context.register_valid_count_prefix(
+                tp_local=policy.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED,
+            )
+            setattr(hook, f"valid_count_prefix_{direction}",
+                    metadata_context.current(prefix_name, direction, scope_id))
 
     @staticmethod
     def _bind_segment_context(
@@ -1442,18 +1666,10 @@ class MegatronAdaptor:
             raise TypeError("Megatron hook output must begin with a Tensor")
         if spec.transport_type is TransportType.SEQ_PREFIX_PACK:
             valid = self._current_valid_count(hook)
-            prefix = getattr(hook, "_dmi_valid_prefix_sum", None)
-            needed = int(valid.numel()) + 1
-            if (
-                prefix is None
-                or prefix.device != valid.device
-                or prefix.dtype != valid.dtype
-                or prefix.numel() != needed
-            ):
-                prefix = torch.empty(needed, dtype=valid.dtype, device=valid.device)
-                hook._dmi_valid_prefix_sum = prefix
-            prefix[0].zero_()
-            torch.cumsum(valid, dim=0, out=prefix[1:])
+            direction = self._hook_phase(hook).name.lower()
+            prefix = getattr(hook, f"valid_count_prefix_{direction}", None)
+            if prefix is None:
+                raise RuntimeError("SEQ_PREFIX_PACK requires a metadata-owned valid-count prefix")
             return HookOutput(output.tensor, (valid, prefix))
         if spec.transport_type is TransportType.SEGMENTED_PACK:
             starts, ends = self._current_segment_ranges(hook)

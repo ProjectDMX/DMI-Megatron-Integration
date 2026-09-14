@@ -9,13 +9,63 @@ scope.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from itertools import accumulate
 from typing import Mapping, Sequence
 
 import torch
 
 from .hooks.specs import DimSpec, MegatronDistributedInfo
+
+
+@dataclass(frozen=True)
+class _PreparedValidCounts:
+    counts: tuple[int, ...]
+    prefix: tuple[int, ...]
+
+    @property
+    def token_count(self) -> int:
+        return self.prefix[-1]
+
+
+def _normalize_int_tuple(values: Sequence[int]) -> tuple[int, ...]:
+    if isinstance(values, tuple) and all(type(value) is int for value in values):
+        return values
+    return tuple(int(value) for value in values)
+
+
+def _prepare_valid_counts(
+    counts: Sequence[int], *, sequence_start: int = 0,
+    sequence_length: int | None = None,
+) -> _PreparedValidCounts:
+    values = _normalize_int_tuple(counts)
+    if any(value < 0 for value in values):
+        raise ValueError("valid counts must be non-negative")
+    if sequence_length is not None:
+        values = tuple(max(0, min(sequence_length, value - sequence_start))
+                       for value in values)
+    return _PreparedValidCounts(values, (0, *accumulate(values)))
+
+
+@dataclass
+class _PreparedPacking:
+    global_counts: _PreparedValidCounts
+    local_counts: dict[tuple[int, int], _PreparedValidCounts] = field(default_factory=dict)
+
+    def counts_for(
+        self, sequence_start: int | None = None, sequence_length: int | None = None,
+    ) -> _PreparedValidCounts:
+        if sequence_start is None:
+            return self.global_counts
+        if sequence_length is None:
+            raise ValueError("TP-local counts require a sequence length")
+        key = (sequence_start, sequence_length)
+        if key not in self.local_counts:
+            self.local_counts[key] = _prepare_valid_counts(
+                self.global_counts.counts, sequence_start=key[0], sequence_length=key[1],
+            )
+        return self.local_counts[key]
 
 
 class DMIMetadataDirection(Enum):
@@ -158,6 +208,14 @@ class DMIMetadataContext:
         self._source_cpu_packets: dict[torch.dtype, torch.Tensor] = {}
         self._field_packet_ranges: dict[str, tuple[torch.dtype, int, int]] = {}
         self._current_buffers: dict[str, torch.Tensor] = {}
+        self._prepared_packings: dict[int, _PreparedPacking] = {}
+        self._pinned_count_buffers: dict[str, torch.Tensor] = {}
+        self._prefix_variants: set[str] = set()
+        self._scope_microbatches: dict[tuple[int, int], int] = {}
+        self._uploads_pending: set[int] = set()
+        self._sources_used: set[int] = set()
+        self._upload_events = []
+        self._source_use_events = []
         wire_offsets: dict[torch.dtype, int] = {}
         resolved_shapes: dict[str, tuple[int, ...]] = {}
         for spec in specs:
@@ -207,7 +265,55 @@ class DMIMetadataContext:
                 dtype=torch.int64,
                 device=self.device,
             )
+            self._source_buffers["tp_seq_sharded_valid_count"] = torch.zeros(
+                (self.max_num_microbatches, self.max_batch_size),
+                dtype=torch.int64, device=self.device,
+            )
+        if "valid_count" in self._source_buffers:
+            for name in ("valid_count", "tp_seq_sharded_valid_count"):
+                if name in self._source_buffers:
+                    self._pinned_count_buffers[name] = torch.empty(
+                        tuple(self._source_buffers[name].shape), dtype=torch.int64,
+                        device="cpu", pin_memory=self.device.type == "cuda",
+                    )
+            if self.device.type == "cuda":
+                # External events retain upload/scope-copy dependencies during
+                # full-iteration graph replay as well as eager execution.
+                self._upload_events = [torch.cuda.Event(external=True)
+                                       for _ in range(self.max_num_microbatches)]
+                self._source_use_events = [torch.cuda.Event(external=True)
+                                          for _ in range(self.max_num_microbatches)]
         self._active_field_names = frozenset(self.field_specs)
+
+    def register_valid_count_prefix(self, *, tp_local: bool = False) -> str:
+        """Bind a required packing variant before capture; buffers remain stable."""
+        name = "tp_seq_sharded_valid_count" if tp_local else "valid_count"
+        if name not in self._pinned_count_buffers:
+            raise ValueError(f"packing prefix requires GPU-visible {name}")
+        prefix_name = name + "_prefix"
+        if name in self._prefix_variants:
+            return prefix_name
+        self._prefix_variants.add(name)
+        self._pinned_count_buffers[prefix_name] = torch.empty(
+            (self.max_num_microbatches, self.max_batch_size + 1), dtype=torch.int64,
+            device="cpu", pin_memory=self.device.type == "cuda",
+        )
+        self._source_buffers[prefix_name] = torch.zeros(
+            (self.max_num_microbatches, self.max_batch_size + 1),
+            dtype=torch.int64, device=self.device,
+        )
+        self._current_buffers[prefix_name] = torch.zeros(
+            (2, self.num_scopes, self.max_batch_size + 1),
+            dtype=torch.int64, device=self.device,
+        )
+        # Binding can follow metadata preload, including in adapter unit tests.
+        for microbatch_id in self._prepared_packings:
+            self._upload_prepared_counts(microbatch_id)
+        for (direction_idx, scope_id), microbatch_id in self._scope_microbatches.items():
+            self._current_buffers[prefix_name][direction_idx, scope_id].copy_(
+                self._source_buffers[prefix_name][microbatch_id],
+            )
+        return prefix_name
 
     def set_active_fields(self, names: Sequence[str]) -> None:
         active = tuple(str(name) for name in names)
@@ -249,6 +355,14 @@ class DMIMetadataContext:
         self.active_num_microbatches = int(active_num_microbatches)
         if not clear_buffers:
             return
+        self._prepared_packings.clear()
+        self._scope_microbatches.clear()
+        if self._uploads_pending or self._sources_used:
+            stream = torch.cuda.current_stream(self.device)
+            for index in self._uploads_pending:
+                stream.wait_event(self._upload_events[index])
+            for index in self._sources_used:
+                stream.wait_event(self._source_use_events[index])
         for buf in self._source_cpu_buffers.values():
             buf.zero_()
         for buf in self._source_buffers.values():
@@ -291,7 +405,7 @@ class DMIMetadataContext:
                 )
             cpu_target.view(-1)[: cpu_value.numel()].copy_(cpu_value.view(-1))
 
-            if not spec.gpu_visible:
+            if not spec.gpu_visible or name == "valid_count":
                 continue
             if name not in fields:
                 raise KeyError(f"Missing GPU-visible DMI metadata field {name!r}")
@@ -304,6 +418,58 @@ class DMIMetadataContext:
                     f"{value.numel()} > {target.numel()}"
                 )
             target.view(-1)[: value.numel()].copy_(value.view(-1))
+        self._prepare_cpu_packing(microbatch_id)
+        self._upload_prepared_counts(microbatch_id)
+
+    def _prepare_cpu_packing(self, microbatch_id: int) -> None:
+        if "valid_count" not in self._active_field_names:
+            return
+        packing = _PreparedPacking(_prepare_valid_counts(self.source_cpu("valid_count", microbatch_id)))
+        sequence_length = self.dims.get(DimSpec.SEQ, self.dims.get(DimSpec.SEQ.value))
+        if sequence_length is not None and any(
+            count > int(sequence_length) for count in packing.global_counts.counts
+        ):
+            raise ValueError("valid count exceeds configured sequence length")
+        if self.tp_sequence_sharded_enabled:
+            packing.counts_for(self.tp_sequence_start, self.tp_sequence_length)
+        self._prepared_packings[microbatch_id] = packing
+
+    def _upload_prepared_counts(self, microbatch_id: int) -> None:
+        if "valid_count" not in self._pinned_count_buffers or "valid_count" not in self._active_field_names:
+            return
+        packing = self._prepared_packings[microbatch_id]
+        stream = None
+        if self.device.type == "cuda":
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("CPU packing metadata must be prepared/uploaded before graph capture/replay")
+            stream = torch.cuda.current_stream(self.device)
+            if microbatch_id in self._uploads_pending:
+                event = self._upload_events[microbatch_id]
+                if not event.query():
+                    # Only recycling pinned bytes needs a host wait, and only
+                    # when their previous asynchronous upload is still active.
+                    event.synchronize()
+            if microbatch_id in self._sources_used:
+                stream.wait_event(self._source_use_events[microbatch_id])
+        for name in ("valid_count", "tp_seq_sharded_valid_count"):
+            if name not in self._pinned_count_buffers:
+                continue
+            counts = (packing.global_counts if name == "valid_count" else
+                      packing.counts_for(self.tp_sequence_start, self.tp_sequence_length))
+            fields = ((name, counts.counts),)
+            if name in self._prefix_variants:
+                fields += ((name + "_prefix", counts.prefix),)
+            for field_name, values in fields:
+                staging = self._pinned_count_buffers[field_name][microbatch_id]
+                staging.copy_(torch.tensor(values, dtype=torch.int64, device="cpu"))
+                self._source_buffers[field_name][microbatch_id].copy_(staging, non_blocking=True)
+        if stream is not None:
+            self._upload_events[microbatch_id].record(stream)
+            self._uploads_pending.add(microbatch_id)
+
+    def prepared_packing(self, microbatch_id: int) -> _PreparedPacking | None:
+        self._check_allocated_microbatch_id(microbatch_id)
+        return self._prepared_packings.get(microbatch_id)
 
     def enter_scope(
         self,
@@ -314,6 +480,9 @@ class DMIMetadataContext:
         direction_idx = self._direction_index(direction)
         self._check_scope_id(scope_id)
         self._check_microbatch_id(microbatch_id)
+        stream = torch.cuda.current_stream(self.device) if self._upload_events else None
+        if stream is not None and microbatch_id in self._uploads_pending:
+            stream.wait_event(self._upload_events[microbatch_id])
         for name in self._active_field_names:
             if name not in self._current_buffers:
                 continue
@@ -321,14 +490,19 @@ class DMIMetadataContext:
                 self._source_buffers[name][microbatch_id]
             )
         if self.tp_sequence_sharded_enabled:
-            assert self.tp_sequence_start is not None
-            assert self.tp_sequence_length is not None
             local = self._current_buffers["tp_seq_sharded_valid_count"][
                 direction_idx, scope_id
             ]
-            local.copy_(self._current_buffers["valid_count"][direction_idx, scope_id])
-            local.sub_(self.tp_sequence_start)
-            local.clamp_(0, self.tp_sequence_length)
+            local.copy_(self._source_buffers["tp_seq_sharded_valid_count"][microbatch_id])
+        for name in self._prefix_variants:
+            prefix_name = name + "_prefix"
+            self._current_buffers[prefix_name][direction_idx, scope_id].copy_(
+                self._source_buffers[prefix_name][microbatch_id],
+            )
+        self._scope_microbatches[(direction_idx, scope_id)] = microbatch_id
+        if stream is not None and "valid_count" in self._pinned_count_buffers:
+            self._source_use_events[microbatch_id].record(stream)
+            self._sources_used.add(microbatch_id)
 
     def current(
         self,
@@ -364,6 +538,10 @@ class DMIMetadataContext:
         self._check_allocated_microbatch_id(microbatch_id)
         if name not in self._source_buffers:
             raise ValueError(f"DMI metadata field {name!r} is CPU-only")
+        if name == "valid_count":
+            self._prepare_cpu_packing(microbatch_id)
+            self._upload_prepared_counts(microbatch_id)
+            return
         self._source_buffers[name][microbatch_id].copy_(
             self._source_cpu_buffers[name][microbatch_id],
             non_blocking=True,
@@ -371,6 +549,7 @@ class DMIMetadataContext:
 
     def end_iteration(self) -> None:
         self.active_num_microbatches = 0
+        self._prepared_packings.clear()
 
     def _normalize_field_value(
         self,
@@ -607,8 +786,13 @@ class PerDPCPUMetadataPropagator(DMIMetadataPropagator):
         self._wait_pp_microbatch(microbatch_id)
         self._sync_tp_microbatch(microbatch_id)
         if microbatch_id not in self._gpu_synced_microbatches:
+            # Receivers may only snapshot after both CPU broadcasts completed.
+            # The source already prepared its snapshot during ingestion.
+            if not self.is_metadata_source_rank:
+                self.context._prepare_cpu_packing(microbatch_id)
+                self.context._upload_prepared_counts(microbatch_id)
             for name in self.context.active_field_names:
-                if not self.context.field_specs[name].gpu_visible:
+                if name == "valid_count" or not self.context.field_specs[name].gpu_visible:
                     continue
                 self.context.sync_source_gpu_from_cpu(name, microbatch_id)
             self._gpu_synced_microbatches.add(microbatch_id)

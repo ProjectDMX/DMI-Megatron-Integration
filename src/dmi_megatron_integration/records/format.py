@@ -258,7 +258,7 @@ class MegatronRecordFormat:
         packed_offset: int,
         active_index: int,
     ) -> tuple[PayloadSlice, int, int]:
-        element_size = int(torch.empty((), dtype=entry.dtype).element_size())
+        element_size = entry.element_size
         if entry.storage in (OutputStorage.SCALAR_FLOAT, OutputStorage.SCALAR_INT):
             self._validate_scalar_dtype(entry.storage, entry.dtype)
             if not entry.output_shape:
@@ -419,7 +419,7 @@ class MegatronRecordFormat:
     def _entry_bytes(entry: ProducerPlanEntry) -> int | None:
         if -1 in entry.output_shape:
             return None
-        element_size = int(torch.empty((), dtype=entry.dtype).element_size())
+        element_size = entry.element_size
         return int(prod(entry.output_shape)) * element_size
 
 

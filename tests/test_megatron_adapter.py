@@ -116,11 +116,17 @@ class FakeRecordRuntime:
         # the public signal that the runtime completed the output directly.
         return StepReservation.OVERSIZED
 
-    def prepare_replay(self, plan, metadata):
+    def _emit_prepared_output(self, entry, metadata, output, *, reservation_bytes):
+        result = self.emit_output(entry, metadata, output)
+        self.reservation_calls[-1] = (reservation_bytes, 1)
+        return result
+
+    def prepare_replay(self, plan, metadata, *, reservation_bytes=None):
         metadata = tuple(metadata)
         self.replay_calls.append((plan, metadata))
         self.reservation_calls.append(
-            (plan.total_reservation_bytes, plan.task_count)
+            (plan.total_reservation_bytes if reservation_bytes is None else sum(reservation_bytes),
+             plan.task_count)
         )
         if self.replay_result is not StepReservation.OVERSIZED:
             self.published_replay_metadata.append(metadata)
@@ -467,6 +473,76 @@ def test_iteration_hook_emits_one_unsplit_record_with_semantic_coordinates():
     assert entry.storage is OutputStorage.SCALAR_FLOAT
     assert entry.record_type is RecordType.PER_ITERATION
     assert torch.equal(output.tensor, torch.tensor([3.5]))
+
+
+def test_semantics_are_bound_per_hook_output_for_both_runtimes(monkeypatch):
+    engine = FakeEngine()
+    adaptor = _make_adaptor(engine, "train-run", dims={})
+
+    def make_hook(layer, iteration=False):
+        prefix = "iter" if iteration else "model"
+        return _make_hook(MegatronHookSpec(
+            name=prefix, layer_no=layer,
+            outputs=[MegatronOutputSpec(
+                name=f"{prefix}_{index}", input_shape=[1], dtype=torch.float32,
+            ) for index in range(2)],
+            preprocess=lambda x: (x, x),
+            need_token_range=False,
+            record_type=RecordType.PER_ITERATION if iteration else RecordType.PER_SAMPLE,
+            dp_emission=DPEmissionPolicy.DP_RANK_0 if iteration else DPEmissionPolicy.ALL_DP_RANKS,
+        ), hook_phase=HookPhase.ITERATION if iteration else HookPhase.FWD)
+
+    # The same output IDs are deliberately reused by two different layers.
+    hooks = [make_hook(0), make_hook(1)]
+    iteration_hook = make_hook(-1, iteration=True)
+    original = adaptor._producer_semantics
+    calls = []
+
+    def counted(**kwargs):
+        result = original(**kwargs)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(adaptor, "_producer_semantics", counted)
+    adaptor.attach_hooks(
+        model_hooks=tuple(MegatronHookBinding(hook=h) for h in hooks),
+        iteration_hooks=(MegatronHookBinding(
+            hook=iteration_hook, record_dp_rank=-1, record_shard_rank=-1,
+        ),),
+    )
+    assert len(calls) == 6
+    assert hooks[0]._output_ids == hooks[1]._output_ids
+    assert len({id(item) for item in calls}) == 6
+    for step in (7, 8):
+        adaptor.set_current_event(MegatronTrainingContext(
+            global_batch_id=step, microbatch_id=step - 7, valid_counts=(1,),
+            dataset_ids=(step,), attempt_id=step - 7,
+        ))
+        adaptor.set_current_iteration(MegatronTrainingContext(
+            global_batch_id=step, microbatch_id=-1, valid_counts=(), direction="iter",
+        ))
+        for hook in (*hooks, iteration_hook):
+            hook(torch.ones(1))
+        adaptor.clear_current_iteration()
+    assert len(calls) == 6
+    metadata = [item[1] for item in engine.record_runtime.emit_calls]
+    assert [item.layer_no for item in metadata[:6]] == [0, 0, 1, 1, -1, -1]
+    assert [item.act_name for item in metadata[:6]] == [
+        "model_0", "model_1", "model_0", "model_1", "iter_0", "iter_1"]
+    assert [item.global_batch_id for item in metadata] == [7] * 6 + [8] * 6
+    assert metadata[0].dataset_ids == (7,)
+    assert metadata[6].dataset_ids == (8,)
+    assert metadata[6].attempt_id == 1
+
+    old = adaptor._configured_hook(hooks[0]).output_semantics
+    replacement = make_hook(9)
+    adaptor.attach_hooks(
+        model_hooks=(MegatronHookBinding(hook=replacement),), iteration_hooks=(),
+    )
+    assert len(calls) == 8
+    assert id(hooks[0]) not in adaptor._configured_by_hook
+    assert adaptor._configured_hook(replacement).output_semantics[0].layer_no == 9
+    assert old[0].layer_no == 0
 
 
 def test_iteration_hook_requires_explicit_iteration_context():

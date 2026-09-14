@@ -11,6 +11,7 @@ import torch
 
 from dmi.api.v1 import (
     HookSpecV1,
+    OutputSizingMode,
     OutputStorage,
     RecordType,
     TransportSpec,
@@ -105,8 +106,11 @@ class MegatronOutputSpec:
     transport_type: TransportType = TransportType.IDENTITY
     storage: OutputStorage = OutputStorage.TENSOR
     row_bytes: int | None = None
+    sizing_mode: OutputSizingMode = OutputSizingMode.KNOWN_BEFORE_EXECUTION
 
     def __post_init__(self) -> None:
+        if not isinstance(self.sizing_mode, OutputSizingMode):
+            raise TypeError("sizing_mode must be an OutputSizingMode")
         object.__setattr__(self, "input_shape", tuple(self.input_shape))
         if self.output_shape is not None:
             object.__setattr__(self, "output_shape", tuple(self.output_shape))
@@ -254,6 +258,7 @@ class MegatronOutputSpec:
             output_shape=output_shape,
             row_bytes=row_bytes,
             feature_bytes=feature_bytes,
+            sizing_mode=self.sizing_mode,
         )
 
 

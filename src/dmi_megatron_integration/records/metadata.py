@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,8 +23,15 @@ class MegatronRecordMetadata:
     dataset_ids: tuple[int, ...] = ()
     attempt_id: int = 0
     invocation_id: int = 0
+    _normalized: InitVar[bool] = False
 
-    def __post_init__(self) -> None:
+    @classmethod
+    def _from_normalized(cls, **values) -> "MegatronRecordMetadata":
+        return cls(**values, _normalized=True)
+
+    def __post_init__(self, _normalized: bool) -> None:
+        if _normalized:
+            return
         object.__setattr__(
             self,
             "valid_counts",

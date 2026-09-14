@@ -92,6 +92,27 @@ def _rows(path) -> list[dict[str, Any]]:
     ]
 
 
+def test_payload_slice_and_entry_bytes_reuse_dtype_size(monkeypatch):
+    record_format = MegatronRecordFormat("training")
+    entries = [ProducerPlanBuilder().record_output(
+        output_id=1 << 16, output_spec=TransportSpec("x"),
+        output=HookOutput(torch.empty(2, 3, dtype=dtype)),
+    ) for dtype in (torch.bfloat16, torch.float32)]
+    for entry in entries:
+        assert entry.element_size in (2, 4)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("format allocated a scalar tensor after warmup")
+
+    monkeypatch.setattr(torch, "empty", forbidden)
+    for entry in entries * 3:
+        assert record_format._entry_bytes(entry) == 6 * entry.element_size
+        payload, _, _ = record_format._sample_payload_slice(
+            entry, sample_index=1, valid_count=1, packed_offset=0, active_index=0)
+        assert payload.offset_bytes == 3 * entry.element_size
+        assert payload.nbytes == 3 * entry.element_size
+
+
 def test_required_record_metadata_fields_are_output_specific():
     def fields(
         transport_type: TransportType,

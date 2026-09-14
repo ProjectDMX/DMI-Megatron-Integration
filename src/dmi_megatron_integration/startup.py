@@ -20,6 +20,7 @@ from dmi.api.v1 import (
     OutputStorage,
     RecordType,
     TransportType,
+    OutputSizingMode,
 )
 
 from .topology.ep_topology_manifest import (
@@ -1216,6 +1217,7 @@ def _install_moe_inverse_map_hooks(model: Any) -> None:
                                     # it neither sizes nor validates the eager payload.  This
                                     # first-milestone hook must remain outside CUDA Graph replay.
                                     input_shape=[DimSpec.ACTUAL_TOKEN_PACKED],
+                                    sizing_mode=OutputSizingMode.RUNTIME_SIZED,
                                     output_shape=[DimSpec.ACTUAL_TOKEN_PACKED],
                                     dtype=torch.int64,
                                     transport_type=TransportType.IDENTITY,
@@ -1262,6 +1264,7 @@ def _install_moe_packed_weighted_output_hooks(model: Any) -> None:
                             # annotations, not eager sizing or validation inputs.  CUDA Graph
                             # support requires a separate fixed-capacity or dynamic-plan design.
                             input_shape=[DimSpec.ACTUAL_TOKEN_PACKED, DimSpec.HIDDEN],
+                            sizing_mode=OutputSizingMode.RUNTIME_SIZED,
                             output_shape=[DimSpec.ACTUAL_TOKEN_PACKED, DimSpec.HIDDEN],
                             dtype=module.config.params_dtype,
                             transport_type=TransportType.IDENTITY,
