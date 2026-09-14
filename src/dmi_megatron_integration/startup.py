@@ -82,6 +82,7 @@ class MegatronDMIConfig:
     enabled: bool = False
     exact_resume: bool = False
     hook_selection: str = "router-summary"
+    layer_stride: int = 1
     recompute_hook: str | None = None
     no_recompute_hook: str | None = None
     dataset_provenance_mode: str = "auto"
@@ -297,6 +298,7 @@ def resolve_megatron_dmi_config(
         hook_selection=str(
             _env_value(args, "dmi_hook_selection", environ, "DMI_HOOK_SELECTION", "router-summary")
         ),
+        layer_stride=int(getattr(args, "dmi_layer_stride", 1)),
         recompute_hook=_env_value(
             args,
             "dmi_recompute_hook",
@@ -1912,6 +1914,35 @@ def _resolve_tp_sequence_shard_policies(
         _print_warning(message)
 
 
+def _select_hook_layers(
+    hooks: list[MegatronHookBinding], *, num_layers: int, layer_stride: int,
+) -> list[MegatronHookBinding]:
+    """Resolve a global layer stride into fixed selectors before hook binding."""
+    if layer_stride == 1:
+        return hooks
+    selected_layers = tuple(range(0, num_layers, layer_stride))
+    selected: list[MegatronHookBinding] = []
+    for binding in hooks:
+        hook = binding.hook
+        spec = _megatron_hook_spec(hook)
+        if spec.layer_placement in (HookLayerPlacement.EVERY_LAYER, HookLayerPlacement.LAYER_SET):
+            selector = selected_layers
+            if spec.layer_placement is HookLayerPlacement.LAYER_SET:
+                existing = {
+                    _resolve_layer_selector(layer, num_layers)
+                    for layer in spec.layer_selector
+                }
+                selector = tuple(layer for layer in selected_layers if layer in existing)
+            if spec.layer_no not in selector:
+                hook.enabled = False
+                continue
+            hook._dmi_megatron_spec = replace(
+                spec, layer_placement=HookLayerPlacement.LAYER_SET, layer_selector=selector,
+            )
+        selected.append(binding)
+    return selected
+
+
 def _active_hooks_for_rank(
     hooks: list[MegatronHookBinding],
     rank_ctx: MegatronRankContext,
@@ -2356,6 +2387,8 @@ def setup_megatron_dmi(
     cfg = resolve_megatron_dmi_config(args, explicit=explicit_config, environ=environ)
     if not cfg.enabled:
         return None
+    if cfg.layer_stride < 1:
+        raise ValueError("--dmi-layer-stride must be a positive integer")
     cfg = replace(
         cfg,
         recurring_d2h_windows_enabled=(
@@ -2622,6 +2655,9 @@ def setup_megatron_dmi(
                 "on the last pipeline stage"
             )
         selected_model_hooks = _collect_selected_hooks(unwrapped, cfg.hook_selection)
+        selected_model_hooks = _select_hook_layers(
+            selected_model_hooks, num_layers=rank_ctx.num_layers, layer_stride=cfg.layer_stride,
+        )
         has_selected_tp_sequence_hook = any(
             _megatron_hook_spec(binding.hook).shard_policy
             is ShardPolicy.TP_SEQUENCE_SHARDED
@@ -2714,6 +2750,20 @@ def setup_megatron_dmi(
                 unwrapped, rank_ctx=rank_ctx, selected_hooks=selected_hooks,
             )
             iteration_hooks.extend(qk_hooks)
+
+        if cfg.layer_stride != 1:
+            iteration_hooks = _select_hook_layers(
+                iteration_hooks, num_layers=rank_ctx.num_layers, layer_stride=cfg.layer_stride,
+            )
+            active_iteration_ids = {id(binding.hook) for binding in iteration_hooks}
+            router_weight_bindings = tuple(
+                binding for binding in router_weight_bindings
+                if id(binding.hook) in active_iteration_ids
+            )
+            qk_weight_bindings = tuple(
+                binding for binding in qk_weight_bindings
+                if id(binding[0]) in active_iteration_ids
+            )
 
         for binding in (*active_model_hooks, *iteration_hooks):
             binding.hook.megatron_distributed_info = distributed_info

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -37,6 +38,7 @@ from dmi_megatron_integration.startup import (
     MegatronRankContext,
     _MetadataRequirementReport,
     _active_hooks_for_rank,
+    _select_hook_layers,
     _gather_metadata_requirement_reports,
     _local_metadata_requirement_report,
     _make_hook,
@@ -958,6 +960,53 @@ def test_explicit_config_overrides_cli_and_env():
     assert cfg is explicit
 
 
+def test_layer_stride_cli_resolves_default_and_explicit_selection():
+    from argparse import ArgumentParser
+    from megatron.training.arguments import _add_dmi_args
+
+    parser = _add_dmi_args(ArgumentParser())
+    default = resolve_megatron_dmi_config(parser.parse_args([]), environ={})
+    assert default.layer_stride == 1
+    selected = resolve_megatron_dmi_config(
+        parser.parse_args(["--dmi-layer-stride", "3"]), environ={},
+    )
+    assert selected.layer_stride == 3
+    explicit = MegatronDMIConfig(layer_stride=4)
+    assert resolve_megatron_dmi_config(
+        parser.parse_args(["--dmi-layer-stride", "3"]), explicit=explicit, environ={},
+    ).layer_stride == 4
+
+
+@pytest.mark.parametrize("stride", [0, -1])
+def test_layer_stride_rejects_nonpositive_values_before_setup(stride):
+    with pytest.raises(ValueError, match="--dmi-layer-stride must be a positive integer"):
+        setup_megatron_dmi(
+            [], args=SimpleNamespace(dmi_enable=True, dmi_layer_stride=stride), environ={},
+        )
+
+
+def test_layer_stride_intersects_existing_selection_and_preserves_unlayered_hooks():
+    retained = _policy_binding("retained", suppress_recompute=True)
+    excluded = _policy_binding("excluded", suppress_recompute=True)
+    unlayered = _policy_binding("unlayered", suppress_recompute=True)
+    for binding, layer_no in ((retained, 6), (excluded, 7)):
+        binding.hook._dmi_megatron_spec = replace(
+            _megatron_hook_spec(binding.hook), layer_no=layer_no,
+            layer_placement=HookLayerPlacement.LAYER_SET, layer_selector=(6, 7, -1),
+        )
+    unlayered.hook._dmi_megatron_spec = replace(
+        _megatron_hook_spec(unlayered.hook), layer_no=-1,
+        layer_placement=HookLayerPlacement.NO_LAYER_LAST_PP,
+    )
+    original_unlayered = _megatron_hook_spec(unlayered.hook)
+    bindings = [retained, excluded, unlayered]
+    assert _select_hook_layers(bindings, num_layers=10, layer_stride=1) is bindings
+    assert _select_hook_layers(bindings, num_layers=10, layer_stride=3) == [retained, unlayered]
+    assert _megatron_hook_spec(retained.hook).layer_selector == (6, 9)
+    assert not excluded.hook.enabled
+    assert _megatron_hook_spec(unlayered.hook) is original_unlayered
+
+
 @pytest.mark.parametrize("value,expected", [("0", False), ("false", False), ("1", True), ("true", True)])
 def test_window_boolean_environment_and_cli_precedence(value, expected):
     env = {"DMI_RECURRING_D2H_WINDOWS": value, "DMI_D2H_WINDOW_DEBUG": value}
@@ -1227,8 +1276,13 @@ def test_setup_enabled_builds_runtime_and_attaches_model(
     assert handle.engine.closed is True
 
 
-def test_setup_hidden_states_resolves_seq_and_hidden_dims():
-    model = [TinyHiddenStateModel()]
+@pytest.mark.parametrize("layer_stride", [1, 3, 20])
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_setup_hidden_states_resolves_dims_and_global_layer_stride(layer_stride, pp_rank):
+    root = nn.Module()
+    local_layers = range(pp_rank * 5, (pp_rank + 1) * 5)
+    root.layers = nn.ModuleList(TransformerLayer(layer + 1) for layer in local_layers)
+    model = [root]
 
     def runtime_factory(**kwargs):
         context = DMIMetadataContext(
@@ -1249,6 +1303,7 @@ def test_setup_hidden_states_resolves_seq_and_hidden_dims():
     cfg = MegatronDMIConfig(
         enabled=True,
         hook_selection="hidden-states",
+        layer_stride=layer_stride,
         model_id="run",
         dataset_provenance_mode=CONSTANT_PROVENANCE,
     )
@@ -1256,9 +1311,9 @@ def test_setup_hidden_states_resolves_seq_and_hidden_dims():
     handle = setup_megatron_dmi(
         model,
         args=args,
-        model_config=SimpleNamespace(hidden_size=32, sequence_parallel=False),
+        model_config=SimpleNamespace(hidden_size=32, sequence_parallel=False, num_layers=10),
         explicit_config=cfg,
-        parallel_state_module=FakeParallelState(dp_world=1),
+        parallel_state_module=FakeParallelState(dp_world=1, pp_rank=pp_rank, pp_world=2),
         dist_module=FakeDist(initialized=False),
         unwrap_fn=lambda x: x,
         engine_factory=_fake_engine_factory,
@@ -1274,9 +1329,20 @@ def test_setup_hidden_states_resolves_seq_and_hidden_dims():
     assert adaptor.dims[DimSpec.HIDDEN] == 32
     assert DimSpec.NUM_EXPERTS not in adaptor.dims
     model_hooks = adaptor.attach_calls[0]["model_hooks"]
-    assert len(model_hooks) == 1
-    assert _megatron_hook_spec(model_hooks[0].hook).shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
-    assert handle.schedule_runtime.propagator.context.tp_sequence_sharded_enabled
+    expected_layers = [layer for layer in local_layers if layer % layer_stride == 0]
+    assert [_megatron_hook_spec(binding.hook).layer_no for binding in model_hooks] == expected_layers
+    for layer in root.layers:
+        assert layer.dmi_hidden_states.enabled == (layer.layer_number - 1 in expected_layers)
+    for binding in model_hooks:
+        spec = _megatron_hook_spec(binding.hook)
+        assert spec.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
+        if layer_stride == 1:
+            assert spec.layer_placement is HookLayerPlacement.EVERY_LAYER
+            assert spec.layer_selector is None
+        else:
+            assert spec.layer_placement is HookLayerPlacement.LAYER_SET
+            assert spec.layer_selector == tuple(range(0, 10, layer_stride))
+    assert handle.schedule_runtime.propagator.context.tp_sequence_sharded_enabled == bool(expected_layers)
 
     handle.close()
 

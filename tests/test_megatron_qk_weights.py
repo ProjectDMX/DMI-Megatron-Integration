@@ -25,6 +25,7 @@ from tests.test_megatron_startup import (
     FakeDist,
     FakeEngine,
     FakeParallelState,
+    TopKRouter,
 )
 
 
@@ -285,6 +286,35 @@ def test_setup_emits_initial_and_restored_states_with_fresh_values():
         assert handle.adaptor.context is None
         with pytest.raises(ValueError, match="must be >= 1"):
             handle.emit_qk_weights(model_state_iteration_id=0)
+    finally:
+        handle.close()
+
+
+def test_layer_stride_filters_weight_bindings_before_iteration_capture():
+    model = nn.Module()
+    model.layers = nn.ModuleList(_attention(layer=layer + 1)[0] for layer in range(3))
+    for layer, module in enumerate(model.layers):
+        module.router = TopKRouter(layer_number=layer + 1)
+        module.router.weight = FakeCudaParameter(torch.zeros(4, 7))
+    handle = setup_megatron_dmi(
+        [model], args=SimpleNamespace(global_batch_size=4, micro_batch_size=2),
+        model_config=SimpleNamespace(num_layers=3, hidden_size=7, num_moe_experts=4),
+        explicit_config=MegatronDMIConfig(
+            enabled=True, layer_stride=2,
+            hook_selection="q-weights,k-weights,router-weights,grad-norm", model_id="stride-test",
+        ),
+        parallel_state_module=FakeParallelState(), dist_module=FakeDist(initialized=False),
+        unwrap_fn=lambda x: x, engine_factory=lambda *args: (FakeEngine(), None),
+        adaptor_cls=FakeAdaptor, device="cpu",
+    )
+    try:
+        assert [_megatron_hook_spec(hook).layer_no for hook, _ in handle.qk_weight_bindings] == [0, 0, 2, 2]
+        assert [_megatron_hook_spec(binding.hook).layer_no for binding in handle.router_weight_bindings] == [0, 2]
+        bindings = handle.adaptor.attach_calls[0]["iteration_hooks"]
+        unlayered = [binding for binding in bindings if _megatron_hook_spec(binding.hook).layer_no == -1]
+        assert len(unlayered) == 2  # Attempt status and gradient norm.
+        assert all(binding.record_shard_rank == -1 for binding in unlayered)
+        assert handle.grad_norm_hook is not None
     finally:
         handle.close()
 
