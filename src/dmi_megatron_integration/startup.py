@@ -854,6 +854,11 @@ def _apply_recompute_hook_policy(
             "DMI recompute policy names resolve to no selected HookPointV1: "
             f"{sorted(unresolved)}"
         )
+    if recompute_names:
+        raise NotImplementedError(
+            "DMI recomputation offloading is temporarily disabled: stale packing "
+            "metadata must be fixed before enabling --dmi-recompute-hook."
+        )
     for binding in hooks:
         if id(binding.hook) in resolved:
             binding.hook.suppress_recompute = resolved[id(binding.hook)]

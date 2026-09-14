@@ -2304,7 +2304,7 @@ def test_router_weights_rejects_dp_greater_than_one_before_engine_creation():
     assert engine_calls == []
 
 
-def test_recompute_hook_policy_preserves_defaults_and_applies_both_overrides():
+def test_recompute_hook_policy_preserves_defaults_and_allows_suppression():
     retain = _policy_binding("retain-me", suppress_recompute=True)
     suppress = _policy_binding("suppress-me", suppress_recompute=False)
     unchanged = _policy_binding("unchanged", suppress_recompute=False)
@@ -2312,13 +2312,29 @@ def test_recompute_hook_policy_preserves_defaults_and_applies_both_overrides():
     _apply_recompute_hook_policy(
         [retain, suppress, unchanged],
         selected_names={"retain-me", "suppress-me", "unchanged"},
-        recompute_names_raw="retain-me",
+        recompute_names_raw=None,
         no_recompute_names_raw="suppress-me",
     )
 
-    assert retain.hook.suppress_recompute is False
+    assert retain.hook.suppress_recompute is True
     assert suppress.hook.suppress_recompute is True
     assert unchanged.hook.suppress_recompute is False
+
+
+def test_recompute_hook_policy_rejects_retention_before_mutating_hooks():
+    retain = _policy_binding("retain-me", suppress_recompute=True)
+    suppress = _policy_binding("suppress-me", suppress_recompute=False)
+
+    with pytest.raises(NotImplementedError, match="stale packing metadata must be fixed"):
+        _apply_recompute_hook_policy(
+            [retain, suppress],
+            selected_names={"retain-me", "suppress-me"},
+            recompute_names_raw="retain-me",
+            no_recompute_names_raw="suppress-me",
+        )
+
+    assert retain.hook.suppress_recompute is True
+    assert suppress.hook.suppress_recompute is False
 
 
 @pytest.mark.parametrize(
