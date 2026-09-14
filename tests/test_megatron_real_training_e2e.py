@@ -956,6 +956,8 @@ def _run_distributed_tensor_file_sink_vs_clickhouse(
             "local",
             "--cuda-graph-scope",
             "full_iteration",
+            "--cuda-graph-warmup-steps",
+            "1",
             "--no-check-for-nan-in-loss-and-grad",
         ]
 
@@ -1002,6 +1004,9 @@ def _run_distributed_tensor_file_sink_vs_clickhouse(
             env=base_env,
             log_path=tmp_path / f"{act_name}_{mode}_clickhouse.log",
         )
+        if graph:
+            graph_log = (tmp_path / f"{act_name}_{mode}_clickhouse.log").read_text()
+            assert "CUDA graph capture done for training" in graph_log
         _wait_for_exact_act_rows(
             client,
             database=database,
@@ -1039,7 +1044,7 @@ def _run_distributed_tensor_file_sink_vs_clickhouse(
             _assert_tensor_maps_close_with_report(
                 file_by_key,
                 db_by_key,
-                label=f"eager vs full-iteration graph {act_name}",
+            label=f"eager vs full-iteration graph {act_name}",
                 atol=float(os.environ.get("DMI_GRAPH_NUMERIC_E2E_ATOL", "5e-2")),
                 rtol=float(os.environ.get("DMI_GRAPH_NUMERIC_E2E_RTOL", "1e-1")),
             )
@@ -1099,6 +1104,54 @@ def _run_distributed_tensor_file_sink_vs_clickhouse(
             id="hidden_states_sp_on",
         ),
         pytest.param(
+            "router_logits_sp_on",
+            "router-logits",
+            "router_logits",
+            [
+                "--num-experts", "2",
+                "--moe-router-topk", "1",
+                "--moe-router-dtype", "fp32",
+                "--moe-router-pre-softmax",
+                "--moe-token-dispatcher-type", "alltoall",
+                "--moe-expert-capacity-factor", "2",
+                "--moe-pad-expert-input-to-capacity",
+                "--moe-pad-experts-for-cuda-graph-inference",
+                "--expert-model-parallel-size", "2",
+                "--expert-tensor-parallel-size", "1",
+                "--sequence-parallel",
+                "--attention-backend", "unfused",
+            ],
+            8,
+            "transformer_engine",
+            (8, 2),
+            {(0, 8), (8, 16)},
+            id="router_logits_sp_on",
+        ),
+        pytest.param(
+            "router_summary_sp_on",
+            "router-summary",
+            "router_probs_mean",
+            [
+                "--num-experts", "2",
+                "--moe-router-topk", "1",
+                "--moe-router-dtype", "fp32",
+                "--moe-router-pre-softmax",
+                "--moe-token-dispatcher-type", "alltoall",
+                "--moe-expert-capacity-factor", "2",
+                "--moe-pad-expert-input-to-capacity",
+                "--moe-pad-experts-for-cuda-graph-inference",
+                "--expert-model-parallel-size", "2",
+                "--expert-tensor-parallel-size", "1",
+                "--sequence-parallel",
+                "--attention-backend", "unfused",
+            ],
+            8,
+            "transformer_engine",
+            (2,),
+            {(0, 8), (8, 16)},
+            id="router_summary_sp_on",
+        ),
+        pytest.param(
             "resid_final",
             "resid_final",
             "hook_resid_final",
@@ -1152,6 +1205,117 @@ def test_real_megatron_distributed_tensor_eager_and_graph_correctness(
         expected_local_shape=expected_local_shape,
         expected_token_intervals=expected_token_intervals,
     )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Expert-count E2E needs CUDA")
+@pytest.mark.parametrize("act_name", ["pre_drop_token_count", "post_drop_token_count"])
+def test_real_megatron_expert_counts_tp_sequence_shards(tmp_path, act_name):
+    if _available_cuda_devices() < 2:
+        pytest.skip("expert-count E2E requires two CUDA devices")
+    _run_distributed_tensor_file_sink_vs_clickhouse(
+        tmp_path=tmp_path,
+        hook_selection="expert-counts",
+        act_name=act_name,
+        train_iters=1,
+        expected_rows=8,
+        extra_args=[
+            "--num-experts", "2",
+            "--moe-router-topk", "1",
+            "--moe-router-dtype", "fp32",
+            "--moe-router-pre-softmax",
+            "--moe-token-dispatcher-type", "alltoall",
+            "--moe-expert-capacity-factor", "1",
+            "--moe-pad-expert-input-to-capacity",
+            "--expert-model-parallel-size", "2",
+            "--expert-tensor-parallel-size", "1",
+            "--sequence-parallel",
+            "--attention-backend", "unfused",
+        ],
+        graph=False,
+        transformer_impl="transformer_engine",
+        expected_local_shape=(2,),
+        expected_token_intervals={(0, 8), (8, 16)},
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Router-entropy E2E needs CUDA")
+def test_real_megatron_router_entropy_tp_sequence_shards(tmp_path):
+    if _available_cuda_devices() < 2:
+        pytest.skip("router-entropy E2E requires two CUDA devices")
+    client = _clickhouse_client_or_skip()
+    database = os.environ.get("DMX_DB_DATABASE", "default")
+    table = f"dmi_megatron_entropy_tp_e2e_{uuid.uuid4().hex}"
+    model_id = f"megatron-entropy-tp-e2e-{uuid.uuid4().hex}"
+    client.execute(f"CREATE DATABASE IF NOT EXISTS `{database}`")
+    _create_training_table(client, database=database, table=table)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{ROOT}:{MEGATRON_ROOT}:{env.get('PYTHONPATH', '')}"
+    env["DMI_ENABLE"] = "1"
+    env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    if "DMI_REAL_E2E_CUDA_VISIBLE_DEVICES" in env:
+        env["CUDA_VISIBLE_DEVICES"] = env["DMI_REAL_E2E_CUDA_VISIBLE_DEVICES"]
+
+    try:
+        cmd = _tiny_megatron_router_summary_cmd(
+            model_id=model_id,
+            train_iters=1,
+            micro_batch_size=2,
+            global_batch_size=2,
+            nproc_per_node=2,
+            tp_size=2,
+            ep_size=2,
+            moe_token_dispatcher_type="alltoall",
+            transformer_impl="transformer_engine",
+            database=database,
+            table=table,
+            extra_args=[
+                "--dmi-hook-selection", "router-logits,router-entropy",
+                "--moe-router-dtype", "fp32",
+                "--expert-tensor-parallel-size", "1",
+                "--sequence-parallel",
+                "--attention-backend", "unfused",
+            ],
+        )
+        _run_megatron_cmd(cmd, env=env, log_path=tmp_path / "router_entropy_tp.log")
+        _wait_for_exact_act_rows(
+            client, database=database, table=table, model_id=model_id,
+            act_name="router_logits", expected=8,
+        )
+        _wait_for_exact_scalar_rows(
+            client, database=database, table=f"{table}_scalar_float",
+            model_id=model_id, act_name="router_token_entropy_mean", expected=8,
+        )
+        logits_rows = _read_training_act_rows(
+            model_id=model_id, table=table, database=database, act_name="router_logits",
+        )
+        entropy_rows = _read_training_scalar_act_rows(
+            model_id=model_id, table=table, database=database,
+            act_name="router_token_entropy_mean", direction="fwd",
+        )
+        # Match all coordinates except act_name between the two hooks.
+        logits_by_coordinate = {key[:1] + key[2:]: tensor for key, tensor in logits_rows}
+        entropy_by_coordinate = {key[:1] + key[2:]: value for key, value in entropy_rows}
+        assert len(logits_rows) == len(logits_by_coordinate) == 8
+        assert len(entropy_rows) == len(entropy_by_coordinate) == 8
+        assert logits_by_coordinate.keys() == entropy_by_coordinate.keys()
+        assert {key[9] for key, _ in entropy_rows} == {0, 1}
+        assert {(key[10], key[11]) for key, _ in entropy_rows} == {(0, 8), (8, 16)}
+        for coordinate, logits in logits_by_coordinate.items():
+            assert tuple(logits.shape) == (8, 2)
+            probs = logits.float().softmax(dim=-1)
+            expected = torch.special.entr(probs).sum(dim=-1).mean().item()
+            assert entropy_by_coordinate[coordinate] == pytest.approx(
+                expected, rel=1e-6, abs=1e-6,
+            )
+    finally:
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_float`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_int`")
+        client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_eval_phase_boundary`")
+        client.disconnect()
 
 
 def _run_two_path_numeric_check(
@@ -1646,11 +1810,18 @@ def test_real_megatron_vocab_logits_training_clickhouse_rows_and_boundary_flush(
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Real Megatron vocabulary top-K E2E needs CUDA")
-def test_real_megatron_vocab_logits_topk_training_clickhouse_rows(tmp_path):
-    """Run real Megatron training and verify both fixed-K vocabulary-logit outputs."""
+@pytest.mark.parametrize(
+    ("tp_size", "sequence_parallel", "ep_size"),
+    [(1, False, 1), (2, False, 1), (2, True, 1), (2, True, 2)],
+    ids=["tp1", "tp2", "tp2_sp", "tp2_sp_ep2_etp1"],
+)
+def test_real_megatron_vocab_logits_topk_training_clickhouse_rows(
+    tmp_path, tp_size, sequence_parallel, ep_size
+):
+    """Read back both local top-K tensors and verify them against raw logits."""
 
-    if _available_cuda_devices() < 1:
-        pytest.skip("vocab-logits-topk E2E requires one CUDA device")
+    if _available_cuda_devices() < tp_size:
+        pytest.skip(f"vocab-logits-topk E2E requires {tp_size} CUDA devices")
 
     client = _clickhouse_client_or_skip()
     database = os.environ.get("DMX_DB_DATABASE", "default")
@@ -1663,8 +1834,9 @@ def test_real_megatron_vocab_logits_topk_training_clickhouse_rows(tmp_path):
     global_batch_size = 2
     seq_length = 16
     padded_vocab_size = 256
+    local_vocab_size = padded_vocab_size // tp_size
     top_k = 100
-    expected_rows_per_output = train_iters * global_batch_size
+    expected_rows_per_output = train_iters * global_batch_size * tp_size
 
     client.execute(f"CREATE DATABASE IF NOT EXISTS `{database}`")
     client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
@@ -1683,19 +1855,29 @@ def test_real_megatron_vocab_logits_topk_training_clickhouse_rows(tmp_path):
         eval_iters=0,
         micro_batch_size=micro_batch_size,
         global_batch_size=global_batch_size,
+        nproc_per_node=tp_size,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        num_experts=None if tp_size > 1 and not sequence_parallel else 2,
+        moe_token_dispatcher_type="alltoall" if ep_size > 1 else "allgather",
+        transformer_impl="transformer_engine" if sequence_parallel else "local",
         database=database,
         table=table,
         extra_args=[
             "--dmi-hook-selection",
-            "vocab-logits-topk",
+            "vocab-logits,vocab-logits-topk",
             "--dmi-vocab-logits-top-k",
             str(top_k),
-        ],
+        ] + (
+            ["--sequence-parallel", "--attention-backend", "unfused"]
+            if sequence_parallel else []
+        ) + (["--expert-tensor-parallel-size", "1"] if ep_size > 1 else []),
     )
 
     try:
         _run_megatron_cmd(cmd, env=env, log_path=log_path)
         for act_name in (
+            "vocab_logits",
             "vocab_logits_topk_values",
             "vocab_logits_topk_indices",
         ):
@@ -1722,24 +1904,34 @@ def test_real_megatron_vocab_logits_topk_training_clickhouse_rows(tmp_path):
             {
                 "model_id": model_id,
                 "act_names": (
+                    "vocab_logits",
                     "vocab_logits_topk_values",
                     "vocab_logits_topk_indices",
                 ),
             },
+            settings={"strings_as_bytes": True},
         )
-        assert len(rows) == 2 * expected_rows_per_output
+        assert len(rows) == 3 * expected_rows_per_output
         by_key = {}
         for row in rows:
             act_name, *metadata, dtype, shape, payload = row
-            key = tuple(metadata)
-            by_key.setdefault(key, {})[str(act_name)] = (
-                str(dtype),
+            key = tuple(item.decode() if isinstance(item, bytes) else item for item in metadata)
+            act_name = act_name.decode()
+            assert act_name not in by_key.get(key, {})
+            by_key.setdefault(key, {})[act_name] = (
+                dtype.decode(),
                 tuple(shape),
                 payload,
             )
         assert len(by_key) == expected_rows_per_output
+        by_sample = {}
+        for key in by_key:
+            by_sample.setdefault(key[:-1], set()).add(int(key[-1]))
+        assert len(by_sample) == train_iters * global_batch_size
+        assert all(shards == set(range(tp_size)) for shards in by_sample.values())
         for outputs in by_key.values():
             assert set(outputs) == {
+                "vocab_logits",
                 "vocab_logits_topk_values",
                 "vocab_logits_topk_indices",
             }
@@ -1766,7 +1958,15 @@ def test_real_megatron_vocab_logits_topk_training_clickhouse_rows(tmp_path):
             ).reshape(seq_length, top_k)
             assert torch.all(values[:, :-1] >= values[:, 1:])
             assert int(indices.min()) >= 0
-            assert int(indices.max()) < padded_vocab_size
+            assert int(indices.max()) < local_vocab_size
+            raw_dtype, raw_shape, raw_bytes = outputs["vocab_logits"]
+            assert raw_dtype == "torch.bfloat16"
+            assert raw_shape == (seq_length, local_vocab_size)
+            raw = torch.frombuffer(
+                bytearray(raw_bytes), dtype=torch.bfloat16
+            ).reshape(raw_shape)
+            assert torch.equal(values, raw.gather(-1, indices.long()))
+            assert torch.equal(values, raw.topk(top_k, dim=-1).values)
     finally:
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_float`")
@@ -2264,11 +2464,17 @@ def test_real_megatron_router_and_loss_summary_graph_matches_eager_file_sink_num
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Real Megatron E2E needs CUDA")
-def test_real_megatron_loss_summary_clickhouse_rows(tmp_path):
+@pytest.mark.parametrize(
+    ("tp_size", "dp_size", "ep_size"),
+    [(1, 1, 1), (1, 2, 2), (2, 1, 2)],
+    ids=["single_rank", "dp2_ep2", "tp2_sp_ep2"],
+)
+def test_real_megatron_loss_summary_clickhouse_rows(tmp_path, tp_size, dp_size, ep_size):
     """Run real Megatron eval and verify loss-summary scalar rows."""
 
-    if _available_cuda_devices() < 1:
-        pytest.skip("loss-summary E2E requires one CUDA device")
+    nproc_per_node = tp_size * dp_size
+    if _available_cuda_devices() < nproc_per_node:
+        pytest.skip(f"loss-summary E2E requires {nproc_per_node} CUDA devices")
 
     client = _clickhouse_client_or_skip()
     database = os.environ.get("DMX_DB_DATABASE", "default")
@@ -2281,7 +2487,7 @@ def test_real_megatron_loss_summary_clickhouse_rows(tmp_path):
     train_iters = 1
     eval_iters = 1
     micro_batch_size = 1
-    global_batch_size = 1
+    global_batch_size = dp_size
     # Megatron --skip-train with eval_iters>0 runs both validation and test.
     expected_rows = 2 * eval_iters * global_batch_size
 
@@ -2303,9 +2509,19 @@ def test_real_megatron_loss_summary_clickhouse_rows(tmp_path):
         eval_iters=eval_iters,
         micro_batch_size=micro_batch_size,
         global_batch_size=global_batch_size,
+        nproc_per_node=nproc_per_node,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        moe_token_dispatcher_type="alltoall" if ep_size > 1 else "allgather",
+        transformer_impl="transformer_engine" if nproc_per_node > 1 else "local",
         database=database,
         table=table,
-        extra_args=["--dmi-hook-selection", "loss-summary", "--skip-train", "--no-load-optim"],
+        extra_args=[
+            "--dmi-hook-selection", "loss-summary", "--skip-train", "--no-load-optim",
+            "--expert-tensor-parallel-size", "1",
+            "--attention-backend", "unfused",
+            *(["--sequence-parallel"] if tp_size > 1 else []),
+        ],
     )
 
     try:
@@ -2318,18 +2534,22 @@ def test_real_megatron_loss_summary_clickhouse_rows(tmp_path):
             act_name="lm_per_sample_loss",
             expected=expected_rows,
         )
-        rows = _query_scalar_values(
-            client,
+        rows = _read_training_scalar_rows_all_phases(
             database=database,
-            table=scalar_table,
+            table=table,
             model_id=model_id,
+            scalar_kind="float",
             act_name="lm_per_sample_loss",
         )
         assert len(rows) == expected_rows
-        for phase, _global_batch_id, _microbatch_id, _sample_index, layer_no, value in rows:
-            phase = phase.decode("utf-8") if isinstance(phase, bytes) else phase
-            assert phase in {"valid", "test"}
-            assert int(layer_no) == -1
+        assert len(dict(rows)) == expected_rows
+        assert {(key[3], key[5]) for key, _ in rows} == {
+            (phase, dp_rank) for phase in ("valid", "test") for dp_rank in range(dp_size)
+        }
+        for key, value in rows:
+            assert key[8] == -1
+            assert key[9] == key[5]
+            assert math.isfinite(float(value))
             assert float(value) > 0.0
         _wait_for_exact_scalar_rows(
             client,
@@ -2339,6 +2559,15 @@ def test_real_megatron_loss_summary_clickhouse_rows(tmp_path):
             act_name="lm_per_sample_loss_token_count",
             expected=expected_rows,
         )
+        count_rows = _read_training_scalar_rows_all_phases(
+            database=database, table=table, model_id=model_id,
+            scalar_kind="int", act_name="lm_per_sample_loss_token_count",
+        )
+        assert len(count_rows) == len(dict(count_rows)) == expected_rows
+        assert {key[:1] + key[2:] for key, _ in count_rows} == {
+            key[:1] + key[2:] for key, _ in rows
+        }
+        assert all(int(value) == 16 for _, value in count_rows)
     finally:
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{scalar_table}`")

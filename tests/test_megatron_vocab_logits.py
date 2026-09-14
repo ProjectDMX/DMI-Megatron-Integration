@@ -62,6 +62,29 @@ def test_vocab_logits_topk_by_sample_supports_boundary_k(k):
     assert indices.shape == (2, 1, k)
 
 
+def test_local_topk_indices_and_shard_rank_reconstruct_global_topk():
+    tp_world, local_vocab_size, k = 8, 16, 4
+    vocab_size = tp_world * local_vocab_size
+    generator = torch.Generator().manual_seed(1234)
+    logits = torch.stack(
+        [torch.randperm(vocab_size, generator=generator) for _ in range(6)]
+    ).reshape(3, 2, vocab_size).to(torch.float32)
+    candidate_values, candidate_ids = [], []
+    for shard_rank, shard in enumerate(logits.chunk(tp_world, dim=-1)):
+        values, indices = vocab_logits_topk_by_sample(shard, k=k)
+        candidate_values.append(values)
+        candidate_ids.append(indices + shard_rank * local_vocab_size)
+
+    # Storage-side reconstruction from only local candidates and TP coordinates.
+    values = torch.cat(candidate_values, dim=-1)
+    ids = torch.cat(candidate_ids, dim=-1)
+    merged_values, positions = values.topk(k, dim=-1)
+    merged_ids = ids.gather(-1, positions)
+    expected_values, expected_ids = logits.transpose(0, 1).topk(k, dim=-1)
+    assert torch.equal(merged_values, expected_values)
+    assert torch.equal(merged_ids, expected_ids.to(torch.int32))
+
+
 @pytest.mark.parametrize("k", [0, -1, 6])
 def test_vocab_logits_topk_by_sample_rejects_out_of_range_k(k):
     with pytest.raises(ValueError, match="must satisfy"):

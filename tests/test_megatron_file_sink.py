@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from typing import Any
 
+import pytest
 import torch
 
 from dmi.api.v1 import (
@@ -306,7 +307,13 @@ def test_megatron_file_sink_writes_seq_prefix_pack_rows(tmp_path):
     )
 
 
-def test_megatron_file_sink_writes_loss_summary_scalar_rows(tmp_path):
+@pytest.mark.parametrize(
+    ("valid_counts", "sample_indices", "token_ends"),
+    [((), [0, 1], [1, 1]), ((3, 2), [0, 1], [3, 2]), ((0, 2), [1], [2])],
+)
+def test_megatron_file_sink_writes_loss_summary_scalar_rows(
+    tmp_path, valid_counts, sample_indices, token_ends
+):
     sink = MegatronTestFileSink(tmp_path, rank=0)
     _emit(
         sink,
@@ -340,7 +347,7 @@ def test_megatron_file_sink_writes_loss_summary_scalar_rows(tmp_path):
             layer_no=-1,
             shard_rank=0,
             token_start=0,
-            valid_counts=(3, 2),
+            valid_counts=valid_counts,
             dataset_ids=(5, 6),
         ),
         torch.tensor([[1.25], [2.5]], dtype=torch.float32),
@@ -349,15 +356,17 @@ def test_megatron_file_sink_writes_loss_summary_scalar_rows(tmp_path):
     sink.close()
 
     rows = _rows(tmp_path / "rank000" / "scalar_float_rows.jsonl")
-    assert [row["value"] for row in rows] == [1.25, 2.5]
-    assert [row["dataset_id"] for row in rows] == [5, 6]
-    assert [row["token_end"] for row in rows] == [1, 1]
+    assert [row["sample_index"] for row in rows] == sample_indices
+    assert [row["value"] for row in rows] == [[1.25, 2.5][i] for i in sample_indices]
+    assert [row["dataset_id"] for row in rows] == [[5, 6][i] for i in sample_indices]
+    assert [row["token_end"] for row in rows] == token_ends
     assert all(row["act_name"] == "lm_per_sample_loss" for row in rows)
 
     int_rows = _rows(tmp_path / "rank000" / "scalar_int_rows.jsonl")
-    assert [row["value"] for row in int_rows] == [3, 2]
-    assert [row["dataset_id"] for row in int_rows] == [5, 6]
-    assert [row["token_end"] for row in int_rows] == [1, 1]
+    assert [row["sample_index"] for row in int_rows] == sample_indices
+    assert [row["value"] for row in int_rows] == [[3, 2][i] for i in sample_indices]
+    assert [row["dataset_id"] for row in int_rows] == [[5, 6][i] for i in sample_indices]
+    assert [row["token_end"] for row in int_rows] == token_ends
     assert all(
         row["act_name"] == "lm_per_sample_loss_token_count"
         for row in int_rows
@@ -425,13 +434,13 @@ def test_megatron_file_sink_writes_packed_loss_summary_scalar_rows(tmp_path):
     float_rows = _rows(tmp_path / "rank000" / "scalar_float_rows.jsonl")
     assert [row["sample_index"] for row in float_rows] == [0, 1]
     assert [row["dataset_id"] for row in float_rows] == [5, 6]
-    assert [row["token_end"] for row in float_rows] == [1, 1]
+    assert [row["token_end"] for row in float_rows] == [4, 2]
     assert [row["value"] for row in float_rows] == [1.25, 2.5]
 
     int_rows = _rows(tmp_path / "rank000" / "scalar_int_rows.jsonl")
     assert [row["sample_index"] for row in int_rows] == [0, 1]
     assert [row["dataset_id"] for row in int_rows] == [5, 6]
-    assert [row["token_end"] for row in int_rows] == [1, 1]
+    assert [row["token_end"] for row in int_rows] == [4, 2]
     assert [row["value"] for row in int_rows] == [4, 2]
 
 

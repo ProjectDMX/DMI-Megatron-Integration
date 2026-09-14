@@ -18,7 +18,12 @@ def vocab_logits_topk_by_sample(
     *,
     k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return sorted vocabulary top-K values and int32 indices as ``[B, S, K]``."""
+    """Return local top-K values and int32 indices as ``[B, S, K]``.
+
+    The input is ``[S, B, V_local]``, including with sequence parallelism.
+    Indices address this vocabulary shard; storage can recover global IDs as
+    ``shard_rank * V_local + index`` for TP-sharded logits.
+    """
 
     if logits.dim() != 3:
         raise ValueError(f"Expected vocabulary logits [S, B, V], got {tuple(logits.shape)}")

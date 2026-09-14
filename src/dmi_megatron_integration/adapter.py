@@ -803,13 +803,20 @@ class MegatronAdaptor:
                 "TP_SEQUENCE_SHARDED requires one PER_SAMPLE output"
             )
         output = policy.outputs[0]
-        if (
-            tuple(output.input_shape[:2]) != (DimSpec.SEQ, DimSpec.BATCH)
-            or output.transport_type is not TransportType.SEQ_PREFIX_PACK
+        # A reduced batch-first output still describes this source interval.
+        if not (
+            (
+                output.transport_type is TransportType.SEQ_PREFIX_PACK
+                and tuple(output.input_shape[:2]) == (DimSpec.SEQ, DimSpec.BATCH)
+            )
+            or (
+                output.transport_type is TransportType.IDENTITY
+                and tuple(output.input_shape[:1]) == (DimSpec.BATCH,)
+            )
         ):
             raise ValueError(
                 "TP_SEQUENCE_SHARDED requires [SEQ, BATCH, ...] "
-                "SEQ_PREFIX_PACK input"
+                "SEQ_PREFIX_PACK input or [BATCH, ...] IDENTITY input"
             )
         distributed_info = getattr(hook, "megatron_distributed_info", None)
         if not isinstance(distributed_info, MegatronDistributedInfo):

@@ -620,13 +620,16 @@ def _shard_policy_allows(spec: MegatronHookSpec, rank_ctx: MegatronRankContext) 
     if policy == ShardPolicy.GLOBAL_RANK_SHARDED:
         return True
     if policy in (ShardPolicy.TP_SHARDED, ShardPolicy.TP_SEQUENCE_SHARDED):
-        return rank_ctx.ep_rank == 0 and rank_ctx.cp_rank == 0
+        # Emit every TP shard; layer placement and DP selection are checked separately.
+        # With CP > 1, Q/K weights are replicated across CP ranks, so these weight
+        # hooks will emit duplicate records. CP weight deduplication is unresolved.
+        return True
     if policy == ShardPolicy.EP_SHARDED:
         return rank_ctx.tp_rank == 0 and rank_ctx.cp_rank == 0
     if policy == ShardPolicy.CP_SHARDED:
         return rank_ctx.tp_rank == 0 and rank_ctx.ep_rank == 0
     if policy == ShardPolicy.DP_SHARDED:
-        return rank_ctx.tp_rank == 0 and rank_ctx.ep_rank == 0 and rank_ctx.cp_rank == 0
+        return rank_ctx.tp_rank == 0
     raise ValueError(f"Unsupported DMI shard policy: {policy!r}")
 
 
@@ -642,13 +645,21 @@ def _validate_hook_contract(hook: HookPointV1) -> None:
         if spec.record_type is not RecordType.PER_SAMPLE or len(spec.outputs) != 1:
             raise ValueError("TP_SEQUENCE_SHARDED requires one PER_SAMPLE output")
         output = spec.outputs[0]
-        if (
-            tuple(output.input_shape[:2]) != (DimSpec.SEQ, DimSpec.BATCH)
-            or output.transport_type is not TransportType.SEQ_PREFIX_PACK
+        # Transport sees the result of preprocessing, which may reduce sequence
+        # tokens to a batch-first summary while retaining sequence ownership.
+        if not (
+            (
+                output.transport_type is TransportType.SEQ_PREFIX_PACK
+                and tuple(output.input_shape[:2]) == (DimSpec.SEQ, DimSpec.BATCH)
+            )
+            or (
+                output.transport_type is TransportType.IDENTITY
+                and tuple(output.input_shape[:1]) == (DimSpec.BATCH,)
+            )
         ):
             raise ValueError(
                 "TP_SEQUENCE_SHARDED requires [SEQ, BATCH, ...] "
-                "SEQ_PREFIX_PACK input"
+                "SEQ_PREFIX_PACK input or [BATCH, ...] IDENTITY input"
             )
     if spec.record_type == RecordType.PER_SAMPLE:
         if hook.hook_phase not in (HookPhase.FWD, HookPhase.BWD):
@@ -935,6 +946,41 @@ def _resolve_dataset_provenance_modes(
     return modes
 
 
+def _install_token_loss_hook(model: Any) -> None:
+    """Record the existing [B, S] cross-entropy output without reducing it."""
+    roots = model if isinstance(model, list) else [model]
+    for root in roots:
+        if not bool(getattr(root, "post_process", False)):
+            continue
+        existing = getattr(root, "dmi_lm_per_token_loss", None)
+        if existing is not None:
+            if not isinstance(existing, HookPointV1):
+                raise TypeError("model.dmi_lm_per_token_loss exists but is not HookPointV1")
+            continue
+        root.dmi_lm_per_token_loss = _make_hook(
+            MegatronHookSpec(
+                name="lm_per_token_loss",
+                layer_no=-1,
+                outputs=[
+                    MegatronOutputSpec(
+                        name="lm_per_token_loss",
+                        input_shape=[DimSpec.BATCH, DimSpec.SEQ],
+                        output_shape=[DimSpec.BATCH, DimSpec.SEQ],
+                        dtype=torch.float32,
+                        transport_type=TransportType.IDENTITY,
+                    )
+                ],
+                # Cross-entropy has already combined the vocabulary shards.
+                shard_policy=ShardPolicy.DP_SHARDED,
+                layer_placement=HookLayerPlacement.NO_LAYER_LAST_PP,
+                enabled_by=frozenset({"token-loss"}),
+                need_token_range=True,
+            ),
+            hook_phase=HookPhase.FWD,
+            suppress_recompute=False,
+        )
+
+
 def _install_loss_summary_hook(
     model: Any,
     *,
@@ -1006,7 +1052,7 @@ def _install_loss_summary_hook(
                     outputs=outputs,
                     preprocess=preprocess,
                     preprocess_metadata_fields=preprocess_metadata_fields,
-                    shard_policy=ShardPolicy.REPLICATED,
+                    shard_policy=ShardPolicy.DP_SHARDED,
                     layer_placement=HookLayerPlacement.NO_LAYER_LAST_PP,
                     enabled_by=frozenset({"loss-summary"}),
                     need_token_range=False,
@@ -1048,7 +1094,7 @@ def _install_router_summary_hooks(model: Any) -> None:
                     preprocess_metadata_fields=frozenset(
                         {MegatronMetadataField.VALID_COUNT}
                     ),
-                    shard_policy=ShardPolicy.REPLICATED,
+                    shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
                     enabled_by=frozenset({"router-summary"}),
                 ),
                 hook_phase=HookPhase.FWD,
@@ -1078,23 +1124,21 @@ def _install_router_logits_hooks(model: Any, *, dtype: torch.dtype) -> None:
                         MegatronOutputSpec(
                             name="router_logits",
                             input_shape=[
-                                DimSpec.BATCH,
                                 DimSpec.SEQ,
+                                DimSpec.BATCH,
                                 DimSpec.NUM_EXPERTS,
                             ],
                             output_shape=[
-                                DimSpec.BATCH,
-                                DimSpec.SEQ,
+                                DimSpec.ACTUAL_TOKEN_PACKED,
                                 DimSpec.NUM_EXPERTS,
                             ],
                             dtype=dtype,
-                            transport_type=TransportType.IDENTITY,
+                            transport_type=TransportType.SEQ_PREFIX_PACK,
                         )
                     ],
-                    preprocess=module._dmi_router_logits_by_sample,
-                    shard_policy=ShardPolicy.REPLICATED,
+                    preprocess=None,
+                    shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
                     enabled_by=frozenset({"router-logits"}),
-                    need_token_range=False,
                 ),
                 hook_phase=HookPhase.FWD,
             )
@@ -1298,15 +1342,28 @@ def _install_vocab_logits_topk_hooks(
     *,
     dtype: torch.dtype,
     top_k: int,
-) -> None:
+) -> ShardPolicy | None:
     roots = model if isinstance(model, list) else [model]
+    effective_policy: ShardPolicy | None = None
     for root in roots:
+        root_policy = (
+            ShardPolicy.TP_SHARDED
+            if bool(getattr(root, "parallel_output"))
+            else ShardPolicy.REPLICATED
+        )
+        if effective_policy is not None and root_policy is not effective_policy:
+            raise ValueError("DMI vocab-logits-topk requires one fixed parallel_output layout")
+        effective_policy = root_policy
         if not bool(getattr(root, "post_process", False)):
             continue
         existing = root.dmi_vocab_logits_topk
         if existing is not None:
             if not isinstance(existing, HookPointV1):
                 raise TypeError("model.dmi_vocab_logits_topk exists but is not HookPointV1")
+            if _megatron_hook_spec(existing).shard_policy is not root_policy:
+                raise ValueError(
+                    "existing DMI vocab-logits-topk hook does not match GPTModel.parallel_output"
+                )
             continue
 
         def preprocess(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1333,7 +1390,7 @@ def _install_vocab_logits_topk_hooks(
                     ),
                 ],
                 preprocess=preprocess,
-                shard_policy=ShardPolicy.REPLICATED,
+                shard_policy=root_policy,
                 layer_placement=HookLayerPlacement.NO_LAYER_LAST_PP,
                 enabled_by=frozenset({"vocab-logits-topk"}),
                 need_token_range=False,
@@ -1343,6 +1400,7 @@ def _install_vocab_logits_topk_hooks(
             ),
             hook_phase=HookPhase.FWD,
         )
+    return effective_policy
 
 
 def _install_router_entropy_hooks(model: Any) -> None:
@@ -1378,7 +1436,7 @@ def _install_router_entropy_hooks(model: Any) -> None:
                     preprocess_metadata_fields=frozenset(
                         {MegatronMetadataField.VALID_COUNT}
                     ),
-                    shard_policy=ShardPolicy.REPLICATED,
+                    shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
                     enabled_by=frozenset({"router-entropy"}),
                     need_token_range=True,
                 ),
@@ -1414,7 +1472,7 @@ def _install_expert_count_hooks(model: Any) -> None:
                         preprocess_metadata_fields=frozenset(
                             {MegatronMetadataField.VALID_COUNT}
                         ),
-                        shard_policy=ShardPolicy.REPLICATED,
+                        shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
                         enabled_by=frozenset({"expert-counts"}),
                         need_token_range=True,
                     ),
@@ -1443,7 +1501,7 @@ def _install_expert_count_hooks(model: Any) -> None:
                         preprocess_metadata_fields=frozenset(
                             {MegatronMetadataField.VALID_COUNT}
                         ),
-                        shard_policy=ShardPolicy.REPLICATED,
+                        shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
                         enabled_by=frozenset({"expert-counts"}),
                         need_token_range=True,
                     ),
@@ -2349,11 +2407,6 @@ def setup_megatron_dmi(
     selected_vocab_hooks = selected_hooks & vocab_hook_names
     padded_vocab_size = None
     if selected_vocab_hooks:
-        if "vocab-logits-topk" in selected_hooks and tp_world != 1:
-            raise NotImplementedError(
-                "DMI vocab-logits-topk requires tensor-model-parallel size 1; "
-                f"got {tp_world}"
-            )
         if cp_world != 1:
             raise NotImplementedError(
                 "DMI vocab-logits requires context-parallel size 1; "
@@ -2404,6 +2457,12 @@ def setup_megatron_dmi(
     ) != 1:
         raise NotImplementedError(
             "DMI exact loss-summary materialization currently requires context parallel size 1"
+        )
+    if "token-loss" in selected_hooks and int(
+        getattr(args, "context_parallel_size", 1)
+    ) != 1:
+        raise NotImplementedError(
+            "DMI token-loss materialization currently requires context parallel size 1"
         )
     weight_selections = {"router-weights", "q-weights", "k-weights"} & selected_hooks
     if weight_selections:
@@ -2471,11 +2530,25 @@ def setup_megatron_dmi(
                     )
                 dims[DimSpec.VOCAB] = int(padded_vocab_size) // tp_world
         if "vocab-logits-topk" in selected_hooks:
-            _install_vocab_logits_topk_hooks(
+            vocab_topk_policy = _install_vocab_logits_topk_hooks(
                 unwrapped,
                 dtype=_vocab_logits_dtype(model_config),
                 top_k=int(top_k),
             )
+            if vocab_topk_policy is ShardPolicy.TP_SHARDED:
+                assert padded_vocab_size is not None
+                if int(padded_vocab_size) % tp_world != 0:
+                    raise ValueError(
+                        "DMI TP-sharded vocab-logits-topk requires padded vocabulary "
+                        "size divisible by tensor-model-parallel size: "
+                        f"{padded_vocab_size} % {tp_world} != 0"
+                    )
+                local_vocab_size = int(padded_vocab_size) // tp_world
+                if int(top_k) > local_vocab_size:
+                    raise ValueError(
+                        "DMI vocabulary-logit top-K must satisfy "
+                        f"1 <= K <= local vocabulary size ({local_vocab_size}); got {top_k}"
+                    )
         if "router-logits" in selected_hooks:
             _install_router_logits_hooks(
                 unwrapped,
@@ -2502,6 +2575,8 @@ def setup_megatron_dmi(
                 input_layout=active_input_layout,
                 segment_capacity=segment_capacity,
             )
+        if "token-loss" in selected_hooks:
+            _install_token_loss_hook(unwrapped)
         if "hidden-states" in selected_hooks:
             _install_hidden_state_hooks(unwrapped)
         resid_final_hook_count = 0

@@ -160,10 +160,24 @@ def test_tp_shards_keep_global_pp_layer_and_iteration_contract(tp_rank, pp_rank)
         assert hook_binding.record_shard_rank == tp_rank
 
 
-@pytest.mark.parametrize("rank", [_rank(dp_rank=1), _rank(cp_rank=1), _rank(ep_rank=1)])
-def test_replicated_non_tp_coordinates_do_not_duplicate_weights(rank):
+def test_nonzero_dp_rank_does_not_duplicate_weights():
     model, _q, _k = _attention()
-    assert _qk_weight_bindings(model, rank_ctx=rank, selected_hooks={"q-weights"}) == ((), ())
+    assert _qk_weight_bindings(
+        model, rank_ctx=_rank(dp_rank=1, dp_world_size=2), selected_hooks={"q-weights"}
+    ) == ((), ())
+
+
+@pytest.mark.parametrize("rank", [
+    _rank(tp_rank=1, tp_world_size=2, ep_rank=1, ep_world_size=2),
+    _rank(tp_rank=1, tp_world_size=2, cp_rank=1, cp_world_size=2),
+])
+def test_tp_weight_shards_are_not_filtered_by_ep_or_cp_rank(rank):
+    model, _q, _k = _attention(tp=2)
+    hooks, bindings = _qk_weight_bindings(
+        model, rank_ctx=rank, selected_hooks={"q-weights", "k-weights"}
+    )
+    assert len(hooks) == len(bindings) == 2
+    assert all(hook.record_shard_rank == rank.tp_rank for hook in hooks)
 
 
 @pytest.mark.parametrize("case,error,match", [

@@ -669,12 +669,14 @@ def test_resolved_output_shape_matches_presplit_runtime_ownership(
     assert resolved.output_shape == expected_output_shape
 
 
+@pytest.mark.parametrize("hook_kind", ["user_sequence", "router_logits"])
 @pytest.mark.parametrize("sequence_parallel_enabled", [False, True])
 @pytest.mark.parametrize(
     ("tp_rank", "expected_counts", "expected_start"),
     [(0, (4, 2), 0), (1, (3, 0), 4)],
 )
 def test_tp_sequence_sharded_hook_uses_one_local_interval(
+    hook_kind,
     sequence_parallel_enabled,
     tp_rank,
     expected_counts,
@@ -684,22 +686,35 @@ def test_tp_sequence_sharded_hook_uses_one_local_interval(
         tp_rank=tp_rank,
         sequence_parallel_enabled=sequence_parallel_enabled,
     )
-    hook = _make_hook(
-        MegatronHookSpec(
-            name="user_sequence",
-            layer_no=2,
-            outputs=(
-                MegatronOutputSpec(
-                    name="user_sequence",
-                    input_shape=(DimSpec.SEQ, DimSpec.BATCH, 2),
-                    output_shape=(DimSpec.ACTUAL_TOKEN_PACKED, 2),
-                    dtype=torch.float32,
-                    transport_type=TransportType.SEQ_PREFIX_PACK,
+    if hook_kind == "router_logits":
+        from dmi_megatron_integration.startup import _install_router_logits_hooks
+
+        class TopKRouter(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer_number = 3
+                self.dmi_router_logits = None
+
+        router = TopKRouter()
+        _install_router_logits_hooks(router, dtype=torch.float32)
+        hook = router.dmi_router_logits
+    else:
+        hook = _make_hook(
+            MegatronHookSpec(
+                name="user_sequence",
+                layer_no=2,
+                outputs=(
+                    MegatronOutputSpec(
+                        name="user_sequence",
+                        input_shape=(DimSpec.SEQ, DimSpec.BATCH, 2),
+                        output_shape=(DimSpec.ACTUAL_TOKEN_PACKED, 2),
+                        dtype=torch.float32,
+                        transport_type=TransportType.SEQ_PREFIX_PACK,
+                    ),
                 ),
-            ),
-            shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
+                shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
+            )
         )
-    )
     hook.megatron_distributed_info = info
     metadata = DMIMetadataContext(
         max_num_microbatches=1,
@@ -717,7 +732,7 @@ def test_tp_sequence_sharded_hook_uses_one_local_interval(
     adaptor = _make_adaptor(
         engine,
         "train-run",
-        dims={DimSpec.SEQ: 8, DimSpec.BATCH: 2},
+        dims={DimSpec.SEQ: 8, DimSpec.BATCH: 2, DimSpec.NUM_EXPERTS: 2},
     )
     adaptor.attach_hooks(
         model_hooks=(
@@ -775,6 +790,205 @@ def test_tp_sequence_sharded_hook_uses_one_local_interval(
         assert tuple((item.offset_bytes, item.nbytes, item.shape) for item in slices) == (
             (0, 24, (3, 2)),
         )
+
+
+@pytest.mark.parametrize("sequence_parallel_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("hook_kind", "score_function"),
+    [
+        ("mean", "softmax"), ("mean", "sigmoid"),
+        ("entropy", "softmax"), ("entropy", "sigmoid"),
+        ("pre_count", None), ("post_count", None),
+    ],
+)
+def test_router_summaries_use_local_tokens_and_record_their_ranges(
+    sequence_parallel_enabled, hook_kind, score_function
+):
+    from dmi_megatron_integration.hooks.megatron_router_summary import (
+        router_probs_mean_from_logits,
+        router_token_entropy_mean_from_logits,
+    )
+    from dmi_megatron_integration.startup import (
+        _install_expert_count_hooks, _install_router_entropy_hooks,
+        _install_router_summary_hooks,
+    )
+
+    is_mean = hook_kind in {"mean", "entropy"}
+    if not is_mean:
+        import sys
+        from pathlib import Path
+
+        megatron_root = str(Path(__file__).resolve().parents[1] / "third_party/megatron-lm")
+        if megatron_root not in sys.path:
+            sys.path.insert(0, megatron_root)
+        from megatron.core.transformer.moe.router import TopKRouter as MegatronTopKRouter
+
+    class TopKRouter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_number = 3
+            self.dmi_router_probs_mean = None
+            self.dmi_router_token_entropy_mean = None
+            self.dmi_pre_drop_token_count = None
+            self.dmi_post_drop_token_count = None
+
+        def _dmi_router_probs_mean_from_logits(self, logits, valid_count):
+            return router_probs_mean_from_logits(logits, valid_count, score_function)
+
+        def _dmi_router_token_entropy_mean_from_logits(self, logits, valid_count):
+            return router_token_entropy_mean_from_logits(logits, valid_count, score_function)
+
+        def _dmi_expert_token_count_from_routing_map(self, routing_map, valid_count):
+            return MegatronTopKRouter._dmi_expert_token_count_from_routing_map(
+                self, routing_map, valid_count
+            )
+
+    logits = torch.randn(8, 2, 3, generator=torch.Generator().manual_seed(42))
+    per_token_values = (
+        logits.softmax(dim=-1) if score_function == "softmax" else logits.sigmoid()
+    )
+    if score_function == "sigmoid":
+        per_token_values = per_token_values / per_token_values.sum(dim=-1, keepdim=True)
+    if hook_kind == "entropy":
+        per_token_values = -(
+            per_token_values * per_token_values.log()
+        ).sum(dim=-1, keepdim=True)
+    source = logits
+    if not is_mean:
+        source = logits > 0
+        if hook_kind == "post_count":
+            source[::2, :, 0] = False
+        per_token_values = source.to(torch.int64)
+    valid_counts = (7, 2)
+    output_width = per_token_values.shape[-1]
+    weighted_sum = torch.zeros(2, output_width, dtype=per_token_values.dtype)
+    recorded_counts = torch.zeros(2, dtype=torch.int64)
+
+    for tp_rank, local_counts, start in [(0, (4, 2), 0), (1, (3, 0), 4)]:
+        router = TopKRouter()
+        if hook_kind == "mean":
+            _install_router_summary_hooks(router)
+            hook = router.dmi_router_probs_mean
+        elif hook_kind == "entropy":
+            _install_router_entropy_hooks(router)
+            hook = router.dmi_router_token_entropy_mean
+        else:
+            _install_expert_count_hooks(router)
+            hook = (
+                router.dmi_pre_drop_token_count
+                if hook_kind == "pre_count" else router.dmi_post_drop_token_count
+            )
+        info = _tp_sequence_distributed_info(
+            tp_rank=tp_rank, sequence_parallel_enabled=sequence_parallel_enabled
+        )
+        hook.megatron_distributed_info = info
+        metadata = DMIMetadataContext(
+            max_num_microbatches=1,
+            max_batch_size=2,
+            num_scopes=1,
+            dims={DimSpec.SEQ: 8},
+            megatron_distributed_info=info,
+            tp_sequence_sharded_enabled=True,
+            device="cpu",
+        )
+        metadata.begin_iteration(1)
+        metadata.ingest_microbatch(0, {"valid_count": valid_counts})
+        metadata.enter_scope("fwd", 0, 0)
+        engine = FakeEngine()
+        adaptor = _make_adaptor(
+            engine, "train-run",
+            dims={DimSpec.SEQ: 8, DimSpec.BATCH: 2, DimSpec.NUM_EXPERTS: 3},
+        )
+        adaptor.attach_hooks(
+            model_hooks=(MegatronHookBinding(hook=hook, record_shard_rank=tp_rank),),
+            iteration_hooks=(),
+            metadata_context=metadata,
+        )
+        adaptor.set_current_event(
+            MegatronTrainingContext(
+                global_batch_id=1, microbatch_id=0,
+                valid_counts=valid_counts, direction="fwd", token_start=0,
+            )
+        )
+        hook_input = source[start : start + 4] if sequence_parallel_enabled else source
+        hook(hook_input, hook.valid_count_fwd)
+
+        entry, record_metadata, output = engine.record_runtime.emit_calls[-1]
+        expected = torch.stack([
+            per_token_values[start : start + count, sample].sum(dim=0)
+            / (max(count, 1) if is_mean else 1)
+            for sample, count in enumerate(local_counts)
+        ])
+        expected = expected.to(per_token_values.dtype)
+        torch.testing.assert_close(output.tensor, expected)
+        assert entry.transport_type is TransportType.IDENTITY
+        assert entry.output_shape == (2, output_width)
+        assert entry.storage is (
+            OutputStorage.SCALAR_FLOAT if hook_kind == "entropy" else OutputStorage.TENSOR
+        )
+        assert record_metadata.valid_counts == local_counts
+        assert record_metadata.token_start == start
+        assert record_metadata.shard_rank == tp_rank
+        assert hook.valid_count_fwd.data_ptr() == metadata.current(
+            "tp_seq_sharded_valid_count", "fwd", 0
+        ).data_ptr()
+
+        rows = MegatronRecordFormat("training").encode(record_metadata, entry).rows
+        assert [row[7] for row in rows] == ([0, 1] if tp_rank == 0 else [0])
+        for row in rows:
+            sample, shard, token_start, token_end = row[7], row[9], row[10], row[11]
+            payload = row[-1]
+            assert shard == tp_rank
+            assert (token_start, token_end) == (start, start + local_counts[sample])
+            row_bytes = output_width * per_token_values.element_size()
+            assert (payload.offset_bytes, payload.nbytes, payload.shape) == (
+                sample * row_bytes, row_bytes, () if hook_kind == "entropy" else (output_width,),
+            )
+            count = token_end - token_start
+            weighted_sum[sample] += output.tensor[sample] * (count if is_mean else 1)
+            recorded_counts[sample] += count
+
+    assert tuple(recorded_counts.tolist()) == valid_counts
+    expected_global = torch.stack([
+        per_token_values[:count, sample].sum(dim=0)
+        / (count if is_mean else 1)
+        for sample, count in enumerate(valid_counts)
+    ]).to(per_token_values.dtype)
+    torch.testing.assert_close(
+        weighted_sum / recorded_counts[:, None] if is_mean else weighted_sum,
+        expected_global,
+    )
+
+
+@pytest.mark.parametrize("validator", ["startup", "adapter"])
+@pytest.mark.parametrize(
+    ("transport", "shape"),
+    [
+        (TransportType.IDENTITY, (DimSpec.SEQ, DimSpec.BATCH, 3)),
+        (TransportType.SEQ_PREFIX_PACK, (DimSpec.BATCH, DimSpec.SEQ, 3)),
+        (TransportType.PREFIX_STRIP, (DimSpec.BATCH, 3)),
+    ],
+)
+def test_tp_sequence_contract_rejects_incompatible_transport_layouts(
+    validator, transport, shape
+):
+    from dmi_megatron_integration.startup import _validate_hook_contract
+
+    policy = MegatronHookSpec(
+        name="invalid_sequence_output", layer_no=0,
+        outputs=(MegatronOutputSpec(
+            name="invalid_sequence_output", input_shape=shape,
+            dtype=torch.float32, transport_type=transport,
+        ),),
+        shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
+    )
+    hook = _make_hook(policy)
+    adaptor = _make_adaptor(FakeEngine(), "train-run")
+    with pytest.raises(ValueError, match="TP_SEQUENCE_SHARDED requires"):
+        if validator == "startup":
+            _validate_hook_contract(hook)
+        else:
+            adaptor._tp_sequence_interval(hook, policy)
 
 
 def test_tp_sequence_interval_is_part_of_captured_semantics():

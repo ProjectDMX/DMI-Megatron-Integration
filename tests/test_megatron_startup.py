@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from dmi.api.v1 import HookPointV1, RecordType, TransportType
+from dmi.api.v1 import HookPointV1, OutputStorage, RecordType, TransportType
 
 from dmi_megatron_integration.adapter import MegatronHookBinding
 from dmi_megatron_integration.hooks.selection import parse_hook_selection
@@ -42,6 +42,8 @@ from dmi_megatron_integration.startup import (
     _make_hook,
     _metadata_field_specs_from_requirements,
     _megatron_hook_spec,
+    _install_loss_summary_hook,
+    _install_token_loss_hook,
     _install_moe_inverse_map_hooks,
     _install_resid_final_hooks,
     _vocab_logits_dtype,
@@ -463,8 +465,12 @@ def test_per_execution_hook_records_global_physical_producer_rank():
     }
 
 
-@pytest.mark.parametrize("tp_rank", [0, 1])
-def test_tp_sequence_sharded_policy_activates_each_tp_rank(tp_rank):
+@pytest.mark.parametrize("tp_rank", range(8))
+@pytest.mark.parametrize("dp_rank", [0, 1])
+@pytest.mark.parametrize("policy", [ShardPolicy.TP_SHARDED, ShardPolicy.TP_SEQUENCE_SHARDED])
+def test_tp_sharded_policies_keep_every_shard_with_expert_parallel_folding(
+    tp_rank, dp_rank, policy
+):
     hook = _make_hook(
         MegatronHookSpec(
             name="hidden_states",
@@ -478,22 +484,22 @@ def test_tp_sequence_sharded_policy_activates_each_tp_rank(tp_rank):
                     transport_type=TransportType.SEQ_PREFIX_PACK,
                 ),
             ),
-            shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
+            shard_policy=policy,
         ),
         hook_phase=HookPhase.FWD,
     )
     rank_ctx = MegatronRankContext(
-        global_rank=tp_rank,
+        global_rank=16 + dp_rank * 8 + tp_rank,
         tp_rank=tp_rank,
-        tp_world_size=2,
-        pp_rank=0,
-        pp_world_size=1,
-        dp_rank=0,
-        dp_world_size=1,
+        tp_world_size=8,
+        pp_rank=1,
+        pp_world_size=2,
+        dp_rank=dp_rank,
+        dp_world_size=2,
         cp_rank=0,
         cp_world_size=1,
-        ep_rank=0,
-        ep_world_size=1,
+        ep_rank=dp_rank * 8 + tp_rank,
+        ep_world_size=16,
         vp_rank=None,
         num_layers=1,
     )
@@ -502,6 +508,45 @@ def test_tp_sequence_sharded_policy_activates_each_tp_rank(tp_rank):
 
     assert len(active) == 1
     assert active[0].record_shard_rank == tp_rank
+
+
+@pytest.mark.parametrize("input_layout", [HookInputLayout.SEQ_BATCH, HookInputLayout.PACKED_SEGMENTED])
+@pytest.mark.parametrize("cp_world_size", [1, 2])
+def test_loss_summary_keeps_each_dp_and_cp_rank_once_on_last_pipeline_stage(
+    input_layout, cp_world_size
+):
+    model = nn.Module()
+    _install_loss_summary_hook(
+        model, input_layout=input_layout,
+        segment_capacity=3 if input_layout is HookInputLayout.PACKED_SEGMENTED else None,
+    )
+    hook = model.dmi_lm_per_sample_loss
+    emitted = []
+    for pp_rank in range(2):
+        for dp_rank in range(2):
+            for cp_rank in range(cp_world_size):
+                for tp_rank in range(8):
+                    rank_ctx = MegatronRankContext(
+                        global_rank=((pp_rank * 2 + dp_rank) * cp_world_size + cp_rank) * 8 + tp_rank,
+                        tp_rank=tp_rank, tp_world_size=8,
+                        pp_rank=pp_rank, pp_world_size=2,
+                        dp_rank=dp_rank, dp_world_size=2,
+                        cp_rank=cp_rank, cp_world_size=cp_world_size,
+                        ep_rank=dp_rank * 8 + tp_rank, ep_world_size=16,
+                        vp_rank=None, num_layers=2,
+                    )
+                    active = _active_hooks_for_rank([MegatronHookBinding(hook)], rank_ctx)
+                    if active:
+                        assert len(active) == 1
+                        assert active[0].record_shard_rank == dp_rank
+                        emitted.append((pp_rank, dp_rank, cp_rank, tp_rank))
+
+    assert emitted == [
+        (1, dp_rank, cp_rank, 0)
+        for dp_rank in range(2)
+        for cp_rank in range(cp_world_size)
+    ]
+    assert _megatron_hook_spec(hook).shard_policy is ShardPolicy.DP_SHARDED
 
 
 def _policy_binding(
@@ -1455,7 +1500,8 @@ def test_setup_vocab_logits_installs_last_stage_raw_identity_hook():
     handle.close()
 
 
-def test_setup_vocab_logits_has_no_hook_on_non_last_pipeline_stage():
+@pytest.mark.parametrize("hook_selection", ["vocab-logits", "vocab-logits-topk"])
+def test_setup_vocab_logits_has_no_hook_on_non_last_pipeline_stage(hook_selection):
     model = [TinyGPTModel(post_process=False)]
 
     def runtime_factory(**kwargs):
@@ -1481,7 +1527,8 @@ def test_setup_vocab_logits_has_no_hook_on_non_last_pipeline_stage():
         model_config=SimpleNamespace(params_dtype=torch.bfloat16),
         explicit_config=MegatronDMIConfig(
             enabled=True,
-            hook_selection="vocab-logits",
+            hook_selection=hook_selection,
+            vocab_logits_top_k=4 if hook_selection == "vocab-logits-topk" else None,
             model_id="non-last-vocab",
             dataset_provenance_mode=CONSTANT_PROVENANCE,
         ),
@@ -1497,13 +1544,25 @@ def test_setup_vocab_logits_has_no_hook_on_non_last_pipeline_stage():
     )
     try:
         assert model[0].dmi_vocab_logits is None
+        assert model[0].dmi_vocab_logits_topk is None
         assert FakeAdaptor.instances[0].attach_calls[0]["model_hooks"] == []
     finally:
         handle.close()
 
 
-def test_setup_vocab_logits_topk_installs_two_output_fixed_k_hook():
-    model = [TinyGPTModel(post_process=True)]
+@pytest.mark.parametrize(
+    ("tp_world", "tp_rank", "sequence_parallel", "parallel_output"),
+    [(1, 0, False, True)]
+    + [(2, rank, sp, True) for rank in range(2) for sp in (False, True)]
+    + [(8, rank, True, True) for rank in range(8)]
+    + [(2, rank, False, False) for rank in range(2)],
+)
+def test_setup_vocab_logits_topk_installs_two_output_fixed_k_hook(
+    tp_world, tp_rank, sequence_parallel, parallel_output
+):
+    model = [TinyGPTModel(post_process=True, parallel_output=parallel_output)]
+    local_vocab_size = 128 // tp_world if parallel_output else 128
+    top_k = min(100, local_vocab_size)
 
     def runtime_factory(**kwargs):
         context = DMIMetadataContext(
@@ -1526,15 +1585,17 @@ def test_setup_vocab_logits_topk_installs_two_output_fixed_k_hook():
             seq_length=16,
             padded_vocab_size=128,
         ),
-        model_config=SimpleNamespace(params_dtype=torch.bfloat16),
+        model_config=SimpleNamespace(
+            params_dtype=torch.bfloat16, sequence_parallel=sequence_parallel
+        ),
         explicit_config=MegatronDMIConfig(
             enabled=True,
             hook_selection="vocab-logits-topk",
-            vocab_logits_top_k=100,
+            vocab_logits_top_k=top_k,
             model_id="vocab-topk-run",
             dataset_provenance_mode=CONSTANT_PROVENANCE,
         ),
-        parallel_state_module=FakeParallelState(),
+        parallel_state_module=FakeParallelState(tp_world=tp_world, tp_rank=tp_rank),
         dist_module=FakeDist(initialized=False),
         unwrap_fn=lambda x: x,
         engine_factory=_fake_engine_factory,
@@ -1550,39 +1611,61 @@ def test_setup_vocab_logits_topk_installs_two_output_fixed_k_hook():
     assert DimSpec.VOCAB not in adaptor.dims
     hook = model[0].dmi_vocab_logits_topk
     assert isinstance(hook, HookPointV1)
-    assert hook.spec is not None
-    assert hook.spec.name == "vocab_logits_topk"
-    assert [output.name for output in hook.spec.outputs] == [
+    policy = _megatron_hook_spec(hook)
+    assert policy.name == "vocab_logits_topk"
+    assert [output.name for output in policy.outputs] == [
         "vocab_logits_topk_values",
         "vocab_logits_topk_indices",
     ]
-    policy = _megatron_hook_spec(hook)
+    assert policy.shard_policy is (
+        ShardPolicy.TP_SHARDED if parallel_output else ShardPolicy.REPLICATED
+    )
     assert policy.need_token_range is False
     assert [output.dtype for output in policy.outputs] == [
         torch.bfloat16,
         torch.int32,
     ]
     assert all(
-        output.input_shape == (DimSpec.BATCH, DimSpec.SEQ, 100)
+        output.input_shape == (DimSpec.BATCH, DimSpec.SEQ, top_k)
         for output in policy.outputs
     )
-    assert adaptor.attach_calls[0]["model_hooks"][0].hook is hook
+    bindings = adaptor.attach_calls[0]["model_hooks"]
+    if parallel_output or tp_rank == 0:
+        assert len(bindings) == 1
+        assert bindings[0].hook is hook
+        assert bindings[0].record_shard_rank == tp_rank
+        assert hook.spec is not None
+        logits = torch.randn(16, 2, local_vocab_size, dtype=torch.bfloat16)
+        values, indices = hook.spec.preprocess(logits)
+        assert values.shape == indices.shape == (2, 16, top_k)
+        assert torch.equal(
+            values, logits.transpose(0, 1).gather(-1, indices.long())
+        )
+        assert int(indices.min()) >= 0
+        assert int(indices.max()) < local_vocab_size
+    else:
+        assert bindings == []
+        assert not hook.enabled
 
     handle.close()
 
 
 @pytest.mark.parametrize(
-    ("hook_selection", "top_k", "message"),
+    ("hook_selection", "top_k", "tp_world", "padded_vocab_size", "message"),
     [
-        ("vocab-logits-topk", None, "requires --dmi-vocab-logits-top-k"),
-        ("vocab-logits-topk", 0, "must satisfy"),
-        ("vocab-logits-topk", 129, "must satisfy"),
-        ("vocab-logits", 100, "configured without selecting"),
+        ("vocab-logits-topk", None, 1, 128, "requires --dmi-vocab-logits-top-k"),
+        ("vocab-logits-topk", 0, 1, 128, "must satisfy"),
+        ("vocab-logits-topk", 129, 1, 128, "must satisfy"),
+        ("vocab-logits-topk", 65, 2, 128, "local vocabulary size"),
+        ("vocab-logits-topk", 4, 2, 127, "size divisible"),
+        ("vocab-logits", 100, 1, 128, "configured without selecting"),
     ],
 )
 def test_setup_vocab_logits_topk_rejects_invalid_selection_contract(
     hook_selection,
     top_k,
+    tp_world,
+    padded_vocab_size,
     message,
 ):
     with pytest.raises(ValueError, match=message):
@@ -1592,7 +1675,7 @@ def test_setup_vocab_logits_topk_rejects_invalid_selection_contract(
                 global_batch_size=2,
                 micro_batch_size=1,
                 seq_length=4,
-                padded_vocab_size=128,
+                padded_vocab_size=padded_vocab_size,
             ),
             model_config=SimpleNamespace(params_dtype=torch.bfloat16),
             explicit_config=MegatronDMIConfig(
@@ -1601,7 +1684,7 @@ def test_setup_vocab_logits_topk_rejects_invalid_selection_contract(
                 vocab_logits_top_k=top_k,
                 model_id="bad-top-k",
             ),
-            parallel_state_module=FakeParallelState(),
+            parallel_state_module=FakeParallelState(tp_world=tp_world),
             dist_module=FakeDist(initialized=False),
             unwrap_fn=lambda x: x,
         )
@@ -1610,12 +1693,6 @@ def test_setup_vocab_logits_topk_rejects_invalid_selection_contract(
 @pytest.mark.parametrize(
     ("parallel_state", "hook_selection", "top_k", "message"),
     [
-        (
-            FakeParallelState(tp_world=2),
-            "vocab-logits-topk",
-            4,
-            "tensor-model-parallel size 1",
-        ),
         (
             FakeParallelState(cp_world=2),
             "vocab-logits",
@@ -1712,11 +1789,15 @@ def test_setup_vocab_logits_parallel_output_false_installs_replicated_with_one_w
         handle.close()
 
 
-@pytest.mark.parametrize("hook_selection", ["hidden-states", "resid_final"])
+@pytest.mark.parametrize(
+    "hook_selection", ["hidden-states", "resid_final", "router-logits", "router-summary"]
+)
 def test_setup_tp_sequence_hooks_reject_context_parallelism(hook_selection):
     model = (
         [TinyFinalResidualModel()]
         if hook_selection == "resid_final"
+        else [TinyMoEModel()]
+        if hook_selection in {"router-logits", "router-summary"}
         else [TinyHiddenStateModel()]
     )
     with pytest.raises(NotImplementedError, match="context-parallel size 1"):
@@ -1727,7 +1808,9 @@ def test_setup_tp_sequence_hooks_reject_context_parallelism(hook_selection):
                 micro_batch_size=1,
                 seq_length=8,
             ),
-            model_config=SimpleNamespace(hidden_size=4),
+            model_config=SimpleNamespace(
+                hidden_size=4, num_moe_experts=2, params_dtype=torch.float32
+            ),
             explicit_config=MegatronDMIConfig(
                 enabled=True,
                 hook_selection=hook_selection,
@@ -1759,6 +1842,18 @@ def test_setup_tp_sequence_hooks_reject_context_parallelism(hook_selection):
             "user_sequence",
             TinyUserSequenceHookModel,
             lambda model: model.user_sequence_hook,
+        ),
+        (
+            "router-logits",
+            "router_logits",
+            TinyMoEModel,
+            lambda model: model.router.dmi_router_logits,
+        ),
+        (
+            "router-summary",
+            "router_probs_mean",
+            TinyMoEModel,
+            lambda model: model.router.dmi_router_probs_mean,
         ),
     ],
 )
@@ -1797,7 +1892,10 @@ def test_setup_tp_sequence_hooks_fall_back_to_replicated_when_nondivisible_witho
             micro_batch_size=1,
             seq_length=7,
         ),
-        model_config=SimpleNamespace(hidden_size=4, sequence_parallel=False),
+        model_config=SimpleNamespace(
+            hidden_size=4, sequence_parallel=False,
+            num_moe_experts=2, params_dtype=torch.float32,
+        ),
         explicit_config=MegatronDMIConfig(
             enabled=True,
             hook_selection=hook_selection,
@@ -1876,6 +1974,7 @@ def test_setup_loss_summary_installs_only_selected_hook():
     assert hasattr(model[0], "dmi_lm_per_sample_loss")
     assert model[0].dmi_lm_per_sample_loss.suppress_recompute is False
     loss_policy = _megatron_hook_spec(model[0].dmi_lm_per_sample_loss)
+    assert loss_policy.shard_policy is ShardPolicy.DP_SHARDED
     assert loss_policy.need_token_range is False
     assert loss_policy.binding_metadata_fields == frozenset()
     assert FakeAdaptor.instances[0].dims == {DimSpec.BATCH: 2}
@@ -1883,6 +1982,77 @@ def test_setup_loss_summary_installs_only_selected_hook():
     assert runtime_contexts[0].field_specs == {}
 
     handle.close()
+
+
+@pytest.mark.parametrize("selection", ["token-loss", "token-loss,loss-summary", "loss-summary"])
+def test_setup_token_loss_is_independent_from_loss_summary(selection):
+    model = [TinyGPTModel()]
+
+    def runtime_factory(**kwargs):
+        context = DMIMetadataContext(
+            max_num_microbatches=kwargs["max_num_microbatches"],
+            max_batch_size=kwargs["max_batch_size"],
+            num_scopes=kwargs["num_scopes"], field_specs=kwargs["field_specs"], device="cpu",
+        )
+        return MegatronScheduleRuntime(LocalMetadataPropagator(context), host_engine=kwargs["host_engine"])
+
+    handle = setup_megatron_dmi(
+        model,
+        args=SimpleNamespace(global_batch_size=4, micro_batch_size=2, seq_length=16),
+        model_config=SimpleNamespace(),
+        explicit_config=MegatronDMIConfig(
+            enabled=True, hook_selection=selection, model_id="run",
+            dataset_provenance_mode=CONSTANT_PROVENANCE,
+        ),
+        parallel_state_module=FakeParallelState(), dist_module=FakeDist(initialized=False),
+        unwrap_fn=lambda x: x, engine_factory=_fake_engine_factory,
+        runtime_factory=runtime_factory, adaptor_cls=FakeAdaptor, device="cpu",
+    )
+    try:
+        selected = set(selection.split(","))
+        assert hasattr(model[0], "dmi_lm_per_token_loss") == ("token-loss" in selected)
+        assert hasattr(model[0], "dmi_lm_per_sample_loss") == ("loss-summary" in selected)
+        bindings = FakeAdaptor.instances[0].attach_calls[0]["model_hooks"]
+        assert len(bindings) == len(selected)
+        if "token-loss" in selected:
+            hook = model[0].dmi_lm_per_token_loss
+            policy = _megatron_hook_spec(hook)
+            assert hook.spec.preprocess is None
+            assert hook.spec.outputs[0].storage is OutputStorage.TENSOR
+            assert hook.spec.outputs[0].transport_type is TransportType.IDENTITY
+            assert policy.outputs[0].input_shape == (DimSpec.BATCH, DimSpec.SEQ)
+            assert policy.need_token_range
+            assert policy.supported_layouts == frozenset({HookInputLayout.SEQ_BATCH})
+            assert handle.config.hook_selection == selection
+    finally:
+        handle.close()
+
+
+def test_token_loss_records_each_dp_replica_once_on_last_pp_stage():
+    model = TinyGPTModel()
+    _install_token_loss_hook(model)
+    hook = model.dmi_lm_per_token_loss
+    _install_token_loss_hook(model)
+    assert model.dmi_lm_per_token_loss is hook
+    first_stage = TinyGPTModel(post_process=False)
+    _install_token_loss_hook(first_stage)
+    assert not hasattr(first_stage, "dmi_lm_per_token_loss")
+    emitted = []
+    for pp_rank in range(2):
+        for dp_rank in range(2):
+            for tp_rank in range(8):
+                rank = MegatronRankContext(
+                    global_rank=(pp_rank * 2 + dp_rank) * 8 + tp_rank,
+                    tp_rank=tp_rank, tp_world_size=8, pp_rank=pp_rank, pp_world_size=2,
+                    dp_rank=dp_rank, dp_world_size=2, cp_rank=0, cp_world_size=1,
+                    ep_rank=dp_rank * 8 + tp_rank, ep_world_size=16,
+                    vp_rank=None, num_layers=2,
+                )
+                active = _active_hooks_for_rank([MegatronHookBinding(hook)], rank)
+                if active:
+                    assert active[0].record_shard_rank == dp_rank
+                    emitted.append((pp_rank, dp_rank, tp_rank))
+    assert emitted == [(1, 0, 0), (1, 1, 0)]
 
 
 def test_setup_router_health_hooks_installs_entropy_and_expert_counts():
@@ -1909,7 +2079,7 @@ def test_setup_router_health_hooks_installs_entropy_and_expert_counts():
         model_id="run",
         dataset_provenance_mode=CONSTANT_PROVENANCE,
     )
-    args = SimpleNamespace(global_batch_size=4, micro_batch_size=2)
+    args = SimpleNamespace(global_batch_size=4, micro_batch_size=2, seq_length=16)
     handle = setup_megatron_dmi(
         model,
         args=args,
@@ -1930,13 +2100,24 @@ def test_setup_router_health_hooks_installs_entropy_and_expert_counts():
     assert router.dmi_router_token_entropy_mean.spec.outputs[0].name == "router_token_entropy_mean"
     assert router.dmi_pre_drop_token_count.spec.outputs[0].name == "pre_drop_token_count"
     assert router.dmi_post_drop_token_count.spec.outputs[0].name == "post_drop_token_count"
+    for hook in (
+        router.dmi_router_token_entropy_mean,
+        router.dmi_pre_drop_token_count,
+        router.dmi_post_drop_token_count,
+    ):
+        assert _megatron_hook_spec(hook).shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
     assert FakeAdaptor.instances[0].dims[DimSpec.NUM_EXPERTS] == 64
     assert "valid_count" in runtime_contexts[0].field_specs
 
     handle.close()
 
 
-def test_setup_router_logits_installs_raw_identity_hook_without_valid_count() -> None:
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize("hook_selection", ["router-logits", "router-summary", "router-entropy"])
+def test_setup_router_hooks_install_sequence_sharded_contract(
+    tp_rank, sequence_parallel, hook_selection
+) -> None:
     model = [TinyMoEModel()]
     runtime_contexts = []
 
@@ -1946,6 +2127,9 @@ def test_setup_router_logits_installs_raw_identity_hook_without_valid_count() ->
             max_batch_size=kwargs["max_batch_size"],
             num_scopes=kwargs["num_scopes"],
             field_specs=kwargs["field_specs"],
+            dims=kwargs["dims"],
+            megatron_distributed_info=kwargs["megatron_distributed_info"],
+            tp_sequence_sharded_enabled=kwargs["tp_sequence_sharded_enabled"],
             device="cpu",
         )
         runtime_contexts.append(context)
@@ -1956,7 +2140,7 @@ def test_setup_router_logits_installs_raw_identity_hook_without_valid_count() ->
 
     cfg = MegatronDMIConfig(
         enabled=True,
-        hook_selection="router-logits",
+        hook_selection=hook_selection,
         model_id="run",
         dataset_provenance_mode=CONSTANT_PROVENANCE,
     )
@@ -1968,9 +2152,10 @@ def test_setup_router_logits_installs_raw_identity_hook_without_valid_count() ->
             num_moe_experts=64,
             moe_router_dtype="fp32",
             params_dtype=torch.bfloat16,
+            sequence_parallel=sequence_parallel,
         ),
         explicit_config=cfg,
-        parallel_state_module=FakeParallelState(dp_world=1),
+        parallel_state_module=FakeParallelState(tp_world=2, tp_rank=tp_rank),
         dist_module=FakeDist(initialized=False),
         unwrap_fn=lambda x: x,
         engine_factory=_fake_engine_factory,
@@ -1980,26 +2165,52 @@ def test_setup_router_logits_installs_raw_identity_hook_without_valid_count() ->
     )
 
     assert handle is not None
-    hook = model[0].router.dmi_router_logits
+    router = model[0].router
+    hook = {
+        "router-logits": router.dmi_router_logits,
+        "router-summary": router.dmi_router_probs_mean,
+        "router-entropy": router.dmi_router_token_entropy_mean,
+    }[hook_selection]
     assert isinstance(hook, HookPointV1)
     policy = _megatron_hook_spec(hook)
-    assert policy.need_token_range is False
-    assert policy.binding_metadata_fields == frozenset()
-    assert hook.spec.outputs[0].transport_type is TransportType.IDENTITY
+    assert policy.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
+    assert policy.need_token_range is True
+    assert policy.binding_metadata_fields == frozenset({MegatronMetadataField.VALID_COUNT})
     assert policy.outputs[0].dtype is torch.float32
-    assert policy.outputs[0].input_shape == (
-        DimSpec.BATCH,
-        DimSpec.SEQ,
-        DimSpec.NUM_EXPERTS,
-    )
-    assert model[0].router.dmi_router_probs_mean is None
+    if hook_selection == "router-logits":
+        assert policy.preprocess is None
+        assert hook.spec.outputs[0].transport_type is TransportType.SEQ_PREFIX_PACK
+        assert policy.outputs[0].input_shape == (
+            DimSpec.SEQ, DimSpec.BATCH, DimSpec.NUM_EXPERTS,
+        )
+        assert policy.outputs[0].output_shape == (
+            DimSpec.ACTUAL_TOKEN_PACKED, DimSpec.NUM_EXPERTS,
+        )
+        assert router.dmi_router_probs_mean is None
+    elif hook_selection == "router-summary":
+        assert policy.preprocess == router._dmi_router_probs_mean_from_logits
+        assert hook.spec.outputs[0].transport_type is TransportType.IDENTITY
+        assert policy.outputs[0].input_shape == (DimSpec.BATCH, DimSpec.NUM_EXPERTS)
+        assert policy.outputs[0].output_shape == (DimSpec.BATCH, DimSpec.NUM_EXPERTS)
+        assert router.dmi_router_logits is None
+    else:
+        assert policy.preprocess == router._dmi_router_token_entropy_mean_from_logits
+        assert hook.spec.outputs[0].transport_type is TransportType.IDENTITY
+        assert hook.spec.outputs[0].storage is OutputStorage.SCALAR_FLOAT
+        assert policy.outputs[0].input_shape == (DimSpec.BATCH, 1)
+        assert policy.outputs[0].output_shape == (DimSpec.BATCH, 1)
+        assert router.dmi_router_logits is None
+        assert router.dmi_router_probs_mean is None
     assert FakeAdaptor.instances[0].dims == {
         DimSpec.BATCH: 2,
         DimSpec.NUM_EXPERTS: 64,
         DimSpec.SEQ: 16,
     }
-    assert len(FakeAdaptor.instances[0].attach_calls[0]["model_hooks"]) == 1
-    assert "valid_count" not in runtime_contexts[0].field_specs
+    bindings = FakeAdaptor.instances[0].attach_calls[0]["model_hooks"]
+    assert len(bindings) == 1
+    assert bindings[0].record_shard_rank == tp_rank
+    assert "valid_count" in runtime_contexts[0].field_specs
+    assert runtime_contexts[0].tp_sequence_sharded_enabled
 
     handle.close()
 

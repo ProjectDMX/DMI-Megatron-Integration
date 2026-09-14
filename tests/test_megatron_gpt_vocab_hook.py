@@ -26,7 +26,7 @@ class _FakeOutputLayer(nn.Module):
         return hidden_states, None
 
 
-def _fake_gpt(hook, *, topk_hook=None):
+def _fake_gpt(hook, *, topk_hook=None, token_loss_hook=None):
     model = GPTModel.__new__(GPTModel)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
@@ -40,6 +40,7 @@ def _fake_gpt(hook, *, topk_hook=None):
     model.output_layer = _FakeOutputLayer()
     model.dmi_vocab_logits = hook
     model.dmi_vocab_logits_topk = topk_hook
+    model.dmi_lm_per_token_loss = token_loss_hook
 
     def compute_loss(self, labels, logits):
         del self, labels
@@ -90,7 +91,7 @@ def test_gpt_vocab_hook_observes_post_scale_pre_loss_logits_without_changing_gra
 
 def test_gpt_vocab_hook_is_not_called_without_labels():
     captured = []
-    model = _fake_gpt(captured.append)
+    model = _fake_gpt(captured.append, token_loss_hook=captured.append)
     logits = model._postprocess(
         hidden_states=torch.ones((2, 1, 3)),
         input_ids=None,
@@ -134,8 +135,10 @@ def test_gpt_vocab_topk_hook_observes_same_post_scale_pre_loss_logits():
     assert torch.equal(topk_captured[0], expected)
 
 
-def test_raw_vocab_hook_rejects_runtime_layout_override_before_output_layer():
-    model = _fake_gpt(lambda _value: None)
+@pytest.mark.parametrize("topk_only", [False, True])
+def test_vocab_hook_rejects_runtime_layout_override_before_output_layer(topk_only):
+    hook = lambda _value: None
+    model = _fake_gpt(None, topk_hook=hook) if topk_only else _fake_gpt(hook)
 
     with pytest.raises(AssertionError, match="fixed GPTModel.parallel_output layout"):
         _postprocess(
@@ -143,3 +146,44 @@ def test_raw_vocab_hook_rejects_runtime_layout_override_before_output_layer():
             torch.ones((2, 1, 3)),
             runtime_gather_output=True,
         )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_token_loss_hook_reuses_cross_entropy_output_and_preserves_gradients(enabled):
+    from dmi_megatron_integration.startup import _install_token_loss_hook
+    from tests.test_megatron_qk_weights import _capture_hook_outputs
+
+    captured = []
+    loss_calls = []
+    model = _fake_gpt(None)
+    _install_token_loss_hook(model)
+    hook = model.dmi_lm_per_token_loss
+    _capture_hook_outputs(hook, captured.append)
+    hook.enabled = enabled
+    assert hook.spec.preprocess is None
+
+    def compute_loss(self, labels, logits):
+        loss_calls.append(logits)
+        return torch.nn.functional.cross_entropy(
+            logits.flatten(0, 1), labels.transpose(0, 1).reshape(-1),
+            reduction="none",
+        ).reshape(labels.shape[1], labels.shape[0]).transpose(0, 1).contiguous()
+
+    model.compute_language_model_loss = MethodType(compute_loss, model)
+    reference_model = _fake_gpt(None)
+    reference_model.compute_language_model_loss = MethodType(compute_loss, reference_model)
+    inputs = torch.tensor([[[0.1, 0.5, -0.3]], [[-2.0, 1.5, 3.0]]], requires_grad=True)
+    reference_inputs = inputs.detach().clone().requires_grad_(True)
+    loss = _postprocess(model, inputs)
+    assert len(loss_calls) == 1  # Recording does not run cross-entropy again.
+    reference_loss = _postprocess(reference_model, reference_inputs)
+    torch.testing.assert_close(loss, reference_loss)
+    torch.testing.assert_close(-loss, (inputs * 2).log_softmax(-1)[:, :, 0].transpose(0, 1))
+    if enabled:
+        assert len(captured) == 1
+        assert captured[0] is loss  # No reduction, cast, clone, or replacement.
+    else:
+        assert captured == []
+    loss.sum().backward()
+    reference_loss.sum().backward()
+    torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0, atol=0)

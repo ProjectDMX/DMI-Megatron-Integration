@@ -6,6 +6,20 @@ The integration package version is `0.17.1` and requires DMI `>=1.2.0,<2.0`. The
 
 For a source setup, clone this repository recursively and follow the [installation guide](docs/install.md). The guide records the tested Python, PyTorch, CUDA, and Transformer Engine stack and installs the pinned fork rather than an unrelated `megatron-core` release.
 
+## Per-token loss hook
+
+Select `--dmi-hook-selection token-loss` with DMI enabled. This separate hook
+records `lm_per_token_loss` directly after Megatron's cross-entropy returns
+`[batch, sequence]` losses. Each sample record contains its sequence of losses,
+before masking or averaging; the recorded token range identifies its valid
+prefix. For ordinary next-token cross-entropy, `log P(target) = -token_loss`.
+No normalization is recomputed, and the existing `loss-summary` mean/count
+outputs remain independently selectable (for example, `token-loss,loss-summary`).
+
+The hook emits on TP rank 0 of the last PP stage for every DP replica, including
+folded EP layouts. It currently supports dense batches with CP=1. The raw loss
+tensor keeps Megatron's output dtype; the hook performs no cast.
+
 ## Q/K weight hooks
 
 Select `--dmi-hook-selection q-weights,k-weights` with DMI enabled (either name

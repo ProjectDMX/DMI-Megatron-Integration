@@ -237,21 +237,10 @@ class MegatronRecordFormat:
         metadata: MegatronRecordMetadata,
         entry: ProducerPlanEntry,
     ) -> tuple[int, ...]:
-        if entry.storage in (OutputStorage.SCALAR_FLOAT, OutputStorage.SCALAR_INT):
-            if entry.transport_type is TransportType.PREFIX_STRIP:
-                if not metadata.valid_counts:
-                    raise ValueError(
-                        "PREFIX_STRIP scalar Megatron records require valid_counts"
-                    )
-                return tuple(
-                    1 if int(count) > 0 else 0 for count in metadata.valid_counts
-                )
-            if not entry.output_shape:
-                return (1,)
-            return (1,) * max(0, int(entry.output_shape[0]))
         if metadata.valid_counts:
             return metadata.valid_counts
         if entry.transport_type in (
+            TransportType.PREFIX_STRIP,
             TransportType.SEQ_PREFIX_PACK,
             TransportType.SEGMENTED_PACK,
         ):
