@@ -1190,6 +1190,47 @@ def _install_router_topk_hooks(model: Any, *, dtype: torch.dtype) -> None:
             )
 
 
+def _install_moe_input_hooks(model: Any) -> None:
+    """Capture sequence-sharded MoE inputs before dispatch metadata computation."""
+    roots = model if isinstance(model, list) else [model]
+    for root in roots:
+        for module in root.modules():
+            if module.__class__.__name__ != "MoELayer":
+                continue
+            dispatcher = module.token_dispatcher
+            if dispatcher.__class__.__name__ != "MoEAlltoAllTokenDispatcher":
+                raise NotImplementedError(
+                    "DMI moe-input requires Megatron's AlltoAll token dispatcher"
+                )
+            existing = getattr(module, "dmi_moe_input", None)
+            if existing is None:
+                module.add_module(
+                    "dmi_moe_input",
+                    _make_hook(
+                        MegatronHookSpec(
+                            name="moe_input",
+                            layer_no=int(module.layer_number) - 1,
+                            outputs=[
+                                MegatronOutputSpec(
+                                    name="moe_input",
+                                    input_shape=[DimSpec.SEQ, DimSpec.BATCH, DimSpec.HIDDEN],
+                                    output_shape=[DimSpec.ACTUAL_TOKEN_PACKED, DimSpec.HIDDEN],
+                                    dtype=module.config.params_dtype,
+                                    transport_type=TransportType.SEQ_PREFIX_PACK,
+                                )
+                            ],
+                            shard_policy=ShardPolicy.TP_SEQUENCE_SHARDED,
+                            enabled_by=frozenset({"moe-input"}),
+                        ),
+                        hook_phase=HookPhase.FWD,
+                    ),
+                )
+                existing = module.dmi_moe_input
+            elif not isinstance(existing, HookPointV1):
+                raise TypeError("layer.dmi_moe_input exists but is not HookPointV1")
+            dispatcher.dmi_moe_input = existing
+
+
 def _install_moe_inverse_map_hooks(model: Any) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
@@ -2531,12 +2572,13 @@ def setup_megatron_dmi(
         dims[DimSpec.NUM_EXPERTS] = _num_experts(model_config)
     if {
         "hidden-states",
+        "moe-input",
         "resid_final",
         "router-weights",
         "moe-packed-weighted-output",
     } & selected_hooks:
         dims[DimSpec.HIDDEN] = _hidden_size(model_config)
-    if {"router-logits", "router-topk", "hidden-states", "resid_final"} & selected_hooks:
+    if {"router-logits", "router-topk", "hidden-states", "moe-input", "resid_final"} & selected_hooks:
         dims[DimSpec.SEQ] = _seq_length(args)
     if selected_vocab_hooks:
         dims[DimSpec.SEQ] = _seq_length(args)
@@ -2595,6 +2637,8 @@ def setup_megatron_dmi(
                 unwrapped,
                 dtype=_router_logits_dtype(model_config),
             )
+        if "moe-input" in selected_hooks:
+            _install_moe_input_hooks(unwrapped)
         if "moe-inverse-map" in selected_hooks:
             _install_moe_inverse_map_hooks(unwrapped)
         if "moe-packed-weighted-output" in selected_hooks:

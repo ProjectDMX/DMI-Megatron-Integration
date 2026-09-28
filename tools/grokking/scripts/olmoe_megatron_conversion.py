@@ -123,6 +123,14 @@ def megatron_argv_from_olmoe(
     ckpt_format: str = "torch_dist",
 ) -> list[str]:
     config = olmoe_config(hf_dir)
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        # Transformers 5 migrated this field into ``rope_parameters`` while
+        # preserving the same value from the pinned OLMoE config.
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if not isinstance(rope_parameters, dict) or "rope_theta" not in rope_parameters:
+            raise ValueError("OLMoE config is missing rope_theta")
+        rope_theta = rope_parameters["rope_theta"]
     argv = [
         "olmoe_conversion.py",
         "--use-mcore-models",
@@ -131,6 +139,10 @@ def megatron_argv_from_olmoe(
         "--global-batch-size",
         "1",
         "--bf16",
+        "--attention-dropout",
+        str(config.attention_dropout),
+        "--hidden-dropout",
+        "0.0",
         "--no-gradient-accumulation-fusion",
         "--no-persist-layer-norm",
         "--no-masked-softmax-fusion",
@@ -182,7 +194,7 @@ def megatron_argv_from_olmoe(
         "--rotary-percent",
         "1.0",
         "--rotary-base",
-        str(int(config.rope_theta)),
+        str(int(rope_theta)),
         "--transformer-impl",
         "local",
         "--spec",
