@@ -1025,6 +1025,7 @@ def test_window_defaults_and_numeric_precedence():
     cfg = resolve_megatron_dmi_config(environ={})
     assert not cfg.recurring_d2h_windows_enabled and not cfg.d2h_window_debug
     fields = {
+        "d2h_window_fallback_entry_threshold": 1,
         "d2h_window_timing_revalidation_retry_interval_occurrences": 4,
         "d2h_window_minimum_record_probe_retry_interval_occurrences": 4,
         "d2h_window_capacity_flush_fallback_threshold": 3,
@@ -1058,6 +1059,7 @@ def test_default_builder_wires_window_config_and_record_mode(monkeypatch):
     assert engines[0]["record_mode_v1"] is True
     windows = engines[0]["ring_config"].recurring_d2h_windows
     assert windows.enabled and windows.debug_enabled
+    assert windows.fallback_entry_threshold == 1
     assert windows.timing_revalidation_retry_interval_occurrences == 6
     assert windows.minimum_record_probe_retry_interval_occurrences == 7
     assert windows.capacity_flush_fallback_threshold == 8

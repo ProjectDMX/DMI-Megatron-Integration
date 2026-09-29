@@ -1131,3 +1131,50 @@ def test_build_megatron_schedule_runtime_uses_dmi_cpu_metadata_groups(
         ((0, 1), "gloo", "DMI_TP_METADATA_GLOO_0_0"),
         ((2, 3), "gloo", "DMI_TP_METADATA_GLOO_0_1"),
     ]
+
+
+@pytest.mark.parametrize("before_pattern", [False, True])
+def test_eval_suspends_windows_and_restores_training(before_pattern):
+    calls = []
+    runtime = MegatronScheduleRuntime(FakePropagator())
+    runtime.adaptor = SimpleNamespace(record_runtime=SimpleNamespace(
+        define_d2h_window_pattern=lambda **kw: calls.append(("pattern", kw)) or True,
+        advance_boundary=lambda: calls.append("boundary"),
+        set_d2h_window_suspended=lambda value: calls.append(("suspend", value)),
+    ))
+    runtime.configure_d2h_windows(enabled=True)
+    if not before_pattern:
+        runtime.prepare_d2h_windows(2, 0, 4)
+    signature = runtime._d2h_window_signature
+    runtime.enter_phase("valid", training_iteration_id_start=1)
+    assert calls[-1] == ("suspend", True)
+    assert not runtime.d2h_windows_active
+    runtime.prepare_d2h_windows(2, 0, 1)
+    assert runtime._d2h_window_signature == signature
+    runtime.enter_phase("test", training_iteration_id_start=1)
+    assert calls[-1] == ("suspend", True)  # No second switch/flush.
+    runtime.enter_phase("train", training_iteration_id_start=2)
+    assert calls[-1] == ("suspend", False)
+    assert runtime._d2h_window_signature == signature
+    assert runtime.d2h_windows_active is (not before_pattern)
+    runtime.prepare_d2h_windows(2, 0, 4)
+    assert len([c for c in calls if isinstance(c, tuple) and c[0] == "pattern"]) == 1
+
+
+def test_failed_window_resume_does_not_enter_training():
+    runtime = MegatronScheduleRuntime(FakePropagator())
+    runtime.phase = "valid"
+    def fail(_):
+        raise RuntimeError("unpublished evaluation payload")
+    runtime.adaptor = SimpleNamespace(record_runtime=SimpleNamespace(set_d2h_window_suspended=fail))
+    runtime.configure_d2h_windows(enabled=True)
+    with pytest.raises(RuntimeError, match="unpublished"):
+        runtime.enter_phase("train", training_iteration_id_start=2)
+    assert runtime.phase == "valid"
+
+
+def test_disabled_windows_do_not_switch_policy():
+    runtime = MegatronScheduleRuntime(FakePropagator())
+    runtime.enter_phase("valid", training_iteration_id_start=1)
+    runtime.enter_phase("test", training_iteration_id_start=1)
+    runtime.enter_phase("train", training_iteration_id_start=2)

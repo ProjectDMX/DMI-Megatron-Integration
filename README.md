@@ -91,8 +91,25 @@ before an eligible receive or combined send/receive and closes at the next
 forward/backward computation entry. DMI-core learns transfer sizes within
 these windows; terminal capacity fallback continues with ordinary batching.
 
+Fallback uses the existing batched drain, with a **one-entry threshold by
+default** (immediate eligibility, not necessarily one record per transfer).
+The same fallback serves validation/test, terminal fallback, and startup before
+a training pattern is active. Configure its entry threshold with
+`--dmi-d2h-window-fallback-entry-threshold`; set it to `0` to use the ordinary
+`DMI_DRAIN_FLUSH_*` thresholds without a fallback entry override. This does
+not change active training-window admission or its capacity limits.
+
+Entering validation/test suspends window learning between drain batches without
+flushing the ring or synchronizing the training stream. Returning to training
+waits for preceding producers and drains the evaluation tail through D2H before
+resuming learning; it does not flush the storage sink. Learned grants and
+terminal fallback survive the transition, while incomplete timing observations
+spanning evaluation are discarded. Moving directly from validation to test
+keeps fallback active. Phase-switch logs report the elapsed transition time.
+
 | CLI option | Default |
 |---|---|
+| `--dmi-d2h-window-fallback-entry-threshold` | 1 |
 | `--dmi-d2h-window-minimum-record-probe-retry-interval-occurrences` | 4 |
 | `--dmi-d2h-window-timing-revalidation-retry-interval-occurrences` | 4 |
 | `--dmi-d2h-window-capacity-flush-fallback-threshold` | 3 |

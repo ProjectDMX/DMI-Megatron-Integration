@@ -100,6 +100,7 @@ class MegatronDMIConfig:
     ring_pinned_mb: int = 4096
     ring_task_entries: int = 65536
     recurring_d2h_windows_enabled: bool = False
+    d2h_window_fallback_entry_threshold: int = 1
     d2h_window_minimum_record_probe_retry_interval_occurrences: int = 4
     d2h_window_timing_revalidation_retry_interval_occurrences: int = 4
     d2h_window_capacity_flush_fallback_threshold: int = 3
@@ -365,6 +366,10 @@ def resolve_megatron_dmi_config(
             args, "dmi_d2h_window_minimum_record_probe_retry_interval_occurrences", environ,
             "DMI_D2H_WINDOW_MINIMUM_RECORD_PROBE_RETRY_INTERVAL_OCCURRENCES", 4, int,
         ),
+        d2h_window_fallback_entry_threshold=int(_env_value(
+            args, "dmi_d2h_window_fallback_entry_threshold", environ,
+            "DMI_D2H_WINDOW_FALLBACK_ENTRY_THRESHOLD", 1, int,
+        )),
         d2h_window_timing_revalidation_retry_interval_occurrences=_env_value(
             args, "dmi_d2h_window_timing_revalidation_retry_interval_occurrences", environ,
             "DMI_D2H_WINDOW_TIMING_REVALIDATION_RETRY_INTERVAL_OCCURRENCES", 4, int,
@@ -2068,6 +2073,7 @@ def _build_engine(
     ring_cfg.drain_flush_timeout_us = int(cfg.drain_flush_timeout_us)
     window_cfg = RecurringD2HWindowConfig()
     window_cfg.enabled = cfg.recurring_d2h_windows_enabled
+    window_cfg.fallback_entry_threshold = cfg.d2h_window_fallback_entry_threshold
     window_cfg.minimum_record_probe_retry_interval_occurrences = (
         cfg.d2h_window_minimum_record_probe_retry_interval_occurrences
     )
@@ -2253,6 +2259,8 @@ def setup_megatron_dmi(
     cfg = resolve_megatron_dmi_config(args, explicit=explicit_config, environ=environ)
     if not cfg.enabled:
         return None
+    if cfg.d2h_window_fallback_entry_threshold < 0:
+        raise ValueError("DMI window fallback entry threshold must be nonnegative")
     if cfg.layer_stride < 1:
         raise ValueError("--dmi-layer-stride must be a positive integer")
     cfg = replace(
@@ -2747,6 +2755,7 @@ def setup_megatron_dmi(
         runtime.producer_rank = rank
         runtime.configure_d2h_windows(
             enabled=cfg.recurring_d2h_windows_enabled, debug=cfg.d2h_window_debug,
+            fallback_entry_threshold=cfg.d2h_window_fallback_entry_threshold,
         )
         if cfg.storage_backend == "drop" and (cfg.drop.timing_enabled or cfg.drop.ring_metrics_enabled):
             runtime.configure_measurements(

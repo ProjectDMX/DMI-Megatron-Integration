@@ -93,6 +93,7 @@ class MegatronScheduleRuntime:
         self._next_attempt_id = 0
         self._d2h_windows_enabled = False
         self._d2h_window_debug = False
+        self._d2h_window_fallback_entry_threshold = 1
         self._d2h_window_signature: tuple[int, int, int] | None = None
         self._d2h_window_definition_rejected = False
         self._d2h_window_unsupported_warned = False
@@ -124,20 +125,24 @@ class MegatronScheduleRuntime:
     def current_attempt_id(self) -> int:
         return 0 if self._active_attempt_id is None else int(self._active_attempt_id)
 
-    def configure_d2h_windows(self, *, enabled: bool, debug: bool = False) -> None:
+    def configure_d2h_windows(self, *, enabled: bool, debug: bool = False,
+                             fallback_entry_threshold: int = 1) -> None:
         """Configure the recurring-window opt-in at engine startup."""
         self._d2h_windows_enabled = bool(enabled)
         self._d2h_window_debug = bool(debug)
+        self._d2h_window_fallback_entry_threshold = fallback_entry_threshold
 
     @property
     def d2h_windows_active(self) -> bool:
         # Keep publishing after terminal fallback; core ignores window grants
         # there. The signature also prevents publication before a definition.
-        return self._d2h_windows_enabled and self._d2h_window_signature is not None
+        return (self._d2h_windows_enabled and self.phase == "train"
+                and self._d2h_window_signature is not None)
 
     def prepare_d2h_windows(self, pp_size: int, pp_rank: int, num_microbatches: int) -> None:
         """Install a pattern before the schedule, only when its signature changes."""
-        if not self._d2h_windows_enabled or self._d2h_window_definition_rejected:
+        if (not self._d2h_windows_enabled or self.phase != "train"
+                or self._d2h_window_definition_rejected):
             return
         signature = (int(pp_size), int(pp_rank), int(num_microbatches))
         if signature == self._d2h_window_signature:
@@ -515,6 +520,12 @@ class MegatronScheduleRuntime:
                 return
             self.seal_current_phase()
 
+        if self._d2h_windows_enabled and (self.phase == "train") != (phase == "train"):
+            started = time.perf_counter()
+            self.adaptor.record_runtime.set_d2h_window_suspended(phase != "train")
+            print(f"[DMI] d2h phase switch rank={self.producer_rank} "
+                  f"{self.phase}->{phase} fallback_entry_threshold={self._d2h_window_fallback_entry_threshold} "
+                  f"elapsed_s={time.perf_counter() - started:.6f}", flush=True)
         self.phase = phase
         self._dataset_id_override = None
         self.global_batch_id = global_start
