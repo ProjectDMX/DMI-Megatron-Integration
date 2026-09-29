@@ -362,3 +362,25 @@ def test_inverse_map_accepts_valid_tokens_with_padding_gaps() -> None:
         result.source_domains[0].combined_output,
         torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
     )
+
+
+def test_three_inputs_match_four_inputs(monkeypatch):
+    """Exercise the existing EP/ETP oracles with and without captured weights."""
+    original = reconstruct_moe_invocation
+    calls=[]
+    def compare(topology, **kwargs):
+        full=original(topology,**kwargs)
+        without=dict(kwargs);without.pop('weight_shards')
+        positional=original(topology,**without)
+        for left,right in zip(full.source_domains,positional.source_domains):
+            assert right.selected_weights is None
+            assert left.token_coordinates==right.token_coordinates
+            torch.testing.assert_close(left.weighted_outputs,right.weighted_outputs)
+            torch.testing.assert_close(left.selected_expert_ids,right.selected_expert_ids)
+        calls.append(True)
+        return full
+    monkeypatch.setitem(globals(),'reconstruct_moe_invocation',compare)
+    test_ep2_reconstructs_exact_source_weighted_outputs()
+    test_etp_partials_sum_in_common_packed_row_order()
+    test_expert_dp_dispatch_groups_remain_isolated()
+    assert len(calls)==3

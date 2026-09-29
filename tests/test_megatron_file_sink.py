@@ -191,7 +191,8 @@ def test_megatron_file_sink_writes_training_rows(tmp_path):
     assert [row["dataset_id"] for row in rows] == [4, 9]
     assert [row["token_end"] for row in rows] == [14, 12]
     assert rows[0]["phase"] == "train"
-    assert rows[0]["schema_version"] == 2
+    assert rows[0]["schema_version"] == 3
+    assert rows[0]["producer_rank"] == 0
     assert rows[0]["attempt_id"] == 2
     assert rows[0]["invocation_id"] == 3
     assert rows[0]["shape"] == [3]

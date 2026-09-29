@@ -6,6 +6,34 @@ The integration package version is `0.17.1` and requires DMI `>=1.2.0,<2.0`. The
 
 For a source setup, clone this repository recursively and follow the [installation guide](docs/install.md). The guide records the tested Python, PyTorch, CUDA, and Transformer Engine stack and installs the pinned fork rather than an unrelated `megatron-core` release.
 
+## Hook selection by training phase
+
+`--dmi-hook-selection` supplies the common selection. Override a phase with
+`--dmi-train-hook-selection`, `--dmi-valid-hook-selection`, or
+`--dmi-test-hook-selection`. Each override replaces the common selection for
+that phase; omission inherits it. Use `none` for an empty selection.
+
+For example:
+
+```bash
+--dmi-hook-selection router-logits,q-weights,k-weights \
+--dmi-valid-hook-selection hidden-states,router-logits,loss-summary \
+--dmi-test-hook-selection none
+```
+
+Disabled hooks are skipped before preprocessing and record preparation. Hooks
+needed by any phase are installed at startup. This selection is fixed before
+graph capture. It filters existing firing sites: weights still emit only at
+initialization and before training updates, and gradient norms remain training
+signals. Phase/attempt metadata remains enabled even with `none`.
+
+If phase selections differ, local layer/partial CUDA graphs run validation and
+test eagerly instead of reusing training graphs. Rank 0 warns once at the first
+fallback. Training retains its cached graphs. Identical phase selections retain
+existing behavior. TE graphs already use the non-TE-graph path for evaluation;
+full-iteration graphs keep their separate phase-specific captures. Existing GPU
+recomputation gates are unchanged.
+
 ## Per-token loss hook
 
 Select `--dmi-hook-selection token-loss` with DMI enabled. This separate hook
@@ -20,23 +48,31 @@ The hook emits on TP rank 0 of the last PP stage for every DP replica, including
 folded EP layouts. It currently supports dense batches with CP=1. The raw loss
 tensor keeps Megatron's output dtype; the hook performs no cast.
 
-## Q/K weight hooks
+## Parameter-weight hooks
 
-Select `--dmi-hook-selection q-weights,k-weights` with DMI enabled (either name
-can also be selected independently). These V1 hooks record
-`query_projection_weight` and `key_projection_weight` at initialization/resume
-and after each successful optimizer update, following the router-weight hooks.
-They do not run per microbatch or during recomputation.
+Select `--dmi-hook-selection q-weights,k-weights,router-weights` (each is
+independently selectable). Capture runs once **before** the optimizer update,
+after the final forward/backward attempt, outside CUDA graphs. It records the
+weights used by that iteration even when the optimizer skips its update.
+Initial/resume snapshots have the separate attempt identity -1.
 
-Each record contains a contiguous `[local_projection_rows, hidden_size]` tensor
-extracted from the live grouped QKV parameter by the hook's GPU `preprocess`
-callback, without V. The emitter passes QKV directly; only the selected Q or K
-output is offloaded. Global layer IDs
-identify PP ownership; `shard_rank` identifies the TP shard. Standard MHA/GQA
-SelfAttention and its OLMoE subclass are supported. As with router weights,
-DP must be 1; `reuse_grad_buf_for_mxfp8_param_ag` with `overlap_param_gather` is
-unsupported. Q/K extraction also rejects gated attention, FP8/FP4 modes, and
-TP sizes greater than the number of KV heads.
+Each rank captures only assigned bytes: retained model-weight shards for FSDP,
+or disjoint slices among actual replicas for non-FSDP. No additional all-gather
+is performed. TP Q/K layout is preserved, including TP greater than KV head
+count and empty local K portions. Capture does not depend on microbatch count.
+Non-quantized Megatron FSDP and Torch FSDP2 storage mappings are implemented;
+upstream restrictions on distributed/graph combinations still apply. Gated
+attention and quantized FP8/FP4 weights remain unsupported.
+
+The raw records contain packed byte fragments. Use the single on-demand
+`weight_matrices` Signal (`builtin:merge_weight_shards`) to obtain complete Q,
+K, and router matrices through `complete_weight_matrices`. It merges rank
+contributions using `capture_topology.weight_layout_json`, retaining iteration,
+attempt, layer and weight name. See [Signal configuration](docs/SIGNALS.md) and
+[the example](examples/signals/reconstruction.yaml). The main tensor table schema
+is unchanged. Existing schema-v3 capture tables need the additional
+`weight_layout_json String` column in their `capture_topology` table before a
+new weight-capture run; old full-matrix captures use the legacy reader.
 
 ## Recurring D2H windows
 

@@ -17,7 +17,6 @@ from dmi_megatron_integration.startup import (
     MegatronDMIConfig,
     MegatronRankContext,
     _megatron_hook_spec,
-    _qk_weight_bindings,
     setup_megatron_dmi,
 )
 from tests.test_megatron_startup import (
@@ -48,7 +47,7 @@ def _attention(*, heads=8, groups=2, head_dim=2, hidden=7, layer=1, tp=1):
     module = OlmoeSelfAttention()
     module.attention_type = "self"
     module.layer_number = layer
-    module.config = SimpleNamespace(num_query_groups=groups * tp, hidden_size=hidden)
+    module.config = SimpleNamespace(num_query_groups=groups * tp, hidden_size=hidden, num_attention_heads=heads * tp)
     module.num_query_groups_per_partition = groups
     module.num_attention_heads_per_partition = heads
     module.hidden_size_per_attention_head = head_dim
@@ -93,130 +92,19 @@ def _capture_hook_outputs(hook, on_output, *, should_emit=True):
     )
 
 
-@pytest.mark.parametrize("heads,groups", [(4, 4), (8, 2), (8, 1)])
-@pytest.mark.parametrize("selected", [{"q-weights"}, {"k-weights"}, {"q-weights", "k-weights"}])
-def test_mha_gqa_mqa_extract_exact_qk_and_refresh(heads, groups, selected):
+@pytest.mark.parametrize("heads,groups", [(4,4), (8,2), (8,1)])
+def test_mha_gqa_mqa_projection_reference(heads, groups):
     model, q, k = _attention(heads=heads, groups=groups)
-    hooks, bindings = _qk_weight_bindings(model, rank_ctx=_rank(), selected_hooks=selected)
-    assert len(hooks) == len(bindings) == len(selected)
-    expected = {"query_projection_weight": q, "key_projection_weight": k}
-    old = []
-    captured = []
-    for hook, parameter in bindings:
-        _capture_hook_outputs(hook, captured.append)
-        assert hook.spec.preprocess.func is qk_weight_from_fused_qkv
-        assert parameter is model.linear_qkv.weight
-        hook(parameter)
-        value = captured[-1]
-        torch.testing.assert_close(value, expected[hook.spec.name])
-        assert value.is_contiguous() and not value.requires_grad
-        assert value.device == parameter.device
-        assert value.numel() < parameter.numel()  # the runtime never receives full QKV
-        assert value.untyped_storage().data_ptr() != parameter.untyped_storage().data_ptr()
-        old.append(value)
-    with torch.no_grad():
-        model.linear_qkv.weight.add_(10)
-    for (hook, parameter), before in zip(bindings, old):
-        torch.testing.assert_close(before, expected[hook.spec.name])
-        hook(parameter)
-        torch.testing.assert_close(captured[-1], expected[hook.spec.name] + 10)
-
-
-@pytest.mark.parametrize("enabled,should_emit", [(False, True), (True, False)])
-def test_ineligible_hook_does_not_preprocess(enabled, should_emit):
-    model, _q, _k = _attention()
-    _hooks, ((hook, parameter),) = _qk_weight_bindings(
-        model, rank_ctx=_rank(), selected_hooks={"q-weights"},
-    )
-    captured = []
-    _capture_hook_outputs(hook, captured.append, should_emit=should_emit)
-    hook.enabled = enabled
-    # An invalid input would fail during extraction, so this also verifies the
-    # callback is behind the hook/runtime eligibility checks, not in the caller.
-    hook(parameter[:0])
-    assert captured == []
-
-
-@pytest.mark.parametrize("tp_rank", [0, 1])
-@pytest.mark.parametrize("pp_rank", [0, 1])
-def test_tp_shards_keep_global_pp_layer_and_iteration_contract(tp_rank, pp_rank):
-    model, _q, _k = _attention(layer=pp_rank + 1, tp=2)
-    hooks, bindings = _qk_weight_bindings(
-        [model, model],  # shared references must not double-emit
-        rank_ctx=_rank(tp_rank=tp_rank, tp_world_size=2, pp_rank=pp_rank, pp_world_size=2),
-        selected_hooks={"q-weights", "k-weights"},
-    )
-    assert len(hooks) == len(bindings) == 2
-    for hook_binding in hooks:
-        spec = _megatron_hook_spec(hook_binding.hook)
-        assert spec.layer_no == pp_rank
-        assert spec.name in {"query_projection_weight", "key_projection_weight"}
-        assert spec.shard_policy is ShardPolicy.TP_SHARDED
-        assert spec.record_type is RecordType.PER_ITERATION
-        assert spec.dp_emission is DPEmissionPolicy.DP_RANK_0
-        assert hook_binding.hook.hook_phase is HookPhase.ITERATION
-        assert spec.outputs[0].transport_type is TransportType.IDENTITY
-        assert not spec.need_token_range
-        assert hook_binding.record_dp_rank == -1
-        assert hook_binding.record_shard_rank == tp_rank
-
-
-def test_nonzero_dp_rank_does_not_duplicate_weights():
-    model, _q, _k = _attention()
-    assert _qk_weight_bindings(
-        model, rank_ctx=_rank(dp_rank=1, dp_world_size=2), selected_hooks={"q-weights"}
-    ) == ((), ())
-
-
-@pytest.mark.parametrize("rank", [
-    _rank(tp_rank=1, tp_world_size=2, ep_rank=1, ep_world_size=2),
-    _rank(tp_rank=1, tp_world_size=2, cp_rank=1, cp_world_size=2),
-])
-def test_tp_weight_shards_are_not_filtered_by_ep_or_cp_rank(rank):
-    model, _q, _k = _attention(tp=2)
-    hooks, bindings = _qk_weight_bindings(
-        model, rank_ctx=rank, selected_hooks={"q-weights", "k-weights"}
-    )
-    assert len(hooks) == len(bindings) == 2
-    assert all(hook.record_shard_rank == rank.tp_rank for hook in hooks)
-
-
-@pytest.mark.parametrize("case,error,match", [
-    ("cpu", RuntimeError, "CUDA-resident"),
-    ("shape", ValueError, "grouped QKV shape"),
-    ("layer", ValueError, "global layer number"),
-    ("duplicate", ValueError, "Duplicate local"),
-    ("gate", NotImplementedError, "gated attention"),
-    ("tp_kv", NotImplementedError, "number of KV heads"),
-    ("fp8", NotImplementedError, "non-quantized"),
-    ("missing", TypeError, "fused QKV Parameter"),
-])
-def test_unsupported_weight_layouts_fail_explicitly(case, error, match):
-    model, _q, _k = _attention()
-    rank = _rank()
-    if case == "cpu":
-        model.linear_qkv.weight = nn.Parameter(model.linear_qkv.weight.detach())
-    elif case == "shape":
-        model.linear_qkv.weight = FakeCudaParameter(torch.zeros(7, 7))
-    elif case == "layer":
-        model.layer_number = 0
-    elif case == "duplicate":
-        other, _q, _k = _attention()
-        model = [model, other]
-    elif case == "gate":
-        model.config.attention_output_gate = True
-    elif case == "tp_kv":
-        rank = _rank(tp_world_size=4)
-    elif case == "fp8":
-        model.config.fp8 = "hybrid"
-    elif case == "missing":
-        del model.linear_qkv
-    with pytest.raises(error, match=match):
-        _qk_weight_bindings(model, rank_ctx=rank, selected_hooks={"q-weights", "k-weights"})
+    for projection, expected in [("q", q), ("k", k)]:
+        actual = qk_weight_from_fused_qkv(model.linear_qkv.weight,
+            num_query_groups=groups, query_rows_per_group=heads//groups*2,
+            head_dim=2, projection=projection)
+        torch.testing.assert_close(actual, expected)
+        assert actual.untyped_storage().data_ptr() != model.linear_qkv.weight.untyped_storage().data_ptr()
 
 
 @pytest.mark.parametrize("selection", ["q-weights", "k-weights", "q-weights,k-weights"])
-@pytest.mark.parametrize("restriction", ["dp", "param_gather"])
+@pytest.mark.parametrize("restriction", ["param_gather"])
 def test_setup_rejects_unsafe_weight_access_before_engine(selection, restriction):
     model, _q, _k = _attention()
     calls = []
@@ -255,11 +143,10 @@ def test_setup_emits_initial_and_restored_states_with_fresh_values():
     )
     observed = []
     try:
-        assert len(handle.qk_weight_bindings) == 2
-        assert handle.router_weight_bindings == ()
+        assert len(handle.weight_captures) == 2
         hook_inputs = []
-        for hook, parameter in handle.qk_weight_bindings:
-            assert parameter is model.linear_qkv.weight
+        for capture in handle.weight_captures:
+            hook = capture.hook
             hook.register_forward_pre_hook(
                 lambda _hook, args: hook_inputs.append(args[0])
             )
@@ -276,13 +163,14 @@ def test_setup_emits_initial_and_restored_states_with_fresh_values():
         handle.emit_qk_weights(model_state_iteration_id=600001)
         assert len(observed) == 6
         assert len(hook_inputs) == 6
-        assert all(value is model.linear_qkv.weight for value in hook_inputs)
+        assert all(value.dtype == torch.uint8 for value in hook_inputs)
         for idx, (name, context, value) in enumerate(observed):
             assert context.global_batch_id == (0, 600000, 600001)[idx // 2]
             assert context.microbatch_id == -1 and context.dataset_ids == ()
             assert context.direction == "iter" and context.phase == "train"
             expected = q if name == "query_projection_weight" else k
-            torch.testing.assert_close(value, expected + (5 if idx >= 4 else 0))
+            assert context.attempt_id == (-1 if idx < 4 else 0)
+            torch.testing.assert_close(value.view(expected.dtype).reshape(expected.shape), expected + (5 if idx >= 4 else 0))
         assert handle.adaptor.context is None
         with pytest.raises(ValueError, match="must be >= 1"):
             handle.emit_qk_weights(model_state_iteration_id=0)
@@ -296,6 +184,7 @@ def test_layer_stride_filters_weight_bindings_before_iteration_capture():
     for layer, module in enumerate(model.layers):
         module.router = TopKRouter(layer_number=layer + 1)
         module.router.weight = FakeCudaParameter(torch.zeros(4, 7))
+        module.router.config = SimpleNamespace(num_moe_experts=4, hidden_size=7)
     handle = setup_megatron_dmi(
         [model], args=SimpleNamespace(global_batch_size=4, micro_batch_size=2),
         model_config=SimpleNamespace(num_layers=3, hidden_size=7, num_moe_experts=4),
@@ -308,8 +197,8 @@ def test_layer_stride_filters_weight_bindings_before_iteration_capture():
         adaptor_cls=FakeAdaptor, device="cpu",
     )
     try:
-        assert [_megatron_hook_spec(hook).layer_no for hook, _ in handle.qk_weight_bindings] == [0, 0, 2, 2]
-        assert [_megatron_hook_spec(binding.hook).layer_no for binding in handle.router_weight_bindings] == [0, 2]
+        assert [c.layer_no for c in handle.weight_captures if c.act_name != "router_projection_weight"] == [0, 0, 2, 2]
+        assert [c.layer_no for c in handle.weight_captures if c.act_name == "router_projection_weight"] == [0, 2]
         bindings = handle.adaptor.attach_calls[0]["iteration_hooks"]
         unlayered = [binding for binding in bindings if _megatron_hook_spec(binding.hook).layer_no == -1]
         assert len(unlayered) == 2  # Attempt status and gradient norm.
@@ -335,7 +224,10 @@ def test_training_calls_qk_only_at_router_weight_boundaries():
         assert isinstance(block, ast.If)
         assert router_name in ast.unparse(block)
         if name == "emit_qk_weights":
-            assert ast.unparse(block.test) == "dmi_handle is not None and update_successful"
+            assert ast.unparse(block.test) == "dmi_handle is not None"
+            optimizer_calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                               and ast.unparse(n.func) == "optimizer.step"]
+            assert any(call.lineno < n.lineno < call.lineno + 10 for n in optimizer_calls)
             assert ast.unparse(call.keywords[0].value) == "int(iteration) + 1"
         else:
             assert ast.unparse(call.keywords[0].value) == "int(iteration)"

@@ -1,0 +1,50 @@
+# On-demand declarations to include alongside an application's root Signal.
+# Set the physical table names to the run's capture table and topology table.
+# The root trigger guarantees that the selected iteration's inputs are ready.
+signals:
+  - name: token_tensors
+    trigger: {event: on_demand}
+    inputs:
+      - from: {table: dmi_training_tensors}
+        where:
+          act_name: {in: [hidden_states, hook_resid_final, moe_input, router_logits]}
+        scope: {event: current}
+    transform: builtin:merge_token_shards
+    output:
+      - signal: complete_token_tensors
+        columns: &merged_tensor_columns
+          - {name: model_id, type: String}
+          - {name: phase, type: String}
+          - {name: global_batch_id, type: Int64}
+          - {name: attempt_id, type: Int32}
+          - {name: microbatch_id, type: Int32}
+          - {name: layer_no, type: Int32}
+          - {name: direction, type: String}
+          - {name: dp_rank, type: Int32}
+          - {name: dataset_id, type: Int32}
+          - {name: sample_index, type: Int32}
+          - {name: invocation_id, type: Int64}
+          - {name: act_name, type: String}
+          - {name: token_start, type: Int64}
+          - {name: token_end, type: Int64}
+          - {name: value, type: Tensor}
+
+  - name: weight_matrices
+    trigger: {event: on_demand}
+    inputs:
+      - from: {table: dmi_training_tensors}
+        where:
+          act_name: {in: [query_projection_weight, key_projection_weight, router_projection_weight]}
+        scope: {event: current}
+      - from: {table: dmi_training_tensors_capture_topology}
+    transform: builtin:merge_weight_shards
+    output:
+      - signal: complete_weight_matrices
+        columns:
+          - {name: model_id, type: String}
+          - {name: phase, type: String}
+          - {name: global_batch_id, type: Int64}
+          - {name: attempt_id, type: Int32}
+          - {name: layer_no, type: Int32}
+          - {name: act_name, type: String}
+          - {name: value, type: Tensor}

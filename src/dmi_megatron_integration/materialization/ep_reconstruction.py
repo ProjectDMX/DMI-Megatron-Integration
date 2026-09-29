@@ -224,7 +224,7 @@ class ReconstructedSourceDomain:
     dense_dp_rank: int
     token_coordinates: tuple[SourceTokenCoordinate, ...]
     selected_expert_ids: torch.Tensor
-    selected_weights: torch.Tensor
+    selected_weights: torch.Tensor | None
     weighted_outputs: torch.Tensor
     combined_output: torch.Tensor
 
@@ -239,7 +239,7 @@ def reconstruct_moe_invocation(
     topology: MoEParallelTopology,
     *,
     expert_id_shards: Sequence[RouterExpertIdsShard],
-    weight_shards: Sequence[RouterWeightsShard],
+    weight_shards: Sequence[RouterWeightsShard] | None = None,
     inverse_map_shards: Sequence[InverseMapShard],
     packed_output_shards: Sequence[PackedWeightedOutputShard],
 ) -> ReconstructedMoEInvocation:
@@ -258,12 +258,13 @@ def reconstruct_moe_invocation(
 
     record_sequences = (
         tuple(expert_id_shards),
-        tuple(weight_shards),
         tuple(inverse_map_shards),
         tuple(packed_output_shards),
     )
+    if weight_shards is not None:
+        record_sequences += (tuple(weight_shards),)
     if any(not records for records in record_sequences):
-        raise ValueError("All four captured payload kinds are required")
+        raise ValueError("Expert IDs, inverse maps, and packed outputs are required; supplied weights must be complete")
     keys = {record.key for records in record_sequences for record in records}
     if len(keys) != 1:
         raise ValueError("Captured payloads do not share one execution key")
@@ -279,7 +280,7 @@ def reconstruct_moe_invocation(
         return result
 
     ids_by_rank = records_by_rank(expert_id_shards, "expert-ID")
-    weights_by_rank = records_by_rank(weight_shards, "router-weight")
+    weights_by_rank = records_by_rank(weight_shards or (), "router-weight")
     inverse_by_rank = records_by_rank(inverse_map_shards, "inverse-map")
     packed_by_rank = records_by_rank(packed_output_shards, "packed-output")
     producer_ranks = {
@@ -287,7 +288,6 @@ def reconstruct_moe_invocation(
     }
     for name, records in (
         ("expert-ID", ids_by_rank),
-        ("router-weight", weights_by_rank),
         ("inverse-map", inverse_by_rank),
         ("packed-output", packed_by_rank),
     ):
@@ -295,6 +295,9 @@ def reconstruct_moe_invocation(
             missing = sorted(producer_ranks.difference(records))
             extra = sorted(set(records).difference(producer_ranks))
             raise ValueError(f"{name} producer mismatch: missing={missing}, extra={extra}")
+
+    if weight_shards is not None and set(weights_by_rank) != producer_ranks:
+        raise ValueError("Router-weight producer mismatch")
 
     integral_dtypes = {
         torch.uint8,
@@ -307,24 +310,23 @@ def reconstruct_moe_invocation(
     source_shapes: dict[int, tuple[int, int]] = {}
     for producer_rank in sorted(producer_ranks):
         ids_record = ids_by_rank[producer_rank]
-        weights_record = weights_by_rank[producer_rank]
+        weights_record = weights_by_rank.get(producer_rank)
         inverse_record = inverse_by_rank[producer_rank]
         assert isinstance(ids_record, RouterExpertIdsShard)
-        assert isinstance(weights_record, RouterWeightsShard)
         assert isinstance(inverse_record, InverseMapShard)
 
         expected_dense_dp_rank = topology.dense_dp_rank_by_global_rank[producer_rank]
         if ids_record.dense_dp_rank != expected_dense_dp_rank:
             raise ValueError(f"Expert-ID dense-DP rank mismatch for rank {producer_rank}")
-        if weights_record.dense_dp_rank != expected_dense_dp_rank:
+        if weights_record is not None and weights_record.dense_dp_rank != expected_dense_dp_rank:
             raise ValueError(f"Router-weight dense-DP rank mismatch for rank {producer_rank}")
-        if ids_record.token_coordinates != weights_record.token_coordinates:
+        if weights_record is not None and ids_record.token_coordinates != weights_record.token_coordinates:
             raise ValueError(f"Router token coordinates disagree for rank {producer_rank}")
         if len(set(ids_record.token_coordinates)) != len(ids_record.token_coordinates):
             raise ValueError(f"Duplicate source token coordinate on rank {producer_rank}")
 
         ids = ids_record.tensor
-        weights = weights_record.tensor
+        weights = None if weights_record is None else weights_record.tensor
         inverse_map = inverse_record.tensor
         if ids.dtype not in integral_dtypes or ids.ndim != 2:
             raise ValueError("Expert IDs must be a rank-2 integer tensor")
@@ -343,9 +345,9 @@ def reconstruct_moe_invocation(
             raise ValueError("Source-flat indices must be unique on each producer")
         if any(index < 0 for index in source_flat_indices):
             raise ValueError("Source-flat indices must be nonnegative")
-        if not weights.is_floating_point() or tuple(weights.shape) != tuple(ids.shape):
+        if weights is not None and (not weights.is_floating_point() or tuple(weights.shape) != tuple(ids.shape)):
             raise ValueError("Router weights must be floating point and match expert IDs")
-        if not bool(torch.isfinite(weights).all().item()):
+        if weights is not None and not bool(torch.isfinite(weights).all().item()):
             raise ValueError("Router weights contain a non-finite value")
         if inverse_map.dtype not in integral_dtypes or inverse_map.ndim != 1:
             raise ValueError("Inverse map must be a rank-1 integer tensor")
@@ -501,9 +503,8 @@ def reconstruct_moe_invocation(
     ] = {}
     for producer_rank in sorted(producer_ranks):
         ids_record = ids_by_rank[producer_rank]
-        weights_record = weights_by_rank[producer_rank]
+        weights_record = weights_by_rank.get(producer_rank)
         assert isinstance(ids_record, RouterExpertIdsShard)
-        assert isinstance(weights_record, RouterWeightsShard)
         token_count, top_k = source_shapes[producer_rank]
         domain_rows = rows_by_dense_dp.setdefault(ids_record.dense_dp_rank, [])
         for token_index, coordinate in enumerate(ids_record.token_coordinates):
@@ -518,7 +519,7 @@ def reconstruct_moe_invocation(
                 (
                     coordinate,
                     ids_record.tensor[token_index],
-                    weights_record.tensor[token_index],
+                    None if weights_record is None else weights_record.tensor[token_index],
                     route_rows,
                 )
             )
@@ -531,7 +532,7 @@ def reconstruct_moe_invocation(
                 f"Dense-DP domain {dense_dp_rank} has duplicate global token coordinates"
             )
         selected_expert_ids = torch.stack([row[1] for row in rows], dim=0)
-        selected_weights = torch.stack([row[2] for row in rows], dim=0)
+        selected_weights = None if weight_shards is None else torch.stack([row[2] for row in rows], dim=0)
         weighted_outputs = torch.stack([row[3] for row in rows], dim=0)
         source_domains.append(
             ReconstructedSourceDomain(

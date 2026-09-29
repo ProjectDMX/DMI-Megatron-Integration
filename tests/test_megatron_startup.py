@@ -1500,6 +1500,59 @@ def test_install_resid_final_rejects_non_v1_hook():
         _install_resid_final_hooks(model)
 
 
+@pytest.mark.parametrize("hook_selection", ["vocab-logits", "vocab-logits-topk"])
+@pytest.mark.parametrize("parallel_output", [True, False])
+@pytest.mark.parametrize("post_process,tp_rank", [(True, 0), (True, 1), (False, 0)])
+def test_capture_topology_records_actual_vocab_partition_size(
+    hook_selection, parallel_output, post_process, tp_rank
+):
+    records = []
+    schemas = []
+
+    def engine_factory(_cfg, _model_id, record_format, _rank):
+        schemas.append(record_format.schema)
+        host = SimpleNamespace(submit_record=lambda *args, **kwargs: records.append(args))
+        return FakeEngine(), host
+
+    def runtime_factory(**kwargs):
+        context = DMIMetadataContext(
+            max_num_microbatches=kwargs["max_num_microbatches"],
+            max_batch_size=kwargs["max_batch_size"],
+            num_scopes=kwargs["num_scopes"],
+            field_specs=kwargs["field_specs"], device="cpu",
+        )
+        return MegatronScheduleRuntime(LocalMetadataPropagator(context), host_engine=kwargs["host_engine"])
+
+    handle = setup_megatron_dmi(
+        [TinyGPTModel(post_process=post_process, parallel_output=parallel_output)],
+        args=SimpleNamespace(global_batch_size=4, micro_batch_size=2, seq_length=16, padded_vocab_size=128),
+        model_config=SimpleNamespace(params_dtype=torch.bfloat16),
+        explicit_config=MegatronDMIConfig(
+            enabled=True, hook_selection=hook_selection,
+            vocab_logits_top_k=4 if hook_selection == "vocab-logits-topk" else None,
+            model_id="vocab-metadata", dataset_provenance_mode=CONSTANT_PROVENANCE,
+        ),
+        parallel_state_module=FakeParallelState(tp_world=2, tp_rank=tp_rank, pp_world=2, pp_rank=int(post_process)),
+        dist_module=FakeDist(initialized=False), unwrap_fn=lambda x: x,
+        engine_factory=engine_factory, runtime_factory=runtime_factory,
+        adaptor_cls=FakeAdaptor, device="cpu",
+    )
+    try:
+        published = [record for record in records if record[0] == "capture_topology"]
+        assert len(published) == 1
+        _, row, types = published[0]
+        layout = next(layout for layout in schemas[0].layouts if layout.name == "capture_topology")
+        assert layout.columns[-2].name == "vocab_partition_size"
+        assert layout.columns[-1].name == "weight_layout_json"
+        assert len(layout.columns) == len(row) == len(types)
+        assert types[-2:] == ("int64", "string")
+        active = post_process and (parallel_output or tp_rank == 0)
+        assert row[-2] == ((64 if parallel_output else 128) if active else 0)
+        assert row[-1] == "[]"
+    finally:
+        handle.close()
+
+
 def test_setup_vocab_logits_installs_last_stage_raw_identity_hook():
     model = [TinyGPTModel(post_process=True)]
 
@@ -2554,31 +2607,31 @@ def test_setup_registers_grad_norm_as_coordinator_iteration_hook():
     handle.close()
 
 
-def test_router_weights_rejects_dp_greater_than_one_before_engine_creation():
-    engine_calls = []
-
-    def engine_factory(_cfg, _model_id, _record_format, _rank):
-        engine_calls.append(True)
-        return FakeEngine(), None
-
-    with pytest.raises(NotImplementedError, match="data-parallel world size exactly 1"):
-        setup_megatron_dmi(
-            [TinyMoEModel()],
-            args=SimpleNamespace(global_batch_size=4, micro_batch_size=2),
-            model_config=SimpleNamespace(num_moe_experts=4, hidden_size=8),
-            explicit_config=MegatronDMIConfig(
-                enabled=True,
-                hook_selection="router-weights",
-                model_id="run",
-            ),
-            parallel_state_module=FakeParallelState(dp_world=2),
-            dist_module=FakeDist(initialized=False),
-            unwrap_fn=lambda x: x,
-            engine_factory=engine_factory,
-            adaptor_cls=FakeAdaptor,
-            device="cpu",
-        )
-    assert engine_calls == []
+def test_router_weights_supports_dp_replica_capture():
+    root = nn.Module()
+    root.router = TopKRouter()
+    root.router.config = SimpleNamespace(num_moe_experts=4, hidden_size=8)
+    root.router.weight = nn.Parameter(torch.arange(32.).reshape(4,8))
+    class Replicas(FakeDist):
+        def all_gather_object(self, output, value):
+            if isinstance(value, list) and value and isinstance(value[0], dict) and "available" in value[0]:
+                output[:] = [[dict(r, producer_rank=rank) for r in value] for rank in range(2)]
+            else:
+                # Metadata reports are normally the per-domain dataclass.
+                from dataclasses import replace
+                output[:] = [replace(value, global_rank=rank, dense_dp_rank=rank) for rank in range(2)]
+    handle = setup_megatron_dmi(
+        [root], args=SimpleNamespace(global_batch_size=4, micro_batch_size=2),
+        model_config=root.router.config,
+        explicit_config=MegatronDMIConfig(enabled=True, hook_selection="router-weights", model_id="run"),
+        parallel_state_module=FakeParallelState(dp_world=2),
+        dist_module=Replicas(world_size=2), unwrap_fn=lambda x:x,
+        engine_factory=lambda *args:(FakeEngine(),None), adaptor_cls=FakeAdaptor, device="cpu")
+    try:
+        assert len(handle.weight_captures) == 1
+        assert handle.weight_captures[0].pack().numel() == 32*4//2
+    finally:
+        handle.close()
 
 
 def test_recompute_hook_policy_preserves_defaults_and_allows_suppression():
@@ -2701,3 +2754,24 @@ def test_no_per_sample_hooks_need_no_dataset_topology_resolution():
         has_per_sample_hooks=False,
     )
     assert set(modes.values()) == {"constant-zero"}
+
+
+@pytest.mark.parametrize('selection', [{'router_topk_expert_ids'}, {'router_topk_weights'}, {'router_topk_expert_ids','router_topk_weights'}])
+def test_router_topk_outputs_independently_selected(selection):
+    from dmi_megatron_integration.startup import _install_router_topk_hooks
+    class TopKRouter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dmi_router_topk=None
+            self.layer_number=1
+            self.topk=2
+        def _dmi_router_topk_from_routing(self,*args):
+            return torch.tensor([[[1,3]]]),torch.tensor([[[0.25,0.75]]])
+    router=TopKRouter()
+    _install_router_topk_hooks(router,dtype=torch.float32,selected_outputs=selection)
+    policy=_megatron_hook_spec(router.dmi_router_topk)
+    assert {output.name for output in policy.outputs}==selection
+    values=policy.preprocess(None)
+    assert len(values)==len(selection)
+    for output,value in zip(policy.outputs,values):
+        assert value.dtype==output.dtype

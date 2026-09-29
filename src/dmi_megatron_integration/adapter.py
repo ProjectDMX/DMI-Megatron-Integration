@@ -25,6 +25,7 @@ from dmi.api.v1 import (
     TransportType,
 )
 
+from .hooks.selection import hook_enabled_in_phase
 from .hooks.specs import (
     DimSpec,
     HookInputLayout,
@@ -607,7 +608,15 @@ class MegatronHookRuntime:
     def _set_null_mode(self, enabled: bool) -> None:
         self.adaptor.engine.set_capture_enabled(not bool(enabled))
 
+    def execution_phase(self) -> str:
+        ctx = self.adaptor.current_context
+        if self.mode is HookRuntimeMode.CAPTURE_RECORD and not self.capture_event_context:
+            return "train"
+        return ctx.phase if ctx else "train"
+
     def should_emit(self, hook: HookPointV1) -> bool:
+        if not hook_enabled_in_phase(hook, self.execution_phase()):
+            return False
         if self._te_capture_session_active and self._capture_builder is None:
             return False
         if not self.adaptor._hook_suppress_recompute(hook):
@@ -636,6 +645,13 @@ class MegatronHookRuntime:
         output_spec: TransportSpec,
         output: HookOutput,
     ) -> StepReservation | None:
+        output_phases = getattr(hook, "megatron_output_phases", None)
+        if output_phases is not None:
+            name = self.adaptor._configured_hook(hook).policy.outputs[output_index].name
+            if self.execution_phase() not in output_phases[name]:
+                # No reservation/metadata/producer: same no-dispatch return as
+                # the existing CPU-direct path, before recording graph entries.
+                return StepReservation.OVERSIZED
         semantics = self.adaptor._configured_hook(hook).output_semantics[output_index]
         builder = self._capture_builder
         if builder is None:
@@ -678,7 +694,8 @@ class MegatronIterationHookRuntime:
             raise RuntimeError("Iteration runtime received a non-ITERATION hook")
         if configured.policy.record_type is not RecordType.PER_ITERATION:
             raise RuntimeError("Iteration runtime received a non-PER_ITERATION hook")
-        return True
+        ctx = self.adaptor.current_iteration_context
+        return hook_enabled_in_phase(hook, ctx.phase if ctx else "train")
 
     def prepare_output(
         self,

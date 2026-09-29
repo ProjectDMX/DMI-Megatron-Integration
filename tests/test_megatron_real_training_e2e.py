@@ -586,6 +586,26 @@ def _read_training_rows_all_phases(*, model_id: str, table: str, database: str):
         reader.close()
 
 
+def _read_merged_weight_rows(*, model_id, table, database, act_name, direction="iter"):
+    from dmi_megatron_integration.signals.storage import ClickHouseStorage
+    from dmi_megatron_integration.signals.events import Event
+    from dmi_megatron_integration.materialization.reconstruction import merge_weight_shards
+    from dmi_megatron_integration.records.schema import TRAINING_ROW_COORDINATE_COLUMN_NAMES
+    client = _clickhouse_client_or_skip()
+    try:
+        storage = ClickHouseStorage(client, database=database, base_table=table)
+        event = Event(model_id, "iteration_end", "train", 0)
+        payload = storage.read({"from": {"table": table}, "where": {"act_name": act_name}}, event, {})
+        topology = storage.read({"from": {"table": table + "_capture_topology"}}, event, {})
+        merged, = merge_weight_shards(payload, topology)
+        defaults = dict(direction=direction, dp_rank=-1, microbatch_id=-1, sample_index=-1,
+                        shard_rank=-1, token_start=0, token_end=1, invocation_id=0, dataset_id=-1)
+        return [(tuple(dict(defaults, **row)[k] for k in TRAINING_ROW_COORDINATE_COLUMN_NAMES), row.value)
+                for row in merged]
+    finally:
+        client.disconnect()
+
+
 def _read_training_act_rows(
     *,
     model_id: str,
@@ -2775,7 +2795,7 @@ def test_real_megatron_training_health_signals_clickhouse_rows(tmp_path):
             assert key[12:] == (0, 0, -1)
             assert int(value) == 1
 
-        weight_rows = _read_training_act_rows(
+        weight_rows = _read_merged_weight_rows(
             model_id=model_id,
             table=table,
             database=database,
@@ -2788,9 +2808,9 @@ def test_real_megatron_training_health_signals_clickhouse_rows(tmp_path):
         for key, value in weight_rows:
             assert key[3] == "train"
             assert key[5:8] == (-1, -1, -1)
-            assert key[9] == 0
+            assert key[9] == -1
             assert key[10:12] == (0, 1)
-            assert key[12:] == (0, 0, -1)
+            assert key[12:] == (-1 if key[4] == 0 else 0, 0, -1)
             assert tuple(value.shape) == (2, 64)
 
         materialize_result = subprocess.run(
@@ -2946,7 +2966,7 @@ def test_real_megatron_router_weights_cover_pipeline_stages_once(tmp_path):
             model_id=model_id,
             expected=expected_router_rows + expected_summary_rows,
         )
-        weight_rows = _read_training_act_rows(
+        weight_rows = _read_merged_weight_rows(
             model_id=model_id,
             table=table,
             database=database,
@@ -2964,7 +2984,7 @@ def test_real_megatron_router_weights_cover_pipeline_stages_once(tmp_path):
         for key, value in weight_rows:
             assert key[3] == "train"
             assert key[5:8] == (-1, -1, -1)
-            assert key[9:12] == (0, 0, 1)
+            assert key[9:12] == (-1, 0, 1)
             assert tuple(value.shape) == (2, 64)
     finally:
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
@@ -3006,6 +3026,7 @@ def test_real_megatron_qk_weights_once_per_state_with_recompute(tmp_path, pp_siz
             "--group-query-attention", "--num-query-groups", "2",
             "--recompute-granularity", "full", "--recompute-method", "uniform",
             "--recompute-num-layers", "1",
+            "--log-interval", "1", "--split", "100,0,0",
         ] + (["--sequence-parallel"] if tp_size > 1 else []),
     )
     try:
@@ -3015,27 +3036,25 @@ def test_real_megatron_qk_weights_once_per_state_with_recompute(tmp_path, pp_siz
             expected=2 * expected_per_projection,
         )
         for name, projection_rows in (("query_projection_weight", 64), ("key_projection_weight", 32)):
-            rows = _read_training_act_rows(
-                model_id=model_id, table=table, database=database,
-                act_name=name, direction="iter",
-            )
-            assert len(rows) == expected_per_projection
-            assert len({key for key, _value in rows}) == expected_per_projection
-            assert {(key[4], key[8], key[9]) for key, _value in rows} == {
-                (iteration, layer, tp_rank) for iteration in range(train_iters + 1)
-                for layer in range(2) for tp_rank in range(tp_size)
-            }
+            raw = _read_training_act_rows(model_id=model_id, table=table, database=database,
+                                          act_name=name, direction="iter")
+            assert len(raw) == expected_per_projection
+            assert all(value.dtype == torch.uint8 for _, value in raw)
+            rows = _read_merged_weight_rows(model_id=model_id, table=table, database=database,
+                                           act_name=name, direction="iter")
+            assert len(rows) == (train_iters + 1) * 2
             states = {}
             for key, value in rows:
                 assert key[3] == "train"
                 assert key[5:8] == (-1, -1, -1)
-                assert key[10:12] == (0, 1)
-                assert tuple(value.shape) == (projection_rows // tp_size, 64)
+                assert key[9:12] == (-1, 0, 1)
+                assert key[12] == (-1 if key[4] == 0 else 0)
+                assert tuple(value.shape) == (projection_rows, 64)
                 assert torch.isfinite(value).all()
-                states[key[4], key[8], key[9]] = value
+                states[key[4], key[8]] = value
             for layer in range(2):
-                for tp_rank in range(tp_size):
-                    assert not torch.equal(states[0, layer, tp_rank], states[train_iters, layer, tp_rank])
+                torch.testing.assert_close(states[0, layer], states[1, layer], rtol=0, atol=0)
+                assert not torch.equal(states[1, layer], states[train_iters, layer])
     finally:
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_float`")
@@ -3885,17 +3904,17 @@ def test_real_megatron_ep2_moe_payloads_reach_clickhouse(tmp_path):
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Real Megatron DP E2E needs CUDA")
-def test_real_megatron_dp2_rejects_router_weights_before_rows(tmp_path):
-    """Verify the DP>1 router-weight guard fails before any DMI payload is emitted."""
+def test_real_megatron_dp2_deduplicates_weights_with_overlap(tmp_path):
+    """Verify DP replicas contribute disjoint bytes and merge into full router weights."""
 
     if _available_cuda_devices() < 2:
-        pytest.skip("router-weight DP rejection E2E requires two CUDA devices")
+        pytest.skip("router-weight DP capture E2E requires two CUDA devices")
 
     client = _clickhouse_client_or_skip()
     database = os.environ.get("DMX_DB_DATABASE", "default")
-    table = f"dmi_megatron_router_dp2_reject_e2e_{uuid.uuid4().hex}"
-    model_id = f"megatron-router-dp2-reject-e2e-{uuid.uuid4().hex}"
-    log_path = tmp_path / "megatron_router_dp2_reject.log"
+    table = f"dmi_megatron_router_dp2_capture_e2e_{uuid.uuid4().hex}"
+    model_id = f"megatron-router-dp2-capture-e2e-{uuid.uuid4().hex}"
+    log_path = tmp_path / "megatron_router_dp2_capture.log"
 
     client.execute(f"CREATE DATABASE IF NOT EXISTS `{database}`")
     client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
@@ -3910,37 +3929,32 @@ def test_real_megatron_dp2_rejects_router_weights_before_rows(tmp_path):
 
     cmd = _tiny_megatron_router_summary_cmd(
         model_id=model_id,
-        train_iters=1,
+        train_iters=2,
         micro_batch_size=1,
         global_batch_size=2,
         nproc_per_node=2,
         database=database,
         table=table,
-        extra_args=["--dmi-hook-selection", "router-weights"],
+        extra_args=["--dmi-hook-selection", "router-weights,q-weights,k-weights",
+                    "--group-query-attention", "--num-query-groups", "2",
+                    "--use-distributed-optimizer", "--overlap-param-gather", "--overlap-grad-reduce",
+                    "--log-interval", "1", "--split", "100,0,0"],
     )
 
     try:
-        with log_path.open("w", encoding="utf-8") as log:
-            result = subprocess.run(
-                cmd,
-                cwd=MEGATRON_ROOT,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=float(os.environ.get("DMI_REAL_E2E_TIMEOUT_S", "240")),
-                check=False,
-            )
-        assert result.returncode != 0
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-        assert "router-weights requires data-parallel world size exactly 1" in log_text
-        assert _query_count(
-            client,
-            database=database,
-            table=table,
-            model_id=model_id,
-            act_name=None,
-        ) == 0
+        _run_megatron_cmd(cmd, env=env, log_path=log_path)
+        _wait_for_exact_model_rows(client, database=database, table=table, model_id=model_id, expected=36)
+        for name, shape in (("router_projection_weight", (2,64)),
+                            ("query_projection_weight", (64,64)),
+                            ("key_projection_weight", (32,64))):
+            rows = _read_merged_weight_rows(model_id=model_id, table=table, database=database,
+                                           act_name=name)
+            assert len(rows) == 6  # two layers, initial plus two pre-update snapshots
+            states = {(key[4], key[8]): value for key, value in rows}
+            for layer in range(2):
+                assert states[1, layer].shape == shape
+                torch.testing.assert_close(states[0, layer], states[1, layer], rtol=0, atol=0)
+                assert not torch.equal(states[1, layer], states[2, layer])
     finally:
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}`")
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_float`")
@@ -4052,7 +4066,7 @@ def test_real_megatron_iteration_hooks_optimizer_modes(
             direction="iter",
             expected=train_iters,
         )
-        weight_rows = _read_training_act_rows(
+        weight_rows = _read_merged_weight_rows(
             model_id=model_id,
             table=table,
             database=database,

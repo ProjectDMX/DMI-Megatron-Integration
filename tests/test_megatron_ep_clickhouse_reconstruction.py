@@ -302,3 +302,18 @@ def test_clickhouse_rows_reject_inconsistent_tp_sp_local_extents() -> None:
         ValueError, match="TP/SP peers disagree on local sequence extent"
     ):
         reconstruct_moe_clickhouse_rows(_manifest(), rows_by_act)
+
+
+def test_persisted_three_input_reconstruction_matches_four(monkeypatch):
+    original=reconstruct_moe_clickhouse_rows
+    def compare(manifest,rows):
+        result=original(manifest,rows)
+        positional=original(manifest,{k:v for k,v in rows.items() if k!='router_topk_weights'})
+        for left,right in zip(result,positional):
+            for a,b in zip(left.source_domains,right.source_domains):
+                assert b.selected_weights is None
+                assert a.token_coordinates==b.token_coordinates
+                torch.testing.assert_close(a.weighted_outputs,b.weighted_outputs)
+        return result
+    monkeypatch.setitem(globals(),'reconstruct_moe_clickhouse_rows',compare)
+    test_clickhouse_rows_restore_sp_coordinates_and_global_etp_expert_order()

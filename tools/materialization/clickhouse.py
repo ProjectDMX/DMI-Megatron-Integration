@@ -867,6 +867,33 @@ def _read_router_weight_state(
             "state_id": state_id,
         },
     )
+    if rows and str(_decode_cell(rows[0][13])).removeprefix("torch.") == "uint8":
+        from dmi_megatron_integration.materialization.reconstruction import merge_weight_shards
+        attempt = -1 if state_id == 0 else accepted_attempts.get(state_id)
+        if attempt is None:
+            raise RuntimeError(f"Weight iteration {state_id} has no accepted attempt")
+        topology = _raw_execute(client,
+            f"SELECT model_id, producer_rank, weight_layout_json FROM {_q(args.raw_db)}."
+            f"{_q(args.raw_table + '_capture_topology')} WHERE model_id = %(model_id)s",
+            {"model_id": args.model_id})
+        layout_rows = [dict(model_id=str(_decode_cell(r[0])), producer_rank=int(r[1]),
+                           weight_layout_json=_decode_cell(r[2])) for r in topology]
+        # Weight bindings use GLOBAL_RANK_SHARDED: shard_rank is the producer's
+        # global rank. Keep the query compatible with legacy payload schemas.
+        payload = [dict(model_id=args.model_id, act_name=ROUTER_WEIGHT_ACT,
+                       direction=str(_decode_cell(r[0])), phase=str(_decode_cell(r[1])),
+                       global_batch_id=int(r[2]), microbatch_id=int(r[4]), layer_no=int(r[6]),
+                       attempt_id=int(r[10]), invocation_id=int(r[11]), producer_rank=int(r[7]),
+                       value=_decode_tensor(r[13],r[14],r[15]))
+                   for r in rows if int(r[10]) == attempt]
+        merged, = merge_weight_shards(payload, layout_rows)
+        weights = {r.layer_no: r.value for r in merged}
+        if set(weights) != set(range(int(args.expected_layer_count))):
+            raise RuntimeError("Incomplete reconstructed router-weight layers")
+        expected = (int(args.expected_expert_count), int(args.expected_hidden_size))
+        if any(tuple(v.shape) != expected for v in weights.values()):
+            raise RuntimeError("Reconstructed router-weight shape differs from model")
+        return weights
     expected_attempt_id = 0 if state_id == 0 else accepted_attempts.get(state_id)
     if expected_attempt_id is None:
         raise RuntimeError(
@@ -950,7 +977,10 @@ def _latest_router_weight_state_id(
           AND phase = 'train'
           AND invocation_id = 0
           AND dataset_id = -1
-          AND global_batch_id < %(before_iteration)s
+          AND (
+            (global_batch_id = %(before_iteration)s AND dtype IN ('uint8', 'torch.uint8'))
+            OR (global_batch_id < %(before_iteration)s AND dtype NOT IN ('uint8', 'torch.uint8'))
+          )
           AND (
             (global_batch_id = 0 AND attempt_id = 0)
             OR (global_batch_id, attempt_id) IN ({_accepted_attempt_subquery(args)})

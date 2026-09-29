@@ -141,6 +141,7 @@ def _create_training_table(client, *, database: str, table: str) -> None:
             `attempt_id` Int32,
             `invocation_id` Int32,
             `dataset_id` Int32,
+            `producer_rank` Int32,
             `dtype` String,
             `shape` Array(Int64),
             `bytes` String

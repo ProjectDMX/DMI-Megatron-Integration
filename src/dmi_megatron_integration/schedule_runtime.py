@@ -66,8 +66,16 @@ class MegatronScheduleRuntime:
         self.active = False
         self._ingested_microbatches: set[int] = set()
         self.adaptor: Any | None = None
+        self.record_format = None
+        self.producer_rank = 0
+        self._phase_expected_count = 0
+        self._count_records_before_capture = False
+        self._phase_global_start = 1
+        self._phase_global_end = 1
         self.global_batch_id = 0
         self.phase = "train"
+        self.phase_hook_selections_differ = False
+        self._eager_phase_warning_printed = False
         self.execution_order_id = 1
         self._phase_open = False
         self._phase_training_iteration_id = 1
@@ -364,6 +372,8 @@ class MegatronScheduleRuntime:
                 f"DMI attempt ID must be {self._next_attempt_id}, got {attempt_id}"
             )
         self._active_attempt_id = attempt_id
+        if self.record_format is not None:
+            self.record_format.count_records = True
         if self.adaptor is not None:
             self.adaptor.begin_attempt(
                 phase="train",
@@ -371,7 +381,7 @@ class MegatronScheduleRuntime:
                 attempt_id=attempt_id,
             )
 
-    def finish_attempt(self, status: int) -> None:
+    def finish_attempt(self, status: int, *, weights_updated: bool = False) -> None:
         attempt_id = self._active_attempt_id
         if attempt_id is None:
             raise RuntimeError("DMI training attempt is not active")
@@ -383,6 +393,7 @@ class MegatronScheduleRuntime:
         if status == 1 and 1 in self._attempt_statuses.values():
             raise RuntimeError("DMI logical iteration has more than one accepted attempt")
         self._emit_attempt_status(attempt_id=attempt_id, status=status)
+        self._submit_iteration_metadata(attempt_id, status, weights_updated)
         if self.adaptor is not None:
             self.adaptor.end_attempt(attempt_id=attempt_id)
         self._attempt_statuses[attempt_id] = status
@@ -464,6 +475,8 @@ class MegatronScheduleRuntime:
             and self._active_attempt_id is None
         ):
             raise RuntimeError("DMI training schedule execution requires an active attempt")
+        if self.record_format is not None and not self._full_iteration_capture_active:
+            self.record_format.count_records = True
         self._configure_active_metadata_fields()
         metadata_preloaded = self._full_iteration_metadata_preloaded
         if metadata_preloaded:
@@ -507,12 +520,19 @@ class MegatronScheduleRuntime:
         self.global_batch_id = global_start
         self._phase_training_iteration_id = training_start
         self._phase_eval_index = eval_index
+        self._phase_expected_count = 0
+        self._phase_global_start = global_start
+        self._phase_global_end = global_start
+        self._submit_phase_metadata("entry")
         self._submit_eval_boundary("entry")
         self._phase_open = True
 
     def seal_current_phase(self) -> None:
         if not self._phase_open:
             return
+        if self.record_format is not None and (self.active or self._active_attempt_id is not None):
+            raise RuntimeError("Cannot seal a phase with active capture or an unfinished attempt")
+        self._submit_phase_metadata("exit")
         self._submit_eval_boundary("exit")
         if self.phase in self._next_phase_global_batch_id:
             self._next_phase_global_batch_id[self.phase] = int(self.global_batch_id)
@@ -527,6 +547,9 @@ class MegatronScheduleRuntime:
         if self._full_iteration_capture_active:
             raise RuntimeError("Megatron DMI full-iteration capture is already active")
         self._full_iteration_capture_active = True
+        if self.record_format is not None:
+            self._count_records_before_capture = self.record_format.count_records
+            self.record_format.count_records = False
         self._full_iteration_capture_valid_counts = valid_counts_by_microbatch
         if valid_counts_by_microbatch is not None or dataset_ids_by_microbatch is not None:
             self.load_full_iteration_metadata(
@@ -538,6 +561,8 @@ class MegatronScheduleRuntime:
         if not self._full_iteration_capture_active:
             return
         self._full_iteration_capture_active = False
+        if self.record_format is not None:
+            self.record_format.count_records = self._count_records_before_capture
         self._full_iteration_capture_valid_counts = None
 
     def abort_full_iteration_capture(self) -> None:
@@ -676,6 +701,8 @@ class MegatronScheduleRuntime:
         self._last_phase = None
 
     def _commit_phase_batch(self) -> None:
+        if self.phase != "train":
+            self._submit_iteration_metadata(0, 1, False)
         self.global_batch_id += 1
         self.execution_order_id += 1
 
@@ -853,6 +880,39 @@ class MegatronScheduleRuntime:
             _packing=self.propagator.context.prepared_packing(event.microbatch_id),
         )
         adaptor.set_current_event(ctx)
+
+    def _submit_iteration_metadata(self, attempt_id: int, status: int, weights_updated: bool) -> None:
+        if self.record_format is None:
+            return
+        count = self.record_format.take_expected_count(self.phase, self.global_batch_id, attempt_id)
+        self.record_format.count_records = False
+        self._phase_expected_count += count
+        self._phase_global_end = max(self._phase_global_end, self.global_batch_id + 1)
+        if self.host_engine is None:
+            return
+        if self.adaptor is None:
+            raise RuntimeError("Iteration metadata requires an adaptor")
+        training_id = self.global_batch_id if self.phase == "train" else self._phase_training_iteration_id
+        self.host_engine.submit_record(
+            "iteration_metadata",
+            (str(self.adaptor.model_id), self.phase, int(self.global_batch_id), int(training_id),
+             int(self._phase_eval_index), int(self.producer_rank), int(attempt_id), int(status),
+             int(weights_updated), int(count)),
+            ("string", "string", "int64", "int64", "int32", "int32", "int32", "int32", "int32", "int64"),
+            nbytes=56,
+        )
+
+    def _submit_phase_metadata(self, boundary_type: str) -> None:
+        if self.host_engine is None or self.record_format is None:
+            return
+        self.host_engine.submit_record(
+            "phase_metadata",
+            (str(self.adaptor.model_id), self.phase, int(self._phase_training_iteration_id),
+             int(self._phase_eval_index), int(self.producer_rank), boundary_type,
+             int(self._phase_global_start), int(self._phase_global_end), int(self._phase_expected_count)),
+            ("string", "string", "int64", "int32", "int32", "string", "int64", "int64", "int64"),
+            nbytes=48,
+        )
 
     def _submit_eval_boundary(self, boundary_type: str) -> None:
         if self.phase == "train":
@@ -1259,9 +1319,9 @@ def dmi_begin_attempt(attempt_id: int) -> None:
         _active_runtime.begin_attempt(attempt_id)
 
 
-def dmi_finish_attempt(status: int) -> None:
+def dmi_finish_attempt(status: int, *, weights_updated: bool = False) -> None:
     if _active_runtime is not None:
-        _active_runtime.finish_attempt(status)
+        _active_runtime.finish_attempt(status, weights_updated=weights_updated)
 
 
 def dmi_enter_phase(
@@ -1513,6 +1573,8 @@ def dmi_prepare_full_iteration_replay(
         valid_counts_by_microbatch,
         dataset_ids_by_microbatch=dataset_ids_by_microbatch,
     )
+    if _active_runtime.record_format is not None:
+        _active_runtime.record_format.count_records = True
     contexts = _active_runtime.full_iteration_contexts(plan, valid_counts_by_microbatch)
     decision = _active_runtime.adaptor.prepare_full_iteration_replay(plan, contexts)
     return decision is StepReservation.OVERSIZED
@@ -1527,6 +1589,21 @@ def dmi_current_phase(default: str = "validation") -> str:
     if _active_runtime is None:
         return str(default)
     return str(_active_runtime.phase)
+
+
+def dmi_local_graph_evaluation_eager(*, warn: bool = False) -> bool:
+    """Bypass shared local runners, not phase-specific full-iteration graphs."""
+    runtime = _active_runtime
+    if (runtime is None or not runtime.phase_hook_selections_differ
+            or runtime.phase not in {"valid", "test"}):
+        return False
+    if warn and not runtime._eager_phase_warning_printed:
+        runtime._eager_phase_warning_printed = True
+        if runtime.producer_rank == 0:
+            print("DMI: phase-specific hook selections differ; validation and test "
+                  "will run eagerly instead of reusing local training CUDA graphs. "
+                  "Training CUDA graphs remain enabled.", file=sys.stderr, flush=True)
+    return True
 
 
 @contextmanager
@@ -1561,6 +1638,7 @@ __all__ = [
     "dmi_finish_attempt",
     "dmi_finish_logical_iteration",
     "dmi_current_phase",
+    "dmi_local_graph_evaluation_eager",
     "dmi_force_eager_unit",
     "dmi_finish_full_iteration_replay",
     "dmi_guard_schedule_supported",

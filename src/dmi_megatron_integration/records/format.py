@@ -93,9 +93,12 @@ def evaluation_boundary_row(
 
 
 class MegatronRecordFormat:
-    """Schema-v2 descriptor encoder for Megatron's GPU record path."""
+    """Schema-v3 descriptor encoder for Megatron's GPU record path."""
 
-    def __init__(self, base_table: str, *, index_granularity: int = 8192) -> None:
+    def __init__(self, base_table: str, *, index_granularity: int = 8192, producer_rank: int = 0) -> None:
+        self.producer_rank = int(producer_rank)
+        self._expected_records = {}
+        self.count_records = False
         self._schema = build_training_schema(
             base_table,
             index_granularity=index_granularity,
@@ -114,11 +117,18 @@ class MegatronRecordFormat:
             raise TypeError("metadata must be MegatronRecordMetadata")
         if not isinstance(entry, ProducerPlanEntry):
             raise TypeError("entry must be ProducerPlanEntry")
+        rows = self._rows(metadata, entry)
+        if self.count_records and metadata.attempt_id >= 0 and metadata.act_name != "iteration_attempt_status":
+            key = (metadata.phase, metadata.global_batch_id, metadata.attempt_id)
+            self._expected_records[key] = self._expected_records.get(key, 0) + len(rows)
         return RecordDescriptor(
             layout=self._layout_name(entry.storage),
-            rows=self._rows(metadata, entry),
+            rows=rows,
             output_id=entry.output_id,
         )
+
+    def take_expected_count(self, phase: str, batch: int, attempt: int) -> int:
+        return self._expected_records.pop((phase, batch, attempt), 0)
 
     def _rows(
         self,
@@ -369,8 +379,8 @@ class MegatronRecordFormat:
         if any(dimension < 0 for dimension in shape) or prod(shape) != 1:
             raise ValueError("Megatron scalar output must contain exactly one value per row")
 
-    @staticmethod
     def _coordinates(
+        self,
         metadata: MegatronRecordMetadata,
         *,
         sample_index: int,
@@ -381,7 +391,10 @@ class MegatronRecordFormat:
         attempt_id = int(metadata.attempt_id)
         invocation_id = int(metadata.invocation_id)
         dataset_id = int(dataset_id)
-        if not 0 <= attempt_id < 1 << 31:
+        initial_weight = (attempt_id == -1 and metadata.direction == "iter"
+                          and metadata.act_name in {"query_projection_weight",
+                              "key_projection_weight", "router_projection_weight"})
+        if not initial_weight and not 0 <= attempt_id < 1 << 31:
             raise ValueError("attempt_id is outside the supported Int32 range")
         if not 0 <= invocation_id < 1 << 31:
             raise ValueError("invocation_id is outside the supported Int32 range")
@@ -403,6 +416,7 @@ class MegatronRecordFormat:
             attempt_id,
             invocation_id,
             dataset_id,
+            self.producer_rank,
         )
 
     @staticmethod

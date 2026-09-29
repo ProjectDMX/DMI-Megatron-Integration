@@ -1,4 +1,4 @@
-"""Megatron schema-v2 queries layered on the public DMI ClickHouse reader."""
+"""Megatron schema-v2/v3 queries layered on the public DMI ClickHouse reader."""
 
 from __future__ import annotations
 
@@ -124,7 +124,8 @@ class MegatronTrainingReader(CHClickhouseDriverReadOnly):
             for row in rows
         )
         expected = _TRAINING_COORDINATE_TYPES + value_columns
-        if actual != expected:
+        expected_v3 = _TRAINING_COORDINATE_TYPES + (("producer_rank", "Int32"),) + value_columns
+        if actual not in (expected, expected_v3):
             raise RuntimeError(
                 f"Megatron training schema mismatch for {self.database}.{table}: "
                 f"expected version {TRAINING_SCHEMA_VERSION}"

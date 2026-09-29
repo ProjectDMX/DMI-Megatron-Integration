@@ -1,0 +1,23 @@
+# Match --table to the existing capture base table. Use phase-local current
+# iteration records; readiness is checked before the numerical function runs.
+signals:
+  - name: gradient_health
+    trigger:
+      event: iteration_end
+      phase: train
+    inputs:
+      - from:
+          table: dmi_training_tensors_scalar_float
+        select: [model_id, global_batch_id, attempt_id, value]
+        where:
+          act_name: grad_norm
+        scope:
+          event: current
+    transform: example_transforms:gradient_health
+    output:
+      - table: gradient_health
+        columns:
+          - {name: model_id, type: String}
+          - {name: global_batch_id, type: Int64}
+          - {name: attempt_id, type: Int32}
+          - {name: grad_norm, type: Float64}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import sys
 from dataclasses import dataclass, field, replace
@@ -24,6 +25,7 @@ from dmi.api.v1 import (
 )
 
 from .topology.ep_topology_manifest import (
+    FrozenMegatronEPTopologyManifest,
     MegatronEPTopologyFragment,
     MoELayerFragment,
     assemble_ep_topology_manifest,
@@ -32,15 +34,14 @@ from .topology.ep_topology_manifest import (
 from .adapter import (
     MegatronAdaptor,
     MegatronHookBinding,
-    MegatronRouterWeightBinding,
     MegatronTrainingContext,
 )
-from .hooks.selection import parse_hook_selection
+from .hooks.selection import parse_hook_selection, resolve_phase_hook_selections, hook_enabled_in_phase, HOOK_SELECTION_NAMES
 from .hooks.megatron_loss_summary import (
     per_sample_loss_from_token_loss,
     per_segment_loss_from_token_loss,
 )
-from .hooks.megatron_qk_weights import qk_weight_from_fused_qkv
+from .hooks.weight_capture import WEIGHT_NAMES, discover_weight_captures, assign_weight_fragments
 from .hooks.megatron_vocab_logits import (
     vocab_logits_by_sample,
     vocab_logits_topk_by_sample,
@@ -82,6 +83,9 @@ class MegatronDMIConfig:
     enabled: bool = False
     exact_resume: bool = False
     hook_selection: str = "router-summary"
+    train_hook_selection: str | None = None
+    valid_hook_selection: str | None = None
+    test_hook_selection: str | None = None
     layer_stride: int = 1
     recompute_hook: str | None = None
     no_recompute_hook: str | None = None
@@ -126,8 +130,7 @@ class MegatronDMIHandle:
         adaptor: MegatronAdaptor,
         current_phase_tensor: torch.Tensor,
         grad_norm_hook: HookPointV1 | None = None,
-        router_weight_bindings: tuple[MegatronRouterWeightBinding, ...] = (),
-        qk_weight_bindings: tuple[tuple[HookPointV1, torch.nn.Parameter], ...] = (),
+        weight_captures: tuple = (),
     ) -> None:
         self.config = config
         self.model_id = model_id
@@ -136,8 +139,7 @@ class MegatronDMIHandle:
         self.adaptor = adaptor
         self.current_phase_tensor = current_phase_tensor
         self.grad_norm_hook = grad_norm_hook
-        self.router_weight_bindings = tuple(router_weight_bindings)
-        self.qk_weight_bindings = tuple(qk_weight_bindings)
+        self.weight_captures = tuple(weight_captures)
         self.closed = False
 
     def _emit_iteration_values(
@@ -146,6 +148,7 @@ class MegatronDMIHandle:
         global_batch_id: int,
         values: tuple[tuple[HookPointV1, torch.Tensor], ...],
         allow_zero: bool = False,
+        initial: bool = False,
     ) -> None:
         global_batch_id = int(global_batch_id)
         minimum = 0 if allow_zero else 1
@@ -161,7 +164,7 @@ class MegatronDMIHandle:
                 microbatch_id=-1,
                 valid_counts=(),
                 dataset_ids=(),
-                attempt_id=int(self.schedule_runtime.current_attempt_id),
+                attempt_id=(-1 if initial else int(self.schedule_runtime.current_attempt_id)),
                 direction="iter",
                 phase="train",
                 dp_rank=-1,
@@ -178,7 +181,7 @@ class MegatronDMIHandle:
 
     def emit_grad_norm(self, tensor: torch.Tensor, *, training_iteration_id: int) -> None:
         hook = self.grad_norm_hook
-        if hook is None:
+        if hook is None or not hook_enabled_in_phase(hook, "train"):
             return
         self._emit_iteration_values(
             global_batch_id=training_iteration_id,
@@ -188,8 +191,10 @@ class MegatronDMIHandle:
     def emit_router_weights(self, *, model_state_iteration_id: int, allow_zero: bool = False) -> None:
         self._emit_iteration_values(
             global_batch_id=model_state_iteration_id,
-            values=tuple((binding.hook, binding.parameter) for binding in self.router_weight_bindings),
+            values=((c.hook, c.pack()) for c in self.weight_captures
+                    if c.act_name == "router_projection_weight" and hook_enabled_in_phase(c.hook, "train")),
             allow_zero=allow_zero,
+            initial=allow_zero,
         )
 
     def emit_initial_router_weights(self, *, model_state_iteration_id: int) -> None:
@@ -199,11 +204,13 @@ class MegatronDMIHandle:
         )
 
     def emit_qk_weights(self, *, model_state_iteration_id: int, allow_zero: bool = False) -> None:
-        # Pass live QKV parameters; each hook preprocesses its own Q/K output.
+        # Capture assigned Q/K bytes from persistent model-weight storage.
         self._emit_iteration_values(
             global_batch_id=model_state_iteration_id,
-            values=self.qk_weight_bindings,
+            values=((c.hook, c.pack()) for c in self.weight_captures
+                    if c.act_name != "router_projection_weight" and hook_enabled_in_phase(c.hook, "train")),
             allow_zero=allow_zero,
+            initial=allow_zero,
         )
 
     def emit_initial_qk_weights(self, *, model_state_iteration_id: int) -> None:
@@ -298,6 +305,9 @@ def resolve_megatron_dmi_config(
         hook_selection=str(
             _env_value(args, "dmi_hook_selection", environ, "DMI_HOOK_SELECTION", "router-summary")
         ),
+        train_hook_selection=getattr(args, "dmi_train_hook_selection", None),
+        valid_hook_selection=getattr(args, "dmi_valid_hook_selection", None),
+        test_hook_selection=getattr(args, "dmi_test_hook_selection", None),
         layer_stride=int(getattr(args, "dmi_layer_stride", 1)),
         recompute_hook=_env_value(
             args,
@@ -624,8 +634,6 @@ def _shard_policy_allows(spec: MegatronHookSpec, rank_ctx: MegatronRankContext) 
         return True
     if policy in (ShardPolicy.TP_SHARDED, ShardPolicy.TP_SEQUENCE_SHARDED):
         # Emit every TP shard; layer placement and DP selection are checked separately.
-        # With CP > 1, Q/K weights are replicated across CP ranks, so these weight
-        # hooks will emit duplicate records. CP weight deduplication is unresolved.
         return True
     if policy == ShardPolicy.EP_SHARDED:
         return rank_ctx.tp_rank == 0 and rank_ctx.cp_rank == 0
@@ -684,7 +692,10 @@ def _validate_hook_contract(hook: HookPointV1) -> None:
         raise ValueError(f"Unsupported DMI record type: {spec.record_type!r}")
     if hook.hook_phase is not HookPhase.ITERATION:
         raise ValueError("PER_ITERATION hooks must use ITERATION phase")
-    if spec.dp_emission != DPEmissionPolicy.DP_RANK_0:
+    weight_fragments = (spec.name in WEIGHT_NAMES
+                        and spec.shard_policy is ShardPolicy.GLOBAL_RANK_SHARDED
+                        and spec.dp_emission is DPEmissionPolicy.ALL_DP_RANKS)
+    if spec.dp_emission != DPEmissionPolicy.DP_RANK_0 and not weight_fragments:
         raise ValueError("PER_ITERATION hooks must use DP_RANK_0 emission")
     if spec.shard_policy == ShardPolicy.DP_SHARDED:
         raise NotImplementedError("DP-sharded PER_ITERATION records are not supported")
@@ -1147,7 +1158,7 @@ def _install_router_logits_hooks(model: Any, *, dtype: torch.dtype) -> None:
             )
 
 
-def _install_router_topk_hooks(model: Any, *, dtype: torch.dtype) -> None:
+def _install_router_topk_hooks(model: Any, *, dtype: torch.dtype, selected_outputs: set[str] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
@@ -1161,11 +1172,16 @@ def _install_router_topk_hooks(model: Any, *, dtype: torch.dtype) -> None:
             layer_number = getattr(module, "layer_number", None)
             layer_no = -1 if layer_number is None else int(layer_number) - 1
             top_k = int(module.topk)
+            selected = selected_outputs or {"router_topk_expert_ids", "router_topk_weights"}
+            original_preprocess = module._dmi_router_topk_from_routing
+            def preprocess(*args, _compute=original_preprocess, _selected=selected, **kwargs):
+                values = _compute(*args, **kwargs)
+                return [value for name, value in zip(("router_topk_expert_ids", "router_topk_weights"), values) if name in _selected]
             module.dmi_router_topk = _make_hook(
                 MegatronHookSpec(
                     name="router_topk",
                     layer_no=layer_no,
-                    outputs=[
+                    outputs=[output for output in [
                         MegatronOutputSpec(
                             name="router_topk_expert_ids",
                             input_shape=[DimSpec.BATCH, DimSpec.SEQ, top_k],
@@ -1180,10 +1196,10 @@ def _install_router_topk_hooks(model: Any, *, dtype: torch.dtype) -> None:
                             dtype=dtype,
                             transport_type=TransportType.IDENTITY,
                         ),
-                    ],
-                    preprocess=module._dmi_router_topk_from_routing,
+                    ] if output.name in selected],
+                    preprocess=preprocess,
                     shard_policy=ShardPolicy.GLOBAL_RANK_SHARDED,
-                    enabled_by=frozenset({"router-topk"}),
+                    enabled_by=frozenset({"router-topk", "router-topk-expert-ids", "router-topk-weights"}),
                     need_token_range=True,
                 ),
                 hook_phase=HookPhase.FWD,
@@ -1691,196 +1707,6 @@ def _make_attempt_status_hook() -> HookPointV1:
     return hook
 
 
-def _router_weight_bindings(
-    model: Any,
-    *,
-    rank_ctx: MegatronRankContext,
-    num_experts: int,
-    hidden_size: int,
-) -> tuple[tuple[MegatronHookBinding, ...], tuple[MegatronRouterWeightBinding, ...]]:
-    discovered: list[tuple[int, torch.nn.Parameter]] = []
-    seen_modules: set[int] = set()
-    for root in _model_roots(model):
-        for module in root.modules():
-            if module.__class__.__name__ != "TopKRouter" or id(module) in seen_modules:
-                continue
-            seen_modules.add(id(module))
-            layer_number = getattr(module, "layer_number", None)
-            if layer_number is None:
-                raise ValueError("DMI router-weight collection requires a global layer number")
-            layer_no = int(layer_number) - 1
-            if layer_no < 0:
-                raise ValueError(f"Invalid DMI router global layer number: {layer_number}")
-            weight = getattr(module, "weight", None)
-            if not isinstance(weight, torch.nn.Parameter):
-                raise TypeError(f"TopKRouter layer {layer_no} weight is not a Parameter")
-            if not weight.is_cuda:
-                raise RuntimeError(f"TopKRouter layer {layer_no} weight must be CUDA-resident")
-            expected_shape = (int(num_experts), int(hidden_size))
-            if tuple(int(x) for x in weight.shape) != expected_shape:
-                raise ValueError(
-                    f"TopKRouter layer {layer_no} weight shape {tuple(weight.shape)} "
-                    f"does not match complete router shape {expected_shape}"
-                )
-            if any(
-                bool(getattr(weight, name, False))
-                for name in ("tensor_model_parallel", "expert_model_parallel", "context_parallel")
-            ):
-                raise NotImplementedError(
-                    f"TopKRouter layer {layer_no} weight is model-parallel sharded"
-                )
-            discovered.append((layer_no, weight))
-
-    layer_nos = [layer_no for layer_no, _ in discovered]
-    if len(layer_nos) != len(set(layer_nos)):
-        raise ValueError(f"Duplicate local TopKRouter layer numbers: {sorted(layer_nos)}")
-
-    hook_bindings: list[MegatronHookBinding] = []
-    parameter_bindings: list[MegatronRouterWeightBinding] = []
-    for layer_no, weight in sorted(discovered):
-        hook = _make_hook(
-            MegatronHookSpec(
-                name="router_projection_weight",
-                layer_no=layer_no,
-                outputs=[
-                    MegatronOutputSpec(
-                        name="router_projection_weight",
-                        input_shape=[int(num_experts), int(hidden_size)],
-                        output_shape=[int(num_experts), int(hidden_size)],
-                        dtype=weight.dtype,
-                        transport_type=TransportType.IDENTITY,
-                        storage=OutputStorage.TENSOR,
-                    )
-                ],
-                shard_policy=ShardPolicy.REPLICATED,
-                layer_placement=HookLayerPlacement.EVERY_LAYER,
-                enabled_by=frozenset({"router-weights"}),
-                need_token_range=False,
-                record_type=RecordType.PER_ITERATION,
-                dp_emission=DPEmissionPolicy.DP_RANK_0,
-            ),
-            hook_phase=HookPhase.ITERATION,
-        )
-        _validate_hook_contract(hook)
-        if not _spec_active_on_rank(_megatron_hook_spec(hook), rank_ctx):
-            hook.enabled = False
-            continue
-        hook_bindings.append(
-            MegatronHookBinding(
-                hook=hook,
-                record_dp_rank=-1,
-                record_shard_rank=0,
-            )
-        )
-        parameter_bindings.append(
-            MegatronRouterWeightBinding(hook=hook, parameter=weight)
-        )
-    return tuple(hook_bindings), tuple(parameter_bindings)
-
-
-def _qk_weight_bindings(
-    model: Any,
-    *,
-    rank_ctx: MegatronRankContext,
-    selected_hooks: set[str],
-) -> tuple[
-    tuple[MegatronHookBinding, ...],
-    tuple[tuple[HookPointV1, torch.nn.Parameter], ...],
-]:
-    """Bind standard Megatron/OLMoE self-attention Q/K weights, never V."""
-    hook_bindings: list[MegatronHookBinding] = []
-    parameter_bindings: list[tuple[HookPointV1, torch.nn.Parameter]] = []
-    seen_modules: set[int] = set()
-    seen_layers: set[int] = set()
-    for root in _model_roots(model):
-        for module in root.modules():
-            # Include subclasses such as OlmoeSelfAttention, but not the nested
-            # DotProductAttention, which also has attention_type="self".
-            if not any(cls.__name__ == "SelfAttention" for cls in type(module).__mro__):
-                continue
-            if id(module) in seen_modules:
-                continue
-            seen_modules.add(id(module))
-            layer_number = getattr(module, "layer_number", None)
-            if layer_number is None or int(layer_number) <= 0:
-                raise ValueError("DMI Q/K weights require a positive global layer number")
-            layer_no = int(layer_number) - 1
-            if layer_no in seen_layers:
-                raise ValueError(f"Duplicate local self-attention layer number: {layer_number}")
-            seen_layers.add(layer_no)
-            config = module.config
-            if bool(getattr(config, "attention_output_gate", False)):
-                raise NotImplementedError("DMI Q/K weights do not support gated attention")
-            if int(config.num_query_groups) < rank_ctx.tp_world_size:
-                raise NotImplementedError("DMI Q/K weights require TP size <= number of KV heads")
-            if getattr(config, "fp8", None) or getattr(config, "fp4", None):
-                raise NotImplementedError("DMI Q/K weights require non-quantized QKV parameters")
-            linear = getattr(module, "linear_qkv", None)
-            weight = getattr(linear, "weight", None)
-            if not isinstance(weight, torch.nn.Parameter):
-                raise TypeError(f"Self-attention layer {layer_no} requires a fused QKV Parameter")
-            if not weight.is_cuda:
-                raise RuntimeError(f"Self-attention layer {layer_no} QKV weight must be CUDA-resident")
-            groups = int(module.num_query_groups_per_partition)
-            heads = int(module.num_attention_heads_per_partition)
-            head_dim = int(module.hidden_size_per_attention_head)
-            if min(groups, heads, head_dim) <= 0 or heads % groups:
-                raise ValueError(f"Invalid local QKV head layout at layer {layer_no}")
-            query_rows = (heads // groups) * head_dim
-            hidden_size = int(config.hidden_size)
-            expected = (groups * (query_rows + 2 * head_dim), hidden_size)
-            if tuple(weight.shape) != expected or not weight.is_contiguous():
-                raise ValueError(
-                    f"Self-attention layer {layer_no} requires contiguous grouped QKV "
-                    f"shape {expected}, got {tuple(weight.shape)}"
-                )
-            for projection, name, width in (
-                ("q", "query_projection_weight", query_rows),
-                ("k", "key_projection_weight", head_dim),
-            ):
-                selection = f"{projection}-weights"
-                if selection not in selected_hooks:
-                    continue
-                shape = [groups * width, hidden_size]
-                hook = _make_hook(
-                    MegatronHookSpec(
-                        name=name,
-                        layer_no=layer_no,
-                        outputs=[MegatronOutputSpec(
-                            name=name,
-                            input_shape=shape,
-                            output_shape=shape,
-                            dtype=weight.dtype,
-                            transport_type=TransportType.IDENTITY,
-                            storage=OutputStorage.TENSOR,
-                        )],
-                        preprocess=partial(
-                            qk_weight_from_fused_qkv,
-                            num_query_groups=groups,
-                            query_rows_per_group=query_rows,
-                            head_dim=head_dim,
-                            projection=projection,
-                        ),
-                        shard_policy=ShardPolicy.TP_SHARDED,
-                        layer_placement=HookLayerPlacement.EVERY_LAYER,
-                        enabled_by=frozenset({selection}),
-                        need_token_range=False,
-                        record_type=RecordType.PER_ITERATION,
-                        dp_emission=DPEmissionPolicy.DP_RANK_0,
-                    ),
-                    hook_phase=HookPhase.ITERATION,
-                )
-                _validate_hook_contract(hook)
-                if not _spec_active_on_rank(_megatron_hook_spec(hook), rank_ctx):
-                    hook.enabled = False
-                    continue
-                hook_bindings.append(MegatronHookBinding(
-                    hook=hook, record_dp_rank=-1, record_shard_rank=rank_ctx.tp_rank,
-                ))
-                parameter_bindings.append((hook, weight))
-    return tuple(hook_bindings), tuple(parameter_bindings)
-
-
 def _model_roots(model: Any) -> list[torch.nn.Module]:
     if isinstance(model, torch.nn.Module):
         return [model]
@@ -1896,9 +1722,7 @@ def _collect_selected_hooks(
     model: Any,
     hook_selection: str,
 ) -> list[MegatronHookBinding]:
-    selected = {name.strip() for name in str(hook_selection).split(",")}
-    if "" in selected:
-        raise ValueError(f"Invalid empty DMI hook selection entry: {hook_selection!r}")
+    selected = parse_hook_selection(hook_selection)
     hooks: list[MegatronHookBinding] = []
     roots = _model_roots(model)
     for root_index, root in enumerate(roots):
@@ -2386,7 +2210,7 @@ def _freeze_ep_topology_manifest(
     model_config: Any,
     parallel_state: Any,
     dist_module: Any,
-) -> None:
+) -> FrozenMegatronEPTopologyManifest:
     if not _dist_ready(dist_module):
         raise RuntimeError("DMI topology manifest requires initialized torch.distributed")
     fragment = _build_ep_topology_fragment(
@@ -2404,6 +2228,7 @@ def _freeze_ep_topology_manifest(
     manifest = assemble_ep_topology_manifest(gathered)
     if int(global_rank) == 0:
         write_ep_topology_manifest(path, manifest)
+    return manifest
 
 
 def setup_megatron_dmi(
@@ -2466,7 +2291,24 @@ def setup_megatron_dmi(
     max_num_microbatches = _max_num_microbatches(args, dp_world)
     max_batch_size = int(getattr(args, "micro_batch_size"))
     scopes = _num_scopes(parallel_state_module)
-    selected_hooks = _selected_hooks(cfg.hook_selection)
+    additional_names = set()
+    for root in _model_roots(model):
+        for module in root.modules():
+            if isinstance(module, HookPointV1):
+                additional_names.update(_megatron_hook_spec(module).enabled_by)
+    requested_names = set().union(*(parse_hook_selection(value) for value in (
+        cfg.hook_selection, cfg.train_hook_selection, cfg.valid_hook_selection,
+        cfg.test_hook_selection) if value is not None))
+    if requested_names - HOOK_SELECTION_NAMES and _dist_ready(dist_for_rank):
+        names_by_rank = [None] * dist_for_rank.get_world_size()
+        dist_for_rank.all_gather_object(names_by_rank, additional_names)
+        additional_names = set().union(*names_by_rank)
+    phase_selections = resolve_phase_hook_selections(
+        cfg.hook_selection, train=cfg.train_hook_selection,
+        valid=cfg.valid_hook_selection, test=cfg.test_hook_selection,
+        additional_names=additional_names,
+    )
+    selected_hooks = set().union(*phase_selections.values())
     tp_world = _parallel_world(
         parallel_state_module, "get_tensor_model_parallel_world_size"
     )
@@ -2544,16 +2386,6 @@ def setup_megatron_dmi(
     weight_selections = {"router-weights", "q-weights", "k-weights"} & selected_hooks
     if weight_selections:
         weight_names = ",".join(sorted(weight_selections))
-        weight_dp_world = int(
-            parallel_state_module.get_data_parallel_world_size(
-                with_context_parallel=False
-            )
-        )
-        if weight_dp_world != 1:
-            raise NotImplementedError(
-                f"DMI {weight_names} requires data-parallel world size exactly 1; "
-                f"got {weight_dp_world}"
-            )
         if bool(getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)) and bool(
             getattr(args, "overlap_param_gather", False)
         ):
@@ -2578,7 +2410,7 @@ def setup_megatron_dmi(
         "moe-packed-weighted-output",
     } & selected_hooks:
         dims[DimSpec.HIDDEN] = _hidden_size(model_config)
-    if {"router-logits", "router-topk", "hidden-states", "moe-input", "resid_final"} & selected_hooks:
+    if {"router-logits", "router-topk", "router-topk-expert-ids", "router-topk-weights", "hidden-states", "moe-input", "resid_final"} & selected_hooks:
         dims[DimSpec.SEQ] = _seq_length(args)
     if selected_vocab_hooks:
         dims[DimSpec.SEQ] = _seq_length(args)
@@ -2632,10 +2464,13 @@ def setup_megatron_dmi(
                 unwrapped,
                 dtype=_router_logits_dtype(model_config),
             )
-        if "router-topk" in selected_hooks:
+        if {"router-topk", "router-topk-expert-ids", "router-topk-weights"} & selected_hooks:
             _install_router_topk_hooks(
                 unwrapped,
                 dtype=_router_logits_dtype(model_config),
+                selected_outputs=(None if "router-topk" in selected_hooks else
+                    {name for flag, name in (("router-topk-expert-ids", "router_topk_expert_ids"),
+                                              ("router-topk-weights", "router_topk_weights")) if flag in selected_hooks}),
             )
         if "moe-input" in selected_hooks:
             _install_moe_input_hooks(unwrapped)
@@ -2698,7 +2533,7 @@ def setup_megatron_dmi(
                 "DMI resid_final requires a TransformerBlock with final_layernorm "
                 "on the last pipeline stage"
             )
-        selected_model_hooks = _collect_selected_hooks(unwrapped, cfg.hook_selection)
+        selected_model_hooks = _collect_selected_hooks(unwrapped, ",".join(sorted(selected_hooks)) or "none")
         selected_model_hooks = _select_hook_layers(
             selected_model_hooks, num_layers=rank_ctx.num_layers, layer_stride=cfg.layer_stride,
         )
@@ -2719,7 +2554,11 @@ def setup_megatron_dmi(
             )
         _apply_recompute_hook_policy(
             selected_model_hooks,
-            selected_names=selected_hooks,
+            selected_names=selected_hooks | (
+                {"router-topk"} if selected_hooks & {
+                    "router-topk-expert-ids", "router-topk-weights"
+                } else set()
+            ),
             recompute_names_raw=cfg.recompute_hook,
             no_recompute_names_raw=cfg.no_recompute_hook,
         )
@@ -2778,39 +2617,64 @@ def setup_megatron_dmi(
                     )
                 )
 
-        router_weight_bindings: tuple[MegatronRouterWeightBinding, ...] = ()
-        if "router-weights" in selected_hooks:
-            router_hooks, router_weight_bindings = _router_weight_bindings(
-                unwrapped,
-                rank_ctx=rank_ctx,
-                num_experts=int(dims[DimSpec.NUM_EXPERTS]),
-                hidden_size=int(dims[DimSpec.HIDDEN]),
-            )
-            iteration_hooks.extend(router_hooks)
-
-        qk_weight_bindings: tuple[tuple[HookPointV1, torch.nn.Parameter], ...] = ()
-        if {"q-weights", "k-weights"} & selected_hooks:
-            qk_hooks, qk_weight_bindings = _qk_weight_bindings(
-                unwrapped, rank_ctx=rank_ctx, selected_hooks=selected_hooks,
-            )
-            iteration_hooks.extend(qk_hooks)
+        weight_captures = discover_weight_captures(model, rank_ctx, selected_hooks) if weight_selections else []
+        weight_captures = [c for c in weight_captures if c.layer_no % cfg.layer_stride == 0]
+        weight_layouts = []
+        if weight_selections:
+            if (max(rank_ctx.tp_world_size, rank_ctx.dp_world_size, rank_ctx.cp_world_size,
+                    rank_ctx.pp_world_size) > 1 and not _dist_ready(dist_for_rank)):
+                raise RuntimeError("Distributed weight capture requires an initialized process group")
+            report = [c.report() for c in weight_captures]
+            reports = [report]
+            if _dist_ready(dist_for_rank):
+                reports = [None] * dist_for_rank.get_world_size()
+                dist_for_rank.all_gather_object(reports, report)
+            weight_layouts = assign_weight_fragments([r for chunk in reports for r in chunk])
+            local_layouts = {(r["layer_no"], r["act_name"]): r for r in weight_layouts
+                             if r["producer_rank"] == rank}
+            for capture in weight_captures:
+                capture.assigned = local_layouts[(capture.layer_no, capture.act_name)]["fragments"]
+                nbytes = sum(length for _, _, length in capture.assigned)
+                hook = _make_hook(MegatronHookSpec(
+                    name=capture.act_name, layer_no=capture.layer_no,
+                    outputs=[MegatronOutputSpec(name=capture.act_name,
+                        input_shape=[nbytes], output_shape=[nbytes], dtype=torch.uint8,
+                        transport_type=TransportType.IDENTITY, storage=OutputStorage.TENSOR)],
+                    shard_policy=ShardPolicy.GLOBAL_RANK_SHARDED,
+                    layer_placement=HookLayerPlacement.EVERY_LAYER,
+                    enabled_by=frozenset({{"query_projection_weight": "q-weights",
+                        "key_projection_weight": "k-weights",
+                        "router_projection_weight": "router-weights"}[capture.act_name]}),
+                    need_token_range=False, record_type=RecordType.PER_ITERATION,
+                    dp_emission=DPEmissionPolicy.ALL_DP_RANKS), hook_phase=HookPhase.ITERATION)
+                _validate_hook_contract(hook)
+                capture.hook = hook
+                iteration_hooks.append(MegatronHookBinding(hook=hook, record_dp_rank=-1,
+                                                          record_shard_rank=rank))
 
         if cfg.layer_stride != 1:
             iteration_hooks = _select_hook_layers(
                 iteration_hooks, num_layers=rank_ctx.num_layers, layer_stride=cfg.layer_stride,
             )
-            active_iteration_ids = {id(binding.hook) for binding in iteration_hooks}
-            router_weight_bindings = tuple(
-                binding for binding in router_weight_bindings
-                if id(binding.hook) in active_iteration_ids
-            )
-            qk_weight_bindings = tuple(
-                binding for binding in qk_weight_bindings
-                if id(binding[0]) in active_iteration_ids
-            )
 
         for binding in (*active_model_hooks, *iteration_hooks):
-            binding.hook.megatron_distributed_info = distributed_info
+            hook = binding.hook
+            names = set(_megatron_hook_spec(hook).enabled_by)
+            # Metadata hooks with no selection name remain unconditional.
+            hook.megatron_enabled_phases = frozenset(
+                phase for phase, selected in phase_selections.items()
+                if not names or names & selected
+            )
+            if _megatron_hook_spec(hook).name == "router_topk":
+                # The existing multi-output hook has independently selectable
+                # IDs/weights. Filter each output before producer-plan recording.
+                hook.megatron_output_phases = {
+                    output.name: frozenset(phase for phase, selected in phase_selections.items()
+                        if {"router_topk_expert_ids": "router-topk-expert-ids",
+                            "router_topk_weights": "router-topk-weights"}[output.name] in selected)
+                    for output in _megatron_hook_spec(hook).outputs
+                }
+            hook.megatron_distributed_info = distributed_info
         has_active_tp_sequence_hook = any(
             _megatron_hook_spec(binding.hook).shard_policy
             is ShardPolicy.TP_SEQUENCE_SHARDED
@@ -2827,7 +2691,7 @@ def setup_megatron_dmi(
             segment_capacity=segment_capacity,
         )
 
-        record_format = MegatronRecordFormat(cfg.clickhouse_table)
+        record_format = MegatronRecordFormat(cfg.clickhouse_table, producer_rank=rank)
         engine, host_engine = (
             engine_factory(cfg, model_id, record_format, rank)
             if engine_factory is not None
@@ -2858,6 +2722,29 @@ def setup_megatron_dmi(
             tp_sequence_sharded_enabled=has_active_tp_sequence_hook,
             host_engine=host_engine,
         )
+        if host_engine is not None:
+            # Top-K indices are local to the vocabulary presented to the hook.
+            # K (the captured payload width) cannot recover this partition size.
+            vocab_partition_size = 0
+            for binding in active_model_hooks:
+                spec = _megatron_hook_spec(binding.hook)
+                if spec.name in ("vocab_logits", "vocab_logits_topk"):
+                    vocab_partition_size = int(padded_vocab_size)
+                    if spec.shard_policy is ShardPolicy.TP_SHARDED:
+                        vocab_partition_size //= tp_world
+            weight_layout_json = json.dumps([r for r in weight_layouts
+                if r["producer_rank"] == rank], separators=(",", ":"))
+            host_engine.submit_record(
+                "capture_topology",
+                (model_id, rank, distributed_info.tp_rank, distributed_info.tp_world_size,
+                 distributed_info.pp_rank, distributed_info.dp_rank, distributed_info.cp_rank,
+                 vocab_partition_size, weight_layout_json),
+                ("string", "int32", "int32", "int32", "int32", "int32", "int32", "int64", "string"),
+                nbytes=32 + len(weight_layout_json.encode("utf-8")),
+            )
+        runtime.phase_hook_selections_differ = len(set(phase_selections.values())) > 1
+        runtime.record_format = record_format
+        runtime.producer_rank = rank
         runtime.configure_d2h_windows(
             enabled=cfg.recurring_d2h_windows_enabled, debug=cfg.d2h_window_debug,
         )
@@ -2931,12 +2818,11 @@ def setup_megatron_dmi(
             adaptor=adaptor,
             current_phase_tensor=current_phase_tensor,
             grad_norm_hook=grad_norm_hook,
-            router_weight_bindings=router_weight_bindings,
-            qk_weight_bindings=qk_weight_bindings,
+            weight_captures=tuple(weight_captures),
         )
         if requires_ep_topology_manifest:
             assert cfg.topology_manifest_path is not None
-            _freeze_ep_topology_manifest(
+            manifest = _freeze_ep_topology_manifest(
                 path=cfg.topology_manifest_path,
                 model_id=model_id,
                 global_rank=rank,
@@ -2945,6 +2831,10 @@ def setup_megatron_dmi(
                 parallel_state=parallel_state_module,
                 dist_module=dist_for_rank,
             )
+            if rank == 0 and host_engine is not None:
+                manifest_json = json.dumps(manifest.to_dict())
+                host_engine.submit_record("topology_manifest", (model_id, manifest_json),
+                                          ("string", "string"), nbytes=len(manifest_json.encode("utf-8")))
         setattr(
             args,
             "dmi_required_metadata_fields",

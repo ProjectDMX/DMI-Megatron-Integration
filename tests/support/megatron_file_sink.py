@@ -31,7 +31,7 @@ from dmi_megatron_integration.records.schema import (
 )
 
 
-_METADATA_COLUMNS = TRAINING_ROW_COORDINATE_COLUMN_NAMES
+_METADATA_COLUMNS = TRAINING_ROW_COORDINATE_COLUMN_NAMES + ("producer_rank",)
 
 _DTYPE_NAMES: dict[torch.dtype, str] = {
     torch.float32: "torch.float",

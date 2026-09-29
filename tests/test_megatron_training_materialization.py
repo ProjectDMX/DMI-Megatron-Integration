@@ -344,3 +344,21 @@ def test_materializer_refuses_raw_database_as_processed_database() -> None:
                 "1",
             ]
         )
+
+
+def test_router_weight_consumer_merges_new_fragments_for_same_iteration(monkeypatch):
+    from tests.test_weight_capture import make_case, materialize
+    captures, expected = make_case(tp=2, fsdp=3, replicas=2, dtype=torch.float32)
+    payload, topology = materialize(captures)
+    args = _args(raw_db='raw_db',raw_table='raw',model_id='run',
+                 expected_layer_count=1,expected_expert_count=5,expected_hidden_size=7)
+    raw = [('iter','train',3,-1,-1,-1,0,r['producer_rank'],0,1,1,0,-1,
+            'torch.uint8',list(r['value'].shape),r['value'].numpy().tobytes())
+           for r in payload if r['act_name']=='router_projection_weight']
+    def execute(client, query, parameters):
+        if 'weight_layout_json' in query:
+            return [(r['model_id'],r['producer_rank'],r['weight_layout_json']) for r in topology]
+        return raw
+    monkeypatch.setattr(materializer,'_raw_execute',execute)
+    result=materializer._read_router_weight_state(None,args,state_id=3,accepted_attempts={3:1})
+    torch.testing.assert_close(result[0],expected['router_projection_weight'])

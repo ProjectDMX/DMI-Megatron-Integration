@@ -23,6 +23,8 @@ classifiers = [
 ]
 dependencies = [
     "DMI>=1.2.0,<2.0",
+    "PyYAML>=6.0",
+    "clickhouse-driver>=0.2.9",
 ]
 
 [project.urls]

@@ -27,7 +27,7 @@ _EXPERT_IDS = "router_topk_expert_ids"
 _ROUTER_WEIGHTS = "router_topk_weights"
 _INVERSE_MAP = "moe_inverse_map"
 _PACKED_OUTPUT = "moe_packed_weighted_output"
-_REQUIRED_ACT_NAMES = (_EXPERT_IDS, _ROUTER_WEIGHTS, _INVERSE_MAP, _PACKED_OUTPUT)
+_REQUIRED_ACT_NAMES = (_EXPERT_IDS, _INVERSE_MAP, _PACKED_OUTPUT)
 
 
 @dataclass(frozen=True)
@@ -114,22 +114,22 @@ def _assemble_router_shards(
     manifest: FrozenMegatronEPTopologyManifest,
     key: MoEExecutionKey,
     ids_rows: Sequence[_TrainingTensorRow],
-    weight_rows: Sequence[_TrainingTensorRow],
+    weight_rows: Sequence[_TrainingTensorRow] | None,
 ) -> tuple[tuple[RouterExpertIdsShard, ...], tuple[RouterWeightsShard, ...]]:
     topology = manifest.topology_for_layer(key.layer_no)
     producer_ranks = {
         rank for dispatch_group in topology.dispatch_groups for rank in dispatch_group
     }
     ids_index = _unique_rows(ids_rows, "router expert-ID")
-    weights_index = _unique_rows(weight_rows, "router weight")
-    if set(ids_index) != set(weights_index):
+    weights_index = _unique_rows(weight_rows or (), "router weight")
+    if weight_rows is not None and set(ids_index) != set(weights_index):
         raise ValueError("Router expert-ID and weight row coordinates disagree")
 
     ids_by_rank: dict[int, list[_TrainingTensorRow]] = {}
     weights_by_rank: dict[int, list[_TrainingTensorRow]] = {}
     for position, ids_row in ids_index.items():
         ids_by_rank.setdefault(ids_row.shard_rank, []).append(ids_row)
-        weights_by_rank.setdefault(ids_row.shard_rank, []).append(weights_index[position])
+        weights_by_rank.setdefault(ids_row.shard_rank, []).append(weights_index.get(position))
     if set(ids_by_rank) != producer_ranks:
         raise ValueError("Router rows do not cover exactly the manifest producer ranks")
 
@@ -190,13 +190,13 @@ def _assemble_router_shards(
         local_seq_extent: int | None = None
         dense_dp_rank = topology.dense_dp_rank_by_global_rank[producer_rank]
         for ids_row, weights_row in paired:
-            if ids_row.dp_rank != dense_dp_rank or weights_row.dp_rank != dense_dp_rank:
+            if ids_row.dp_rank != dense_dp_rank or (weights_row is not None and weights_row.dp_rank != dense_dp_rank):
                 raise ValueError(
                     f"Producer rank {producer_rank} has the wrong dense-DP coordinate"
                 )
-            if ids_row.tensor.ndim != 2 or weights_row.tensor.ndim != 2:
+            if ids_row.tensor.ndim != 2 or (weights_row is not None and weights_row.tensor.ndim != 2):
                 raise ValueError("Persisted router rows must have shape [local_seq, top_k]")
-            if tuple(ids_row.tensor.shape) != tuple(weights_row.tensor.shape):
+            if weights_row is not None and tuple(ids_row.tensor.shape) != tuple(weights_row.tensor.shape):
                 raise ValueError("Persisted router ID and weight row shapes disagree")
             if int(ids_row.tensor.shape[1]) != topology.top_k:
                 raise ValueError("Persisted router row top-k disagrees with the manifest")
@@ -228,7 +228,8 @@ def _assemble_router_shards(
                 if global_token_index >= ids_row.token_end:
                     continue
                 compact_ids.append(ids_row.tensor[local_token_index])
-                compact_weights.append(weights_row.tensor[local_token_index])
+                if weights_row is not None:
+                    compact_weights.append(weights_row.tensor[local_token_index])
                 token_coordinates.append(
                     SourceTokenCoordinate(
                         dataset_id=ids_row.dataset_id,
@@ -241,17 +242,14 @@ def _assemble_router_shards(
                 )
 
         ids_template = paired[0][0].tensor
-        weights_template = paired[0][1].tensor
         ids_tensor = (
             torch.stack(compact_ids, dim=0)
             if compact_ids
             else ids_template.new_empty((0, topology.top_k))
         )
-        weights_tensor = (
-            torch.stack(compact_weights, dim=0)
-            if compact_weights
-            else weights_template.new_empty((0, topology.top_k))
-        )
+        if weight_rows is not None:
+            weights_template = paired[0][1].tensor
+            weights_tensor = torch.stack(compact_weights, dim=0) if compact_weights else weights_template.new_empty((0, topology.top_k))
         ids_shards.append(
             RouterExpertIdsShard(
                 key=key,
@@ -262,15 +260,17 @@ def _assemble_router_shards(
                 source_flat_indices=tuple(source_flat_indices),
             )
         )
-        weight_shards.append(
-            RouterWeightsShard(
-                key=key,
-                producer_rank=producer_rank,
-                dense_dp_rank=dense_dp_rank,
-                token_coordinates=tuple(token_coordinates),
-                tensor=weights_tensor,
+        if weight_rows is not None:
+            weight_shards.append(
+                RouterWeightsShard(
+                    key=key,
+                    producer_rank=producer_rank,
+                    dense_dp_rank=dense_dp_rank,
+                    token_coordinates=tuple(token_coordinates),
+                    tensor=weights_tensor,
+                )
             )
-        )
+
 
     ids_shard_by_rank = {shard.producer_rank: shard for shard in ids_shards}
     for tp_group in manifest.tp_groups:
@@ -340,10 +340,9 @@ def reconstruct_moe_clickhouse_rows(
     if missing:
         raise ValueError(f"Missing MoE payload kinds: {missing}")
 
-    grouped: dict[str, dict[MoEExecutionKey, list[_TrainingTensorRow]]] = {
-        name: {} for name in _REQUIRED_ACT_NAMES
-    }
-    for act_name in _REQUIRED_ACT_NAMES:
+    names = _REQUIRED_ACT_NAMES + ((_ROUTER_WEIGHTS,) if _ROUTER_WEIGHTS in rows_by_act else ())
+    grouped: dict[str, dict[MoEExecutionKey, list[_TrainingTensorRow]]] = {name: {} for name in names}
+    for act_name in names:
         for coordinates, tensor in rows_by_act[act_name]:
             row = _parse_row(coordinates, tensor)
             if row.act_name != act_name:
@@ -354,7 +353,7 @@ def reconstruct_moe_clickhouse_rows(
                 raise ValueError("Training row model_id disagrees with the topology manifest")
             grouped[act_name].setdefault(row.key, []).append(row)
 
-    key_sets = [set(grouped[name]) for name in _REQUIRED_ACT_NAMES]
+    key_sets = [set(grouped[name]) for name in names]
     if not key_sets[0] or any(keys != key_sets[0] for keys in key_sets[1:]):
         raise ValueError("MoE payload kinds do not contain the same execution keys")
 
@@ -379,7 +378,7 @@ def reconstruct_moe_clickhouse_rows(
             manifest,
             key,
             grouped[_EXPERT_IDS][key],
-            grouped[_ROUTER_WEIGHTS][key],
+            grouped[_ROUTER_WEIGHTS][key] if _ROUTER_WEIGHTS in grouped else None,
         )
         inverse_by_rank = _execution_payloads_by_rank(
             grouped[_INVERSE_MAP][key],
@@ -395,7 +394,7 @@ def reconstruct_moe_clickhouse_rows(
             reconstruct_moe_invocation(
                 topology,
                 expert_id_shards=expert_id_shards,
-                weight_shards=weight_shards,
+                weight_shards=weight_shards if _ROUTER_WEIGHTS in grouped else None,
                 inverse_map_shards=tuple(
                     InverseMapShard(key, rank, inverse_by_rank[rank])
                     for rank in sorted(producer_ranks)
