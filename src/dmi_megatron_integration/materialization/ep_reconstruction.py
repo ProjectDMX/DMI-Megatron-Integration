@@ -65,6 +65,12 @@ class MoEParallelTopology:
     dropless: bool = True
     padded: bool = False
 
+    def ordered_sources(self, dispatch_group: Sequence[int]) -> tuple[int, ...]:
+        """Physical source order: ETP-major then EP, not raw group rank order."""
+        ep = {rank: index for group in self.ep_groups for index, rank in enumerate(group)}
+        etp = {rank: index for group in self.etp_groups for index, rank in enumerate(group)}
+        return tuple(sorted(dispatch_group, key=lambda rank: (etp[rank], ep[rank])))
+
     def __post_init__(self) -> None:
         if self.context_parallel_size <= 0:
             raise ValueError("context_parallel_size must be positive")
@@ -242,6 +248,7 @@ def reconstruct_moe_invocation(
     weight_shards: Sequence[RouterWeightsShard] | None = None,
     inverse_map_shards: Sequence[InverseMapShard],
     packed_output_shards: Sequence[PackedWeightedOutputShard],
+    selected_sources: Sequence[int] | None = None,
 ) -> ReconstructedMoEInvocation:
     """Reconstruct one logical MoE invocation for the supported CP=1 path."""
 
@@ -286,6 +293,9 @@ def reconstruct_moe_invocation(
     producer_ranks = {
         rank for group in topology.dispatch_groups for rank in group
     }
+    retained_sources = producer_ranks if selected_sources is None else set(selected_sources)
+    if not retained_sources.issubset(producer_ranks):
+        raise ValueError("Selected sources are outside the dispatch topology")
     for name, records in (
         ("expert-ID", ids_by_rank),
         ("inverse-map", inverse_by_rank),
@@ -448,6 +458,7 @@ def reconstruct_moe_invocation(
             common_layout,
             key=lambda route: local_expert_position[route[2]],
         )
+        common_layout = [route for route in common_layout if route[0] in retained_sources]
         partials: list[torch.Tensor] = []
         for producer_rank in etp_group:
             packed_record = packed_by_rank[producer_rank]
@@ -483,6 +494,7 @@ def reconstruct_moe_invocation(
     expected_route_keys = {
         (producer_rank, route_index)
         for producer_rank, (token_count, top_k) in source_shapes.items()
+        if producer_rank in retained_sources
         for route_index in range(token_count * top_k)
     }
     if set(route_outputs) != expected_route_keys:
@@ -502,6 +514,8 @@ def reconstruct_moe_invocation(
         ],
     ] = {}
     for producer_rank in sorted(producer_ranks):
+        if producer_rank not in retained_sources or source_shapes[producer_rank][0] == 0:
+            continue
         ids_record = ids_by_rank[producer_rank]
         weights_record = weights_by_rank.get(producer_rank)
         assert isinstance(ids_record, RouterExpertIdsShard)

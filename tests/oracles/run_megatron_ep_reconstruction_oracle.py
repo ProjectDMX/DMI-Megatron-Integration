@@ -18,6 +18,14 @@ _ORACLE_OUTPUTS: dict[int, list[torch.Tensor]] = defaultdict(list)
 
 def _record_moe_output(layer_no: int):
     def record(_module: torch.nn.Module, _inputs: tuple[Any, ...], outputs: Any) -> None:
+        # Partial MoE graph capture returns dispatch inputs, not expert outputs.
+        # Its eager continuation may return the postprocessed tensor directly.
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+        if is_graph_capturing():
+            return
+        if isinstance(outputs, torch.Tensor) and "postprocess" in _module.fwd_execution_map:
+            _ORACLE_OUTPUTS[layer_no].append(outputs.detach().cpu().clone())
+            return
         if not isinstance(outputs, tuple) or len(outputs) != 2:
             raise TypeError("Controlled eager MoELayer output must be (output, mlp_bias)")
         output, mlp_bias = outputs

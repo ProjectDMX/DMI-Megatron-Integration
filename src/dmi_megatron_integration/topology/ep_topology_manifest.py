@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -116,6 +116,7 @@ class MegatronEPTopologyFragment:
     etp_composition: str
     dropless: bool
     padded: bool
+    hook_capture: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.model_id:
@@ -181,6 +182,7 @@ class FrozenMegatronEPTopologyManifest:
     etp_composition: str
     dropless: bool
     padded: bool
+    hook_capture: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.model_id:
@@ -219,6 +221,10 @@ class FrozenMegatronEPTopologyManifest:
             raise ValueError("Only matching-row ETP summation is supported")
         if not self.dropless or self.padded:
             raise ValueError("The manifest requires dropless, unpadded execution")
+        from ..hooks.source_sampling import EP_OUTPUT, SourceSampling
+        sampling = self.hook_capture.get(EP_OUTPUT, {}).get("source_sampling")
+        if sampling is not None:
+            SourceSampling.from_dict(sampling)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -245,6 +251,7 @@ class FrozenMegatronEPTopologyManifest:
             "etp_composition": self.etp_composition,
             "dropless": self.dropless,
             "padded": self.padded,
+            "hook_capture": self.hook_capture,
         }
 
     @classmethod
@@ -277,6 +284,7 @@ class FrozenMegatronEPTopologyManifest:
             etp_composition=str(value["etp_composition"]),
             dropless=_require_bool(value["dropless"], "dropless"),
             padded=_require_bool(value["padded"], "padded"),
+            hook_capture=value.get("hook_capture", {}),
         )
 
     def topology_for_layer(self, layer_no: int) -> MoEParallelTopology:
@@ -389,6 +397,9 @@ def assemble_ep_topology_manifest(
     ep_size = len(groups["ep_groups"][0])
     if set(expert_orders) != set(range(ep_size)):
         raise ValueError("Rank fragments do not establish every EP rank's expert order")
+    policies = {json.dumps(fragment.hook_capture, sort_keys=True, allow_nan=False) for fragment in fragments}
+    if len(policies) != 1:
+        raise ValueError("Ranks disagree on hook_capture")
 
     return FrozenMegatronEPTopologyManifest(
         model_id=str(common("model_id")),
@@ -402,6 +413,7 @@ def assemble_ep_topology_manifest(
         etp_composition=str(common("etp_composition")),
         dropless=bool(common("dropless")),
         padded=bool(common("padded")),
+        hook_capture=json.loads(next(iter(policies))),
     )
 
 

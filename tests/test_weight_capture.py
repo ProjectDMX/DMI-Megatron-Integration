@@ -290,3 +290,29 @@ def test_initial_weight_snapshot_does_not_count_toward_iteration_readiness():
     assert fmt.take_expected_count('train',3,0)==1
     with pytest.raises(ValueError,match='attempt_id'):
         fmt.encode(replace(metadata,act_name='grad_norm'),entry)
+
+
+@pytest.mark.parametrize('selection', [(), (0,), (3,)])
+def test_discovery_filters_before_storage_inspection_across_chunks(monkeypatch, selection):
+    from tests.test_megatron_qk_weights import _attention, _rank
+    from dmi_megatron_integration.hooks import weight_capture as wc
+    good, _, _ = _attention()
+    bad, _, _ = _attention()
+    good.layer_number, bad.layer_number = 1, 2
+    bad.config.fp8 = True
+    reads = []
+    original = wc.resolve_weight_source
+    def resolve(owner, *args, **kwargs):
+        reads.append(owner)
+        return original(owner, *args, **kwargs)
+    monkeypatch.setattr(wc, 'resolve_weight_source', resolve)
+    captures = wc.discover_weight_captures([good, bad], _rank(), {'q-weights', 'k-weights'},
+                                         capture_layers=selection)
+    assert len(captures) == (2 if 0 in selection else 0)
+    assert len(reads) == (1 if 0 in selection else 0)
+    assert wc.assign_weight_fragments([]) == []
+    if captures:
+        rows, topology = materialize(captures)
+        assert {row.layer_no for row in merge_weight_shards(rows, topology)[0]} == {0}
+    with pytest.raises(NotImplementedError, match='non-quantized'):
+        wc.discover_weight_captures([good, bad], _rank(), {'q-weights'}, capture_layers=(1,))

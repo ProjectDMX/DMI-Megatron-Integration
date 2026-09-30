@@ -164,8 +164,11 @@ class WeightCapture:
                     f'source={self.source.kind} range=({start}, {size}) '
                     f'available_bytes={source.numel()}')
             parts.append(source[start:start + size])
-        # Cat materializes assigned fragments only; the DMI producer then copies
-        # into the ring on this same stream before the optimizer may mutate it.
+        # Nonempty captures currently make two GPU copies before D2H:
+        # torch.cat copies assigned fragments into a temporary packed tensor,
+        # then the DMI producer copies that tensor into the GPU ring on this
+        # same stream before the optimizer may mutate the weights. Rank
+        # deduplication reduces the bytes but does not remove the packing copy.
         return torch.cat(parts) if parts else source.new_empty((0,))
 
 
@@ -214,7 +217,7 @@ def assign_weight_fragments(reports):
     return layouts
 
 
-def discover_weight_captures(model, rank_ctx, selected_hooks):
+def discover_weight_captures(model, rank_ctx, selected_hooks, *, capture_layers=None):
     roots = [model] if isinstance(model, torch.nn.Module) else list(model)
     captures, seen = [], set()
     for root in roots:
@@ -229,6 +232,8 @@ def discover_weight_captures(model, rank_ctx, selected_hooks):
             layer = int(module.layer_number) - 1
             if layer < 0:
                 raise ValueError('Weight hook requires a global layer number')
+            if capture_layers is not None and layer not in capture_layers:
+                continue
             config = module.config
             if getattr(config, 'fp8', None) or getattr(config, 'fp4', None):
                 raise NotImplementedError('Weight capture requires non-quantized model weights')

@@ -238,3 +238,72 @@ Use your actual capture-topology table name. Startup validates the schema; it
 does not migrate existing tables automatically. Adding this column does not
 retroactively supply layouts for old captures. Old full-matrix captures remain
 readable with the legacy `merge_projection_shards` helper.
+
+### Sampling expert outputs by source
+
+Pass `--dmi-hook-config hooks.yaml` (or set `DMI_HOOK_CONFIG`) alongside the
+usual hook selection. For example:
+
+```yaml
+hooks:
+  moe_packed_weighted_output:
+    source_sampling:
+      function: dmi_megatron_integration.hooks.source_sampling.round_robin
+      args:
+        count: 2
+        offset: 0
+```
+
+`count` sources are selected from each expert dispatch group. Source positions
+are ordered by source expert-TP rank, then source EP rank. With `U = ETP * EP`,
+the first position is `((global_batch_id - 1) * count + offset) % U`; the next
+`count - 1` positions wrap around. EDP groups apply the same rule independently.
+The same iteration, including its retries and recomputation, keeps its selection.
+Omitting `source_sampling` retains full capture. Configuring it on a hook that
+does not support it emits a warning and ignores that block.
+
+A custom selector is a dotted Python callable accepting `iteration`,
+`num_sources`, and its YAML `args`. It must deterministically return a fixed,
+nonzero number of distinct source positions in `[0, num_sources)`. The callable
+must be available both during capture and reconstruction. Arguments and the
+iteration convention are persisted in the existing EP topology manifest.
+
+The hook preprocesses `[local_expert, source]` row counts into GPU segment
+ranges. The existing segmented producer copies those ranges directly into the
+ring; it does not first gather activations into another tensor. Reservation
+uses the exact selected CPU counts from Megatron's existing metadata transfer.
+For one local expert, those counts join the same transfer and synchronization.
+Destinations with no selected rows still publish an empty record.
+
+`reconstruct_expert_outputs` reads the policy from the manifest and returns only
+selected source tokens, retaining their original token and sample identities.
+Keep the inverse-map and selected-expert-ID hooks enabled on every producer.
+Destination ETP partial outputs are still captured and summed; source sampling
+does not discard destination contributions. DP samples remain separate and PP
+layers retain their global identity. Missing policy metadata means full capture,
+so older manifests remain readable.
+
+Both variants require CP=1 and dropless, unpadded, non-fused AlltoAll dispatch.
+The expert-output hook stays eager; surrounding attention, router, and MoE
+preprocessing may use supported partial CUDA graphs. Full expert-output graph
+capture is not supported. Inactive hooks do not run the selector or retain/copy
+additional source counts.
+
+
+### Capture-layer selection
+
+`--dmi-layer-indices 0 4 7` captures layer-based hooks only at those zero-based
+**global** layer numbers, across pipeline stages and virtual pipeline chunks.
+Indices must be nonempty, unique, and in range; their order is immaterial.
+This option requires `--dmi-layer-stride 1`. Without explicit indices, the
+existing stride behavior is unchanged. Python configuration uses
+`MegatronDMIConfig(layer_indices=(0, 4, 7))`.
+
+The selection intersects hook-specific layer restrictions and applies to both
+activation hooks and weight capture, before graph recording. Unlayered outputs
+(final residuals, vocabulary logits, losses, and status records) retain their
+existing placement. Phase-specific hook selection still applies independently.
+A rank or virtual pipeline chunk may have no retained layer hooks. Full and
+sampled EP reconstruction uses matching retained layers with the complete
+topology manifest. A storage-side Signal filter cannot enable an uncaptured
+layer. Layer selection is fixed at startup.

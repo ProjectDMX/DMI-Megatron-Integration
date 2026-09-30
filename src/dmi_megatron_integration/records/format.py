@@ -142,7 +142,10 @@ class MegatronRecordFormat:
             RecordType.PER_EXECUTION,
         ):
             raise ValueError(f"unsupported record type: {entry.record_type!r}")
-        if entry.transport_type is not TransportType.IDENTITY:
+        if entry.transport_type is not TransportType.IDENTITY and not (
+            entry.record_type is RecordType.PER_EXECUTION
+            and entry.transport_type is TransportType.SEGMENTED_PACK
+        ):
             raise ValueError("unsplit Megatron records require IDENTITY transport")
         if metadata.valid_counts:
             raise ValueError("unsplit Megatron records must not carry valid_counts")

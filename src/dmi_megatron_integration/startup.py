@@ -37,6 +37,7 @@ from .adapter import (
     MegatronTrainingContext,
 )
 from .hooks.selection import parse_hook_selection, resolve_phase_hook_selections, hook_enabled_in_phase, HOOK_SELECTION_NAMES
+from .hooks.source_sampling import EP_OUTPUT, ExpertSourceCapture, SourceSampling, read_source_sampling
 from .hooks.megatron_loss_summary import (
     per_sample_loss_from_token_loss,
     per_segment_loss_from_token_loss,
@@ -86,7 +87,9 @@ class MegatronDMIConfig:
     train_hook_selection: str | None = None
     valid_hook_selection: str | None = None
     test_hook_selection: str | None = None
+    hook_config_path: str | None = None
     layer_stride: int = 1
+    layer_indices: tuple[int, ...] | None = None
     recompute_hook: str | None = None
     no_recompute_hook: str | None = None
     dataset_provenance_mode: str = "auto"
@@ -309,7 +312,10 @@ def resolve_megatron_dmi_config(
         train_hook_selection=getattr(args, "dmi_train_hook_selection", None),
         valid_hook_selection=getattr(args, "dmi_valid_hook_selection", None),
         test_hook_selection=getattr(args, "dmi_test_hook_selection", None),
+        hook_config_path=_env_value(args, "dmi_hook_config", environ, "DMI_HOOK_CONFIG", None),
         layer_stride=int(getattr(args, "dmi_layer_stride", 1)),
+        layer_indices=(tuple(args.dmi_layer_indices)
+                       if getattr(args, "dmi_layer_indices", None) is not None else None),
         recompute_hook=_env_value(
             args,
             "dmi_recompute_hook",
@@ -688,7 +694,12 @@ def _validate_hook_contract(hook: HookPointV1) -> None:
             raise ValueError("PER_EXECUTION hooks must use FWD or BWD phase")
         if spec.dp_emission != DPEmissionPolicy.ALL_DP_RANKS:
             raise ValueError("PER_EXECUTION hooks must emit on all data-parallel ranks")
-        if any(output.transport_type != TransportType.IDENTITY for output in spec.outputs):
+        if any(output.transport_type != TransportType.IDENTITY and not (
+            output.transport_type is TransportType.SEGMENTED_PACK
+            and output.segment_ranges_from_preprocess
+            and output.sizing_mode is OutputSizingMode.RUNTIME_SIZED
+            and output.eager_nbytes is not None
+        ) for output in spec.outputs):
             raise ValueError("PER_EXECUTION hooks initially require IDENTITY transport")
         if spec.binding_metadata_fields:
             raise ValueError("PER_EXECUTION hooks must not require bound metadata")
@@ -830,6 +841,7 @@ def _apply_recompute_hook_policy(
     selected_names: set[str],
     recompute_names_raw: str | None,
     no_recompute_names_raw: str | None,
+    declarations: set[tuple[str, tuple[str, ...], bool]] | None = None,
 ) -> None:
     recompute_names = _parse_hook_policy_list(
         recompute_names_raw,
@@ -853,28 +865,25 @@ def _apply_recompute_hook_policy(
             f"{sorted(missing_selection)}"
         )
 
-    resolved: dict[int, bool] = {}
+    if declarations is None:
+        declarations = {
+            (spec.name, tuple(sorted(spec.enabled_by)), spec.record_type is RecordType.PER_ITERATION)
+            for binding in hooks for spec in [_megatron_hook_spec(binding.hook)]
+        }
     resolved_names: set[str] = set()
-    for binding in hooks:
-        hook = binding.hook
-        spec = _megatron_hook_spec(hook)
-        matched_recompute = set(spec.enabled_by) & set(recompute_names)
-        matched_no_recompute = set(spec.enabled_by) & set(no_recompute_names)
+    for name, aliases, per_iteration in sorted(declarations):
+        matched_recompute = set(aliases) & set(recompute_names)
+        matched_no_recompute = set(aliases) & set(no_recompute_names)
         if matched_recompute and matched_no_recompute:
             raise ValueError(
-                f"DMI hook {spec.name!r} receives conflicting recompute policies"
+                f"DMI hook {name!r} receives conflicting recompute policies"
             )
         if not matched_recompute and not matched_no_recompute:
             continue
-        if spec.record_type is RecordType.PER_ITERATION:
+        if per_iteration:
             raise ValueError(
-                f"DMI recompute policy does not apply to PER_ITERATION hook {spec.name!r}"
+                f"DMI recompute policy does not apply to PER_ITERATION hook {name!r}"
             )
-        suppress = bool(matched_no_recompute)
-        previous = resolved.get(id(hook))
-        if previous is not None and previous != suppress:
-            raise ValueError(f"Conflicting DMI recompute policy for hook {spec.name!r}")
-        resolved[id(hook)] = suppress
         resolved_names.update(matched_recompute)
         resolved_names.update(matched_no_recompute)
 
@@ -890,8 +899,8 @@ def _apply_recompute_hook_policy(
             "metadata must be fixed before enabling --dmi-recompute-hook."
         )
     for binding in hooks:
-        if id(binding.hook) in resolved:
-            binding.hook.suppress_recompute = resolved[id(binding.hook)]
+        if set(_megatron_hook_spec(binding.hook).enabled_by) & set(no_recompute_names):
+            binding.hook.suppress_recompute = True
 
 
 def _parse_explicit_dataset_provenance_modes(value: str) -> dict[str, str]:
@@ -1083,11 +1092,13 @@ def _install_loss_summary_hook(
         )
 
 
-def _install_router_summary_hooks(model: Any) -> None:
+def _install_router_summary_hooks(model: Any, capture_layers: tuple[int, ...] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
             if module.__class__.__name__ != "TopKRouter":
+                continue
+            if not _module_layer_selected(module, capture_layers):
                 continue
             existing = module.dmi_router_probs_mean
             if existing is not None:
@@ -1122,11 +1133,13 @@ def _install_router_summary_hooks(model: Any) -> None:
             module.dmi_router_probs_mean.valid_count_bwd = torch.empty(0, dtype=torch.int64)
 
 
-def _install_router_logits_hooks(model: Any, *, dtype: torch.dtype) -> None:
+def _install_router_logits_hooks(model: Any, *, dtype: torch.dtype, capture_layers: tuple[int, ...] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
             if module.__class__.__name__ != "TopKRouter":
+                continue
+            if not _module_layer_selected(module, capture_layers):
                 continue
             existing = module.dmi_router_logits
             if existing is not None:
@@ -1163,11 +1176,13 @@ def _install_router_logits_hooks(model: Any, *, dtype: torch.dtype) -> None:
             )
 
 
-def _install_router_topk_hooks(model: Any, *, dtype: torch.dtype, selected_outputs: set[str] | None = None) -> None:
+def _install_router_topk_hooks(model: Any, *, dtype: torch.dtype, selected_outputs: set[str] | None = None, capture_layers: tuple[int, ...] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
             if module.__class__.__name__ != "TopKRouter":
+                continue
+            if not _module_layer_selected(module, capture_layers):
                 continue
             existing = module.dmi_router_topk
             if existing is not None:
@@ -1211,12 +1226,14 @@ def _install_router_topk_hooks(model: Any, *, dtype: torch.dtype, selected_outpu
             )
 
 
-def _install_moe_input_hooks(model: Any) -> None:
+def _install_moe_input_hooks(model: Any, capture_layers: tuple[int, ...] | None = None) -> None:
     """Capture sequence-sharded MoE inputs before dispatch metadata computation."""
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
             if module.__class__.__name__ != "MoELayer":
+                continue
+            if not _module_layer_selected(module, capture_layers):
                 continue
             dispatcher = module.token_dispatcher
             if dispatcher.__class__.__name__ != "MoEAlltoAllTokenDispatcher":
@@ -1252,11 +1269,13 @@ def _install_moe_input_hooks(model: Any) -> None:
             dispatcher.dmi_moe_input = existing
 
 
-def _install_moe_inverse_map_hooks(model: Any) -> None:
+def _install_moe_inverse_map_hooks(model: Any, capture_layers: tuple[int, ...] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
             if module.__class__.__name__ != "MoELayer":
+                continue
+            if not _module_layer_selected(module, capture_layers):
                 continue
             dispatcher = module.token_dispatcher
             if dispatcher.__class__.__name__ != "MoEAlltoAllTokenDispatcher":
@@ -1276,12 +1295,13 @@ def _install_moe_inverse_map_hooks(model: Any) -> None:
                             outputs=[
                                 MegatronOutputSpec(
                                     name="moe_inverse_map",
-                                    # Eager IDENTITY emission obtains shape and bytes from the
-                                    # runtime tensor.  ACTUAL_TOKEN_PACKED is descriptive here;
-                                    # it neither sizes nor validates the eager payload.  This
-                                    # first-milestone hook must remain outside CUDA Graph replay.
+                                    # Fixed source-token count, dropless routing, no padding,
+                                    # unfused permute: the int64 map has source_tokens * topk
+                                    # entries. Routing changes values only. IDENTITY captures
+                                    # concrete shape/bytes; ACTUAL_TOKEN_PACKED is descriptive,
+                                    # not a dynamic-size policy.
                                     input_shape=[DimSpec.ACTUAL_TOKEN_PACKED],
-                                    sizing_mode=OutputSizingMode.RUNTIME_SIZED,
+                                    sizing_mode=OutputSizingMode.KNOWN_BEFORE_EXECUTION,
                                     output_shape=[DimSpec.ACTUAL_TOKEN_PACKED],
                                     dtype=torch.int64,
                                     transport_type=TransportType.IDENTITY,
@@ -1301,11 +1321,27 @@ def _install_moe_inverse_map_hooks(model: Any) -> None:
             dispatcher.dmi_moe_inverse_map = existing
 
 
-def _install_moe_packed_weighted_output_hooks(model: Any) -> None:
+def _install_moe_packed_weighted_output_hooks(model: Any, source_sampling: SourceSampling | None = None, capture_layers: tuple[int, ...] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
             if module.__class__.__name__ != "MoELayer":
+                continue
+            dispatcher = module.token_dispatcher
+            # TE shares backward buffers between layers with equal differentiable
+            # outputs, including the tuple's non-differentiable slots. Keep those
+            # slots uniform when only some layers sample. These are aliases of
+            # counts Megatron already computes, not sampling/copies on excluded layers.
+            if (source_sampling is not None
+                    and dispatcher.__class__.__name__ == "MoEAlltoAllTokenDispatcher"
+                    and getattr(module.config, "cuda_graph_impl", None) == "transformer_engine"
+                    and any(getattr(scope, "name", scope) == "moe_preprocess"
+                            for scope in (getattr(module.config, "cuda_graph_scope", ()) or ()))):
+                dispatcher.dmi_source_counts_gpu = None
+                dispatcher.dmi_preserve_source_count_graph_outputs = True
+                if "dmi_source_counts_gpu" not in dispatcher.cudagraph_attrs:
+                    dispatcher.cudagraph_attrs.append("dmi_source_counts_gpu")
+            if not _module_layer_selected(module, capture_layers):
                 continue
             existing = module.dmi_moe_packed_weighted_output
             if existing is not None:
@@ -1316,6 +1352,17 @@ def _install_moe_packed_weighted_output_hooks(model: Any) -> None:
                 continue
             layer_number = getattr(module, "layer_number", None)
             layer_no = -1 if layer_number is None else int(layer_number) - 1
+            sampler = None
+            if source_sampling is not None:
+                dispatcher = module.token_dispatcher
+                if dispatcher.__class__.__name__ != "MoEAlltoAllTokenDispatcher":
+                    raise ValueError("EP source sampling requires the AlltoAll dispatcher")
+                sampler = ExpertSourceCapture(source_sampling, dispatcher)
+                dispatcher.dmi_source_sampling = sampler
+                # Retain the live GPU counts across a surrounding preprocess graph.
+                dispatcher.dmi_source_counts_gpu = None
+                if "dmi_source_counts_gpu" not in dispatcher.cudagraph_attrs:
+                    dispatcher.cudagraph_attrs.append("dmi_source_counts_gpu")
             module.dmi_moe_packed_weighted_output = _make_hook(
                 MegatronHookSpec(
                     name="moe_packed_weighted_output",
@@ -1331,16 +1378,21 @@ def _install_moe_packed_weighted_output_hooks(model: Any) -> None:
                             sizing_mode=OutputSizingMode.RUNTIME_SIZED,
                             output_shape=[DimSpec.ACTUAL_TOKEN_PACKED, DimSpec.HIDDEN],
                             dtype=module.config.params_dtype,
-                            transport_type=TransportType.IDENTITY,
+                            transport_type=(TransportType.SEGMENTED_PACK if sampler else TransportType.IDENTITY),
+                            segment_ranges_from_preprocess=sampler is not None,
+                            eager_nbytes=sampler.output_nbytes if sampler else None,
                         )
                     ],
                     shard_policy=ShardPolicy.GLOBAL_RANK_SHARDED,
                     enabled_by=frozenset({"moe-packed-weighted-output"}),
                     need_token_range=False,
                     record_type=RecordType.PER_EXECUTION,
+                    preprocess=sampler,
                 ),
                 hook_phase=HookPhase.FWD,
             )
+            if sampler is not None:
+                sampler.hook = module.dmi_moe_packed_weighted_output
 
 
 def _install_vocab_logits_hooks(
@@ -1470,11 +1522,13 @@ def _install_vocab_logits_topk_hooks(
     return effective_policy
 
 
-def _install_router_entropy_hooks(model: Any) -> None:
+def _install_router_entropy_hooks(model: Any, capture_layers: tuple[int, ...] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
             if module.__class__.__name__ != "TopKRouter":
+                continue
+            if not _module_layer_selected(module, capture_layers):
                 continue
             existing = module.dmi_router_token_entropy_mean
             if existing is not None:
@@ -1513,11 +1567,13 @@ def _install_router_entropy_hooks(model: Any) -> None:
             module.dmi_router_token_entropy_mean.valid_count_bwd = torch.empty(0, dtype=torch.int64)
 
 
-def _install_expert_count_hooks(model: Any) -> None:
+def _install_expert_count_hooks(model: Any, capture_layers: tuple[int, ...] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
             if module.__class__.__name__ != "TopKRouter":
+                continue
+            if not _module_layer_selected(module, capture_layers):
                 continue
             layer_number = getattr(module, "layer_number", None)
             layer_no = -1 if layer_number is None else int(layer_number) - 1
@@ -1580,11 +1636,13 @@ def _install_expert_count_hooks(model: Any) -> None:
                 raise TypeError("router.dmi_post_drop_token_count exists but is not HookPointV1")
 
 
-def _install_hidden_state_hooks(model: Any) -> None:
+def _install_hidden_state_hooks(model: Any, capture_layers: tuple[int, ...] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
         for module in root.modules():
             if module.__class__.__name__ != "TransformerLayer":
+                continue
+            if not _module_layer_selected(module, capture_layers):
                 continue
             existing = module.dmi_hidden_states
             if existing is not None:
@@ -1784,13 +1842,63 @@ def _resolve_tp_sequence_shard_policies(
         _print_warning(message)
 
 
+def _resolve_capture_layers(*, num_layers: int, layer_stride: int,
+                            layer_indices: tuple[int, ...] | None = None) -> tuple[int, ...] | None:
+    """None preserves unrestricted capture, including models without numbered layers."""
+    if layer_stride < 1:
+        raise ValueError("--dmi-layer-stride must be a positive integer")
+    if layer_indices is not None:
+        if layer_stride != 1:
+            raise ValueError("--dmi-layer-indices requires --dmi-layer-stride 1")
+        if (not layer_indices or any(type(i) is not int or i < 0 or i >= num_layers
+                                     for i in layer_indices)
+                or len(set(layer_indices)) != len(layer_indices)):
+            raise ValueError("--dmi-layer-indices requires nonempty unique global indices in [0, num_layers)")
+        return tuple(sorted(layer_indices))
+    return None if layer_stride == 1 else tuple(range(0, num_layers, layer_stride))
+
+
+def _module_layer_selected(module: Any, capture_layers: tuple[int, ...] | None) -> bool:
+    return capture_layers is None or int(getattr(module, "layer_number", 0) or 0) - 1 in capture_layers
+
+
+def _recompute_declarations(model: Any, dist: Any) -> set[tuple[str, tuple[str, ...], bool]]:
+    """Describe unfiltered hooks without installing excluded layer hooks."""
+    declarations = set()
+    builtin_names = {
+        "TransformerLayer": ("hidden-states",),
+        "TopKRouter": ("router-summary", "router-logits", "router-entropy", "expert-counts"),
+        "MoELayer": ("moe-input", "moe-inverse-map", "moe-packed-weighted-output"),
+    }
+    for root in _model_roots(model):
+        for module in root.modules():
+            for name in builtin_names.get(type(module).__name__, ()):
+                declarations.add((name, (name,), False))
+            if type(module).__name__ == "TopKRouter":
+                declarations.add(("router_topk", ("router-topk", "router-topk-expert-ids", "router-topk-weights"), False))
+            if isinstance(module, HookPointV1):
+                spec = _megatron_hook_spec(module)
+                declarations.add((spec.name, tuple(sorted(spec.enabled_by)),
+                                  spec.record_type is RecordType.PER_ITERATION))
+    # These selections always name iteration hooks, regardless of local ownership.
+    for name in ("q-weights", "k-weights", "router-weights", "grad-norm"):
+        declarations.add((name, (name,), True))
+    if _dist_ready(dist):
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, declarations)
+        declarations = set().union(*gathered)
+    return declarations
+
+
 def _select_hook_layers(
     hooks: list[MegatronHookBinding], *, num_layers: int, layer_stride: int,
+    layer_indices: tuple[int, ...] | None = None,
 ) -> list[MegatronHookBinding]:
-    """Resolve a global layer stride into fixed selectors before hook binding."""
-    if layer_stride == 1:
+    """Resolve global layer selection before hook binding and graph capture."""
+    selected_layers = _resolve_capture_layers(num_layers=num_layers, layer_stride=layer_stride,
+                                             layer_indices=layer_indices)
+    if selected_layers is None:
         return hooks
-    selected_layers = tuple(range(0, num_layers, layer_stride))
     selected: list[MegatronHookBinding] = []
     for binding in hooks:
         hook = binding.hook
@@ -2216,6 +2324,7 @@ def _freeze_ep_topology_manifest(
     model_config: Any,
     parallel_state: Any,
     dist_module: Any,
+    source_sampling: SourceSampling | None = None,
 ) -> FrozenMegatronEPTopologyManifest:
     if not _dist_ready(dist_module):
         raise RuntimeError("DMI topology manifest requires initialized torch.distributed")
@@ -2227,6 +2336,9 @@ def _freeze_ep_topology_manifest(
         parallel_state=parallel_state,
         dist_module=dist_module,
     )
+    fragment = replace(fragment, hook_capture={EP_OUTPUT: {
+        "source_sampling": source_sampling.to_dict() if source_sampling else None,
+    }})
     gathered: list[Any] = [None] * int(dist_module.get_world_size())
     dist_module.all_gather_object(gathered, fragment)
     if any(not isinstance(item, MegatronEPTopologyFragment) for item in gathered):
@@ -2281,6 +2393,10 @@ def setup_megatron_dmi(
         from megatron.core.utils import get_model_config
 
         model_config = get_model_config(model[0] if isinstance(model, list) else model)
+    capture_layers = _resolve_capture_layers(
+        num_layers=int(getattr(model_config, "num_layers", None) or getattr(args, "num_layers", 0)),
+        layer_stride=cfg.layer_stride, layer_indices=cfg.layer_indices,
+    )
     dist_for_rank = torch.distributed if dist_module is None else dist_module
     rank = int(dist_for_rank.get_rank()) if _dist_ready(dist_for_rank) else 0
     if cfg.recurring_d2h_windows_enabled and bool(
@@ -2317,12 +2433,27 @@ def setup_megatron_dmi(
         additional_names=additional_names,
     )
     selected_hooks = set().union(*phase_selections.values())
+    source_sampling = read_source_sampling(
+        cfg.hook_config_path, ep_enabled="moe-packed-weighted-output" in selected_hooks,
+    )
     tp_world = _parallel_world(
         parallel_state_module, "get_tensor_model_parallel_world_size"
     )
     cp_world = _parallel_world(
         parallel_state_module, "get_context_parallel_world_size"
     )
+    if source_sampling is not None:
+        if cp_world != 1:
+            raise ValueError("EP source sampling supports CP=1 only")
+        if (getattr(model_config, "moe_token_dispatcher_type", None) != "alltoall"
+                or getattr(model_config, "moe_permute_fusion", False)
+                or getattr(model_config, "moe_expert_capacity_factor", None) is not None
+                or getattr(model_config, "moe_router_padding_for_quantization", False)
+                or getattr(model_config, "moe_pad_expert_input_to_capacity", False)):
+            raise ValueError("EP source sampling requires dropless, unpadded, non-fused alltoall")
+        source_count = (_parallel_world(parallel_state_module, "get_expert_model_parallel_world_size")
+                        * _parallel_world(parallel_state_module, "get_expert_tensor_parallel_world_size"))
+        source_sampling.select(source_sampling.iteration_origin, source_count)
     requires_ep_topology_manifest = bool(
         {"moe-inverse-map", "moe-packed-weighted-output"} & selected_hooks
     )
@@ -2470,28 +2601,28 @@ def setup_megatron_dmi(
         if "router-logits" in selected_hooks:
             _install_router_logits_hooks(
                 unwrapped,
-                dtype=_router_logits_dtype(model_config),
+                dtype=_router_logits_dtype(model_config), capture_layers=capture_layers,
             )
         if {"router-topk", "router-topk-expert-ids", "router-topk-weights"} & selected_hooks:
             _install_router_topk_hooks(
                 unwrapped,
-                dtype=_router_logits_dtype(model_config),
+                dtype=_router_logits_dtype(model_config), capture_layers=capture_layers,
                 selected_outputs=(None if "router-topk" in selected_hooks else
                     {name for flag, name in (("router-topk-expert-ids", "router_topk_expert_ids"),
                                               ("router-topk-weights", "router_topk_weights")) if flag in selected_hooks}),
             )
         if "moe-input" in selected_hooks:
-            _install_moe_input_hooks(unwrapped)
+            _install_moe_input_hooks(unwrapped, capture_layers=capture_layers)
         if "moe-inverse-map" in selected_hooks:
-            _install_moe_inverse_map_hooks(unwrapped)
+            _install_moe_inverse_map_hooks(unwrapped, capture_layers=capture_layers)
         if "moe-packed-weighted-output" in selected_hooks:
-            _install_moe_packed_weighted_output_hooks(unwrapped)
+            _install_moe_packed_weighted_output_hooks(unwrapped, source_sampling, capture_layers=capture_layers)
         if "router-summary" in selected_hooks:
-            _install_router_summary_hooks(unwrapped)
+            _install_router_summary_hooks(unwrapped, capture_layers=capture_layers)
         if "router-entropy" in selected_hooks:
-            _install_router_entropy_hooks(unwrapped)
+            _install_router_entropy_hooks(unwrapped, capture_layers=capture_layers)
         if "expert-counts" in selected_hooks:
-            _install_expert_count_hooks(unwrapped)
+            _install_expert_count_hooks(unwrapped, capture_layers=capture_layers)
         if "loss-summary" in selected_hooks:
             _install_loss_summary_hook(
                 unwrapped,
@@ -2501,7 +2632,7 @@ def setup_megatron_dmi(
         if "token-loss" in selected_hooks:
             _install_token_loss_hook(unwrapped)
         if "hidden-states" in selected_hooks:
-            _install_hidden_state_hooks(unwrapped)
+            _install_hidden_state_hooks(unwrapped, capture_layers=capture_layers)
         resid_final_hook_count = 0
         if "resid_final" in selected_hooks:
             resid_final_hook_count = _install_resid_final_hooks(unwrapped)
@@ -2543,7 +2674,7 @@ def setup_megatron_dmi(
             )
         selected_model_hooks = _collect_selected_hooks(unwrapped, ",".join(sorted(selected_hooks)) or "none")
         selected_model_hooks = _select_hook_layers(
-            selected_model_hooks, num_layers=rank_ctx.num_layers, layer_stride=cfg.layer_stride,
+            selected_model_hooks, num_layers=rank_ctx.num_layers, layer_stride=cfg.layer_stride, layer_indices=cfg.layer_indices,
         )
         has_selected_tp_sequence_hook = any(
             _megatron_hook_spec(binding.hook).shard_policy
@@ -2569,6 +2700,8 @@ def setup_megatron_dmi(
             ),
             recompute_names_raw=cfg.recompute_hook,
             no_recompute_names_raw=cfg.no_recompute_hook,
+            declarations=(_recompute_declarations(unwrapped, dist_for_rank)
+                          if cfg.recompute_hook is not None or cfg.no_recompute_hook is not None else None),
         )
         active_model_hooks = _active_hooks_for_rank(selected_model_hooks, rank_ctx)
         active_model_hooks = _hooks_for_input_layout(
@@ -2625,8 +2758,7 @@ def setup_megatron_dmi(
                     )
                 )
 
-        weight_captures = discover_weight_captures(model, rank_ctx, selected_hooks) if weight_selections else []
-        weight_captures = [c for c in weight_captures if c.layer_no % cfg.layer_stride == 0]
+        weight_captures = discover_weight_captures(model, rank_ctx, selected_hooks, capture_layers=capture_layers) if weight_selections else []
         weight_layouts = []
         if weight_selections:
             if (max(rank_ctx.tp_world_size, rank_ctx.dp_world_size, rank_ctx.cp_world_size,
@@ -2660,9 +2792,9 @@ def setup_megatron_dmi(
                 iteration_hooks.append(MegatronHookBinding(hook=hook, record_dp_rank=-1,
                                                           record_shard_rank=rank))
 
-        if cfg.layer_stride != 1:
+        if capture_layers is not None:
             iteration_hooks = _select_hook_layers(
-                iteration_hooks, num_layers=rank_ctx.num_layers, layer_stride=cfg.layer_stride,
+                iteration_hooks, num_layers=rank_ctx.num_layers, layer_stride=cfg.layer_stride, layer_indices=cfg.layer_indices,
             )
 
         for binding in (*active_model_hooks, *iteration_hooks):
@@ -2839,6 +2971,7 @@ def setup_megatron_dmi(
                 model_config=model_config,
                 parallel_state=parallel_state_module,
                 dist_module=dist_for_rank,
+                source_sampling=source_sampling,
             )
             if rank == 0 and host_engine is not None:
                 manifest_json = json.dumps(manifest.to_dict())

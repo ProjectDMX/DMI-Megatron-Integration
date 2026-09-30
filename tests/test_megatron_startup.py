@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import nn
 
-from dmi.api.v1 import HookPointV1, OutputStorage, RecordType, TransportType
+from dmi.api.v1 import HookPointV1, OutputSizingMode, OutputStorage, RecordType, TransportType
 
 from dmi_megatron_integration.adapter import MegatronHookBinding
 from dmi_megatron_integration.hooks.selection import parse_hook_selection
@@ -47,6 +47,7 @@ from dmi_megatron_integration.startup import (
     _install_loss_summary_hook,
     _install_token_loss_hook,
     _install_moe_inverse_map_hooks,
+    _install_hidden_state_hooks,
     _install_resid_final_hooks,
     _vocab_logits_dtype,
     _apply_recompute_hook_policy,
@@ -384,6 +385,7 @@ def test_install_moe_inverse_map_hook_uses_execution_record():
     assert isinstance(hook, HookPointV1)
     policy = _megatron_hook_spec(hook)
     assert policy.record_type is RecordType.PER_EXECUTION
+    assert policy.outputs[0].sizing_mode is OutputSizingMode.KNOWN_BEFORE_EXECUTION
     assert policy.need_token_range is False
     assert policy.binding_metadata_fields == frozenset()
     assert policy.shard_policy is ShardPolicy.GLOBAL_RANK_SHARDED
@@ -1334,7 +1336,7 @@ def test_setup_hidden_states_resolves_dims_and_global_layer_stride(layer_stride,
     expected_layers = [layer for layer in local_layers if layer % layer_stride == 0]
     assert [_megatron_hook_spec(binding.hook).layer_no for binding in model_hooks] == expected_layers
     for layer in root.layers:
-        assert layer.dmi_hidden_states.enabled == (layer.layer_number - 1 in expected_layers)
+        assert (layer.dmi_hidden_states is not None and layer.dmi_hidden_states.enabled) == (layer.layer_number - 1 in expected_layers)
     for binding in model_hooks:
         spec = _megatron_hook_spec(binding.hook)
         assert spec.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
@@ -2777,3 +2779,104 @@ def test_router_topk_outputs_independently_selected(selection):
     assert len(values)==len(selection)
     for output,value in zip(policy.outputs,values):
         assert value.dtype==output.dtype
+
+
+@pytest.mark.parametrize("indices,stride", [((), 1), ((1, 1), 1), ((-1,), 1), ((4,), 1), ((1.0,), 1), ((True,), 1), ((1,), 2)])
+def test_explicit_layer_selection_rejects_invalid_requests(indices, stride):
+    from dmi_megatron_integration.startup import _resolve_capture_layers
+    with pytest.raises(ValueError, match="--dmi-layer-indices"):
+        _resolve_capture_layers(num_layers=4, layer_stride=stride, layer_indices=indices)
+
+
+def test_explicit_layers_cli_and_virtual_pipeline_scopes():
+    from argparse import ArgumentParser
+    from megatron.training.arguments import _add_dmi_args
+    from dmi_megatron_integration.startup import _collect_selected_hooks, _resolve_capture_layers
+    args = _add_dmi_args(ArgumentParser()).parse_args(["--dmi-layer-indices", "6", "1"])
+    cfg = resolve_megatron_dmi_config(args, environ={})
+    assert cfg.layer_indices == (6, 1)
+    selected = _resolve_capture_layers(num_layers=8, layer_stride=1, layer_indices=cfg.layer_indices)
+    assert selected == (1, 6)
+    roots = []
+    for scope, layers in [(0, (0, 1)), (1, (4, 5)), (2, (6, 7))]:
+        root = nn.Module()
+        root.vp_stage = scope
+        root.layers = nn.ModuleList(TransformerLayer(i + 1) for i in layers)
+        roots.append(root)
+    _install_hidden_state_hooks(roots, capture_layers=selected)
+    hooks = _select_hook_layers(_collect_selected_hooks(roots, "hidden-states"),
+                               num_layers=8, layer_stride=1, layer_indices=selected)
+    assert [(_megatron_hook_spec(b.hook).layer_no, b.scope_id) for b in hooks] == [(1, 0), (6, 2)]
+    assert all(layer.dmi_hidden_states is None for layer in roots[1].layers)
+
+
+@pytest.mark.parametrize("installer", ["_install_moe_input_hooks", "_install_moe_inverse_map_hooks", "_install_moe_packed_weighted_output_hooks"])
+def test_excluded_layer_skips_dispatcher_validation_and_sampler(installer):
+    from dmi_megatron_integration import startup
+    from dmi_megatron_integration.hooks.source_sampling import SourceSampling, BUILTIN_ROUND_ROBIN
+    layer = type("MoELayer", (nn.Module,), {} )()
+    layer.layer_number = 2
+    layer.token_dispatcher = SimpleNamespace()
+    layer.dmi_moe_packed_weighted_output = None
+    kwargs = dict(capture_layers=(0,))
+    if installer == "_install_moe_packed_weighted_output_hooks":
+        kwargs['source_sampling'] = SourceSampling(BUILTIN_ROUND_ROBIN, {'count': 1})
+    fn = getattr(startup, installer)
+    fn([layer], **kwargs)
+    assert not hasattr(layer.token_dispatcher, 'dmi_source_sampling')
+    assert not list(layer.children())
+    kwargs['capture_layers'] = (1,)
+    with pytest.raises((ValueError, NotImplementedError), match="[Aa]llto[Aa]ll"):
+        fn([layer], **kwargs)
+
+
+def test_global_recompute_declarations_allow_empty_local_stage_and_custom_aliases():
+    from dmi_megatron_integration.startup import _recompute_declarations
+    remote = {('remote_custom', ('custom', 'alias'), False), ('hidden-states', ('hidden-states',), False)}
+    class Dist:
+        def is_available(self): return True
+        def is_initialized(self): return True
+        def get_world_size(self): return 2
+        def all_gather_object(self, out, value): out[:] = [value, remote]
+    declarations = _recompute_declarations([nn.Module()], Dist())
+    _apply_recompute_hook_policy([], selected_names={'alias', 'hidden-states'},
+        recompute_names_raw=None, no_recompute_names_raw='alias,hidden-states', declarations=declarations)
+    with pytest.raises(ValueError, match='conflicting'):
+        _apply_recompute_hook_policy([], selected_names={'alias', 'custom'},
+            recompute_names_raw='alias', no_recompute_names_raw='custom', declarations=declarations)
+    with pytest.raises(ValueError, match='resolve to no'):
+        _apply_recompute_hook_policy([], selected_names={'absent'}, recompute_names_raw=None,
+            no_recompute_names_raw='absent', declarations=declarations)
+    with pytest.raises(ValueError, match='PER_ITERATION'):
+        _apply_recompute_hook_policy([], selected_names={'q-weights'}, recompute_names_raw=None,
+            no_recompute_names_raw='q-weights', declarations=declarations)
+
+
+def test_uninstalled_layer_hooks_still_declare_recompute_capabilities():
+    from dmi_megatron_integration.startup import _recompute_declarations
+    layer = TransformerLayer(6)
+    _install_hidden_state_hooks([layer], capture_layers=(0,))
+    assert layer.dmi_hidden_states is None
+    declarations = _recompute_declarations([layer], FakeDist(initialized=False))
+    _apply_recompute_hook_policy([], selected_names={'hidden-states'}, recompute_names_raw=None,
+        no_recompute_names_raw='hidden-states', declarations=declarations)
+
+
+def test_excluded_sampled_layer_preserves_te_output_slots_without_sampler():
+    from megatron.core.transformer.enums import CudaGraphScope
+    from dmi_megatron_integration.startup import _install_moe_packed_weighted_output_hooks
+    from dmi_megatron_integration.hooks.source_sampling import SourceSampling, BUILTIN_ROUND_ROBIN
+    layer = type('MoELayer', (nn.Module,), {})()
+    layer.layer_number = 1
+    layer.config = SimpleNamespace(cuda_graph_impl='transformer_engine',
+                                   cuda_graph_scope=[CudaGraphScope.moe_preprocess])
+    dispatcher = type('MoEAlltoAllTokenDispatcher', (), {})()
+    dispatcher.cudagraph_attrs = []
+    layer.token_dispatcher = dispatcher
+    _install_moe_packed_weighted_output_hooks([layer],
+        SourceSampling(BUILTIN_ROUND_ROBIN, {'count': 1}), capture_layers=(1,))
+    assert dispatcher.dmi_preserve_source_count_graph_outputs
+    assert dispatcher.cudagraph_attrs == ['dmi_source_counts_gpu']
+    assert dispatcher.dmi_source_counts_gpu is None
+    assert not hasattr(dispatcher, 'dmi_source_sampling')
+    assert not list(layer.children())

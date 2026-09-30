@@ -158,6 +158,7 @@ class _ProducerSemantics:
     packed_size_fn: Callable[[int, int], int] | None = field(
         default=None, repr=False, compare=False,
     )
+    eager_nbytes: Callable[[], int] | None = field(default=None, repr=False, compare=False)
 
     @property
     def signature(self) -> tuple[object, ...]:
@@ -1063,6 +1064,15 @@ class MegatronAdaptor:
             output_spec=output_spec,
             output=output,
         )
+        if semantics.eager_nbytes is not None:
+            nbytes = int(semantics.eager_nbytes())
+            if entry.transport_type is not TransportType.SEGMENTED_PACK:
+                raise ValueError("Explicit eager byte sizing requires segmented transport")
+            row_bytes = entry.transport_args[0]
+            if nbytes < 0 or nbytes % row_bytes or nbytes > output.tensor.numel() * output.tensor.element_size():
+                raise ValueError("Invalid sampled output byte count")
+            entry = replace(entry, output_shape=(nbytes // row_bytes, *entry.input_shape[1:]),
+                            reservation_upper_bytes=nbytes)
         return self.emit_prepared_output(entry, semantics, output)
 
     def emit_prepared_output(
@@ -1111,6 +1121,8 @@ class MegatronAdaptor:
     ) -> int:
         if entry.transport_type is TransportType.IDENTITY:
             return _align_up(prod(entry.input_shape) * entry.element_size)
+        if semantic.eager_nbytes is not None:
+            return _align_up(entry.reservation_upper_bytes)
         if packing is None or not packing.global_counts.counts:
             raise ValueError("packed outputs require current CPU packing metadata")
         counts = packing.counts_for(semantic.tp_sequence_start, semantic.tp_sequence_length)
@@ -1444,6 +1456,8 @@ class MegatronAdaptor:
                     int(output_spec.feature_bytes), local=configured.tp_sequence_start is not None,
                 ) if output_spec.transport_type is TransportType.SEQ_PREFIX_PACK else None
             ),
+            eager_nbytes=next(output.eager_nbytes for output in configured.policy.outputs
+                              if output.name == output_spec.name),
         )
 
     def _remember_plan(
@@ -1689,7 +1703,17 @@ class MegatronAdaptor:
                 raise RuntimeError("SEQ_PREFIX_PACK requires a metadata-owned valid-count prefix")
             return HookOutput(output.tensor, (valid, prefix))
         if spec.transport_type is TransportType.SEGMENTED_PACK:
-            starts, ends = self._current_segment_ranges(hook)
+            if output.producer_meta:
+                if len(output.producer_meta) != 2:
+                    raise ValueError("SEGMENTED_PACK requires explicit starts and ends")
+                starts, ends = output.producer_meta
+                if (starts.dtype != torch.int64 or ends.dtype != torch.int64
+                        or starts.ndim != 1 or ends.shape != starts.shape or starts.numel() == 0
+                        or starts.device != output.tensor.device or ends.device != output.tensor.device
+                        or not starts.is_contiguous() or not ends.is_contiguous()):
+                    raise ValueError("SEGMENTED_PACK ranges must be matching contiguous int64 vectors")
+            else:
+                starts, ends = self._current_segment_ranges(hook)
             return HookOutput(output.tensor, (starts, ends))
         return output
 

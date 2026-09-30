@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any, Literal, Sequence
 
+import torch
+
 from dmi.api.v1 import CHClickhouseDriverReadOnly
 
 from .schema import (
@@ -67,6 +69,16 @@ class MegatronTrainingReader(CHClickhouseDriverReadOnly):
         )
         self._training_decode_strings = bool(decode_strings)
         self._validated_training_tables: set[tuple[str, str]] = set()
+
+    @classmethod
+    def torch_decode(cls, dtype_bytes, shape, payload_bytes):
+        # Empty PER_EXECUTION records are still published when sampling selects
+        # no rows on a destination. torch.frombuffer cannot decode an empty buffer.
+        if len(payload_bytes) == 0:
+            if not shape or any(dim < 0 for dim in shape) or 0 not in shape:
+                raise ValueError("Empty tensor payload requires a zero-size shape")
+            return torch.empty(tuple(shape), dtype=cls.bytes_to_torch_dtype(dtype_bytes))
+        return super().torch_decode(dtype_bytes, shape, payload_bytes)
 
     @staticmethod
     def _training_ident(value: str) -> str:

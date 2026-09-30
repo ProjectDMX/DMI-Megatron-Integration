@@ -2997,7 +2997,7 @@ def test_real_megatron_router_weights_cover_pipeline_stages_once(tmp_path):
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Real Megatron Q/K E2E needs CUDA")
 @pytest.mark.parametrize("pp_size,tp_size", [(1, 1), (2, 1), (1, 2)])
-def test_real_megatron_qk_weights_once_per_state_with_recompute(tmp_path, pp_size, tp_size):
+def test_real_megatron_qk_weights_once_per_state_with_recompute(tmp_path, pp_size, tp_size, layer_indices=None):
     """Q/K only: two microbatches and full recompute must not duplicate weights."""
     ranks = pp_size * tp_size
     if _available_cuda_devices() < ranks:
@@ -3008,7 +3008,8 @@ def test_real_megatron_qk_weights_once_per_state_with_recompute(tmp_path, pp_siz
     model_id = f"megatron-qk-weight-e2e-{uuid.uuid4().hex}"
     log_path = tmp_path / "megatron_qk_weights.log"
     train_iters = 2
-    expected_per_projection = (train_iters + 1) * 2 * tp_size
+    retained_layers = tuple(range(2)) if layer_indices is None else layer_indices
+    expected_per_projection = (train_iters + 1) * len(retained_layers) * tp_size
     client.execute(f"CREATE DATABASE IF NOT EXISTS `{database}`")
     _create_training_table(client, database=database, table=table)
     env = os.environ.copy()
@@ -3021,13 +3022,16 @@ def test_real_megatron_qk_weights_once_per_state_with_recompute(tmp_path, pp_siz
         model_id=model_id, train_iters=train_iters, micro_batch_size=2,
         global_batch_size=4, nproc_per_node=ranks, pp_size=pp_size,
         tp_size=tp_size, database=database, table=table,
+        transformer_impl="transformer_engine" if layer_indices is not None else "local",
         extra_args=[
             "--dmi-hook-selection", "q-weights,k-weights",
             "--group-query-attention", "--num-query-groups", "2",
             "--recompute-granularity", "full", "--recompute-method", "uniform",
             "--recompute-num-layers", "1",
             "--log-interval", "1", "--split", "100,0,0",
-        ] + (["--sequence-parallel"] if tp_size > 1 else []),
+        ] + (["--sequence-parallel"] if tp_size > 1 else [])
+          + (["--dmi-layer-indices", *map(str, layer_indices), "--attention-backend", "fused"]
+             if layer_indices is not None else []),
     )
     try:
         _run_megatron_cmd(cmd, env=env, log_path=log_path)
@@ -3042,7 +3046,8 @@ def test_real_megatron_qk_weights_once_per_state_with_recompute(tmp_path, pp_siz
             assert all(value.dtype == torch.uint8 for _, value in raw)
             rows = _read_merged_weight_rows(model_id=model_id, table=table, database=database,
                                            act_name=name, direction="iter")
-            assert len(rows) == (train_iters + 1) * 2
+            assert len(rows) == (train_iters + 1) * len(retained_layers)
+            assert {key[8] for key, _ in rows} == set(retained_layers)
             states = {}
             for key, value in rows:
                 assert key[3] == "train"
@@ -3052,7 +3057,7 @@ def test_real_megatron_qk_weights_once_per_state_with_recompute(tmp_path, pp_siz
                 assert tuple(value.shape) == (projection_rows, 64)
                 assert torch.isfinite(value).all()
                 states[key[4], key[8]] = value
-            for layer in range(2):
+            for layer in retained_layers:
                 torch.testing.assert_close(states[0, layer], states[1, layer], rtol=0, atol=0)
                 assert not torch.equal(states[1, layer], states[train_iters, layer])
     finally:
@@ -4550,3 +4555,11 @@ def test_real_megatron_training_router_and_loss_summary_exact_clickhouse_rows(
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_scalar_int`")
         client.execute(f"DROP TABLE IF EXISTS `{database}`.`{table}_eval_phase_boundary`")
         client.disconnect()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("pp_size,tp_size", [(2, 1), (1, 2)])
+def test_real_megatron_layer_filtered_qk_weights(tmp_path, pp_size, tp_size):
+    test_real_megatron_qk_weights_once_per_state_with_recompute(
+        tmp_path, pp_size, tp_size, layer_indices=(1,))

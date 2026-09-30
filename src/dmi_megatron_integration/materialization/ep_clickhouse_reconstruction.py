@@ -369,8 +369,17 @@ def reconstruct_moe_clickhouse_rows(
         )
 
     reconstructed: list[ReconstructedMoEInvocation] = []
+    from ..hooks.source_sampling import EP_OUTPUT, SourceSampling
+    sampling_config = manifest.hook_capture.get(EP_OUTPUT, {}).get("source_sampling")
+    sampling = SourceSampling.from_dict(sampling_config) if sampling_config is not None else None
     for key in sorted(key_sets[0], key=key_order):
         topology = manifest.topology_for_layer(key.layer_no)
+        selected_sources = None
+        if sampling is not None:
+            selected_sources = []
+            for group in topology.dispatch_groups:
+                ordered = topology.ordered_sources(group)
+                selected_sources.extend(ordered[u] for u in sampling.select(key.global_batch_id, len(ordered)))
         producer_ranks = {
             rank for dispatch_group in topology.dispatch_groups for rank in dispatch_group
         }
@@ -393,6 +402,7 @@ def reconstruct_moe_clickhouse_rows(
         reconstructed.append(
             reconstruct_moe_invocation(
                 topology,
+                selected_sources=selected_sources,
                 expert_id_shards=expert_id_shards,
                 weight_shards=weight_shards if _ROUTER_WEIGHTS in grouped else None,
                 inverse_map_shards=tuple(

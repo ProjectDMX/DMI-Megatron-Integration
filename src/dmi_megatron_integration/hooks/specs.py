@@ -107,6 +107,8 @@ class MegatronOutputSpec:
     storage: OutputStorage = OutputStorage.TENSOR
     row_bytes: int | None = None
     sizing_mode: OutputSizingMode = OutputSizingMode.KNOWN_BEFORE_EXECUTION
+    segment_ranges_from_preprocess: bool = False
+    eager_nbytes: Callable[[], int] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.sizing_mode, OutputSizingMode):
@@ -116,12 +118,16 @@ class MegatronOutputSpec:
             object.__setattr__(self, "output_shape", tuple(self.output_shape))
         if self.transport_type is not TransportType.PREFIX_STRIP and self.row_bytes is not None:
             raise ValueError("row_bytes is valid only for PREFIX_STRIP")
+        if self.segment_ranges_from_preprocess and self.transport_type is not TransportType.SEGMENTED_PACK:
+            raise ValueError("Explicit segment ranges require SEGMENTED_PACK")
+        if self.eager_nbytes is not None and self.sizing_mode is not OutputSizingMode.RUNTIME_SIZED:
+            raise ValueError("eager_nbytes requires RUNTIME_SIZED output")
 
     @property
     def transport_metadata_fields(self) -> frozenset[MegatronMetadataField]:
         if self.transport_type is TransportType.SEQ_PREFIX_PACK:
             return frozenset({MegatronMetadataField.VALID_COUNT})
-        if self.transport_type is TransportType.SEGMENTED_PACK:
+        if self.transport_type is TransportType.SEGMENTED_PACK and not self.segment_ranges_from_preprocess:
             return frozenset({MegatronMetadataField.SEGMENT_METADATA})
         return frozenset()
 
