@@ -12,12 +12,14 @@ from dmi_megatron_integration.materialization.reconstruction import merge_weight
 from dmi_megatron_integration.signals.config import load_config
 
 
-def make_case(tp=2, fsdp=3, replicas=2, dtype=torch.bfloat16):
+def make_case(tp=2, fsdp=3, replicas=2, dtype=torch.bfloat16, attention_output_gate=False):
     heads, groups, dim, hidden = 8, 2, 2, 7
-    fused = torch.arange(groups * (heads // groups + 2) * dim * hidden).reshape(-1, hidden).to(dtype)
+    qrows = heads // groups * dim
+    gate_rows = qrows if attention_output_gate else 0
+    fused = torch.arange(groups * (qrows + gate_rows + 2 * dim) * hidden).reshape(-1, hidden).to(dtype)
     router = torch.arange(5 * hidden).reshape(5, hidden).to(dtype)
     q = fused.view(groups, -1, hidden)[:, :heads // groups * dim].reshape(-1, hidden)
-    k = fused.view(groups, -1, hidden)[:, heads // groups * dim:heads // groups * dim + dim].reshape(-1, hidden)
+    k = fused.view(groups, -1, hidden)[:, qrows + gate_rows:qrows + gate_rows + dim].reshape(-1, hidden)
     captures = []
     for t in range(tp):
         local = fused.chunk(tp)[t].contiguous()
@@ -33,7 +35,8 @@ def make_case(tp=2, fsdp=3, replicas=2, dtype=torch.bfloat16):
                     else:
                         shape, param_shape, mapping = qk_projection_ranges(
                             heads=heads, groups=groups, head_dim=dim, hidden=hidden,
-                            tp_rank=t, tp_size=tp, element_size=full.element_size(), projection=short)
+                            tp_rank=t, tp_size=tp, element_size=full.element_size(), projection=short,
+                            attention_output_gate=attention_output_gate)
                     start, end = full.numel() * d // fsdp, full.numel() * (d + 1) // fsdp
                     owned = full.flatten()[start:end].clone()
                     storage = [(0, start * full.element_size(), owned.numel() * full.element_size())]
@@ -61,8 +64,9 @@ def materialize(captures, *, attempt=1, iteration=3):
 
 @pytest.mark.parametrize('tp,fsdp,replicas', [(1,1,1), (1,1,5), (2,3,2), (8,3,2), (4,1,3)])
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
-def test_all_weight_types_merge_all_ranks_exactly(tp, fsdp, replicas, dtype):
-    captures, expected = make_case(tp, fsdp, replicas, dtype)
+@pytest.mark.parametrize('attention_output_gate', [False, True])
+def test_all_weight_types_merge_all_ranks_exactly(tp, fsdp, replicas, dtype, attention_output_gate):
+    captures, expected = make_case(tp, fsdp, replicas, dtype, attention_output_gate)
     rows, topology = materialize(captures)
     result, = merge_weight_shards(rows[::-1] + [rows[0]], topology)
     assert len(result) == 3
@@ -126,10 +130,11 @@ def test_megatron_fsdp_retained_compute_shard_not_freed_parameter_or_master(hybr
 
 
 @pytest.mark.parametrize('hybrid', [False, True])
-def test_megatron_fsdp_optimizer_proxy_resolves_compute_dtype_and_qk_offsets(hybrid):
+@pytest.mark.parametrize('attention_output_gate', [False, True])
+def test_megatron_fsdp_optimizer_proxy_resolves_compute_dtype_and_qk_offsets(hybrid, attention_output_gate):
     from tests.test_megatron_qk_weights import _attention, _rank
     from dmi_megatron_integration.hooks.weight_capture import discover_weight_captures
-    attention, q, k = _attention()
+    attention, q, k = _attention(attention_output_gate=attention_output_gate)
     original = attention.linear_qkv.weight
     original.data = original.data.to(torch.bfloat16)
     retained = original.detach().flatten().clone()

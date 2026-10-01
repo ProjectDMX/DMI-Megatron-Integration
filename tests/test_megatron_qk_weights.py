@@ -43,11 +43,13 @@ class OlmoeSelfAttention(SelfAttention):
     pass
 
 
-def _attention(*, heads=8, groups=2, head_dim=2, hidden=7, layer=1, tp=1):
+def _attention(*, heads=8, groups=2, head_dim=2, hidden=7, layer=1, tp=1,
+               attention_output_gate=False):
     module = OlmoeSelfAttention()
     module.attention_type = "self"
     module.layer_number = layer
     module.config = SimpleNamespace(num_query_groups=groups * tp, hidden_size=hidden, num_attention_heads=heads * tp)
+    module.config.attention_output_gate = attention_output_gate
     module.num_query_groups_per_partition = groups
     module.num_attention_heads_per_partition = heads
     module.hidden_size_per_attention_head = head_dim
@@ -55,8 +57,10 @@ def _attention(*, heads=8, groups=2, head_dim=2, hidden=7, layer=1, tp=1):
     q = torch.arange(heads * head_dim * hidden).reshape(heads * head_dim, hidden).float()
     k = 1000 + torch.arange(groups * head_dim * hidden).reshape(groups * head_dim, hidden).float()
     v = torch.full_like(k, -5000)
-    packed = torch.cat((
-        q.reshape(groups, -1, hidden),
+    parts = [q.reshape(groups, -1, hidden)]
+    if attention_output_gate:
+        parts.append(torch.full_like(parts[0], -9000))
+    packed = torch.cat((*parts,
         k.reshape(groups, head_dim, hidden),
         v.reshape(groups, head_dim, hidden),
     ), dim=1).reshape(-1, hidden)

@@ -16,7 +16,7 @@ class SelfAttention(nn.Module):
         self.config=config
         self.layer_number=1
         self.hidden_size_per_attention_head=2
-        self.linear_qkv=nn.Linear(7,16,bias=False)
+        self.linear_qkv=nn.Linear(7,24 if config.attention_output_gate else 16,bias=False)
 
 
 class TopKRouter(nn.Module):
@@ -27,7 +27,8 @@ class TopKRouter(nn.Module):
         self.weight=nn.Parameter(torch.arange(28.).reshape(4,7))
 
 
-def test_native_weight_snapshot_before_mutation(tmp_path):
+@pytest.mark.parametrize('attention_output_gate', [False, True])
+def test_native_weight_snapshot_before_mutation(tmp_path, attention_output_gate):
     from clickhouse_driver import Client
     from dmi_megatron_integration.startup import MegatronDMIConfig, setup_megatron_dmi
     from dmi_megatron_integration.signals.storage import ClickHouseStorage
@@ -37,16 +38,19 @@ def test_native_weight_snapshot_before_mutation(tmp_path):
     client=Client('localhost')
     database='dmi_weight_gpu_test_'+uuid.uuid4().hex
     config=SimpleNamespace(num_layers=1,hidden_size=7,num_moe_experts=4,
-                           num_attention_heads=4,num_query_groups=2)
+                           num_attention_heads=4,num_query_groups=2,
+                           attention_output_gate=attention_output_gate)
     root=nn.Module()
     root.attention=SelfAttention(config)
     root.router=TopKRouter(config)
     root.cuda()
     with torch.no_grad():
-        root.attention.linear_qkv.weight.copy_(torch.arange(112.,device='cuda').reshape(16,7))
-    fused=root.attention.linear_qkv.weight.detach().cpu().reshape(2,8,7)
+        weight = root.attention.linear_qkv.weight
+        weight.copy_(torch.arange(weight.numel(),device='cuda').reshape_as(weight))
+    fused=root.attention.linear_qkv.weight.detach().cpu().reshape(2,-1,7)
+    kstart = 8 if attention_output_gate else 4
     expected=dict(query_projection_weight=fused[:,:4].reshape(8,7),
-                  key_projection_weight=fused[:,4:6].reshape(4,7),
+                  key_projection_weight=fused[:,kstart:kstart+2].reshape(4,7),
                   router_projection_weight=root.router.weight.detach().cpu())
     handle=None
     try:

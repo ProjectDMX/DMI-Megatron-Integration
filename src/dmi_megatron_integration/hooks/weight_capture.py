@@ -26,23 +26,25 @@ def intersect_maps(storage, projection):
 
 
 def qk_projection_ranges(*, heads, groups, head_dim, hidden, tp_rank, tp_size,
-                         element_size, projection):
+                         element_size, projection, attention_output_gate=False):
     """Map a contiguous TP slice of grouped QKV to global Q or K bytes.
 
     This also covers TP > KV heads: physical TP boundaries may cut a Q/K
-    group, and some TP ranks contain no K at all.
+    group, and some TP ranks contain no K at all. Gated SelfAttention stores
+    each group as [Q, gate, K, V]; gate rows are never part of either output.
     """
     if projection not in ('q', 'k') or heads % groups:
         raise ValueError('Invalid Q/K projection layout')
     qrows = heads // groups * head_dim
-    group_rows = qrows + 2 * head_dim
+    gate_rows = qrows if attention_output_gate else 0
+    group_rows = qrows + gate_rows + 2 * head_dim
     total_rows = groups * group_rows
     if total_rows % tp_size:
         raise ValueError('Fused QKV rows must be divisible by TP size')
     row_bytes = hidden * element_size
     local_rows = total_rows // tp_size
     begin, end = tp_rank * local_rows, (tp_rank + 1) * local_rows
-    width, offset = (qrows, 0) if projection == 'q' else (head_dim, qrows)
+    width, offset = (qrows, 0) if projection == 'q' else (head_dim, qrows + gate_rows)
     ranges = []
     for group in range(groups):
         start = group * group_rows + offset
@@ -244,8 +246,6 @@ def discover_weight_captures(model, rank_ctx, selected_hooks, *, capture_layers=
                 shape = (int(config.num_moe_experts), int(config.hidden_size))
                 owner, projections = module, [('router_projection_weight', shape, None)]
             else:
-                if getattr(config, 'attention_output_gate', False):
-                    raise NotImplementedError('Weight capture does not support gated attention')
                 owner = module.linear_qkv
                 groups = int(config.num_query_groups)
                 heads = int(config.num_attention_heads)
@@ -259,7 +259,8 @@ def discover_weight_captures(model, rank_ctx, selected_hooks, *, capture_layers=
                     complete, shape, ranges = qk_projection_ranges(
                         heads=heads, groups=groups, head_dim=head_dim, hidden=hidden,
                         tp_rank=rank_ctx.tp_rank, tp_size=rank_ctx.tp_world_size,
-                        element_size=1, projection=short)
+                        element_size=1, projection=short,
+                        attention_output_gate=getattr(config, 'attention_output_gate', False))
                     projections.append((name, complete, ranges))
             source = resolve_weight_source(owner, 'weight', model_roots=roots, expected_shape=shape)
             if source.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
