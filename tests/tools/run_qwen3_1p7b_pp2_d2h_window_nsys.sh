@@ -25,6 +25,7 @@ RING_TASK_ENTRIES="${DMI_NSYS_RING_TASK_ENTRIES:-4096}"
 CH_PARALLELISM="${DMI_NSYS_CH_PARALLELISM:-4}"
 NORMAL_DRAIN_BYTE_THRESHOLD="${DMI_NSYS_NORMAL_DRAIN_BYTE_THRESHOLD:-67108864}"
 TIMING_REVALIDATION_RETRY_INTERVAL_OCCURRENCES="${DMI_NSYS_TIMING_REVALIDATION_RETRY_INTERVAL_OCCURRENCES:-100}"
+CASES="${DMI_NSYS_CASES:-normal_batching,window_scheduled}"
 
 DB_HOST="${DMX_DB_HOST:-localhost}"
 DB_PORT="${DMX_DB_PORT:-9000}"
@@ -211,6 +212,8 @@ ring_pinned_mb=$RING_PINNED_MB
 ring_task_entries=$RING_TASK_ENTRIES
 normal_drain_byte_threshold=$NORMAL_DRAIN_BYTE_THRESHOLD
 timing_revalidation_retry_interval_occurrences=$TIMING_REVALIDATION_RETRY_INTERVAL_OCCURRENCES
+cases=$CASES
+batch_p2p_sync=false
 clickhouse_host=$DB_HOST
 clickhouse_port=$DB_PORT
 clickhouse_database=$DB_DATABASE
@@ -252,6 +255,7 @@ base_command=(
     --global-batch-size "$GLOBAL_BATCH_SIZE"
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 2
+    --no-batch-p2p-sync
     --train-iters "$TRAIN_ITERS"
     --eval-interval 100
     --eval-iters 0
@@ -297,12 +301,21 @@ run_case() {
     local case_name="$1"
     local windows_enabled="$2"
     local debug_enabled="$3"
+    local window_subset="$4"
     local case_dir="$OUT_DIR/$case_name"
     local model_id="qwen3-1p7b-pp2-${case_name}-${TIMESTAMP}"
     local report_base="$case_dir/trace"
     local command_file="$case_dir/command.txt"
     local log_file="$case_dir/training.log"
-    local command=("${base_command[@]}" --dmi-model-id "$model_id")
+    local command=(
+        "$PYTHON" -m torch.distributed.run
+        --standalone
+        --nproc_per_node=2
+        "$SCRIPT_DIR/pretrain_gpt_with_d2h_window_subset.py"
+        "$MEGATRON_ROOT/pretrain_gpt.py"
+        "${base_command[@]:6}"
+        --dmi-model-id "$model_id"
+    )
 
     if [[ "$windows_enabled" == "1" ]]; then
         command+=(--dmi-recurring-d2h-windows)
@@ -312,8 +325,8 @@ run_case() {
     fi
 
     mkdir -p "$case_dir"
-    printf 'DMI_RECURRING_D2H_WINDOWS=%q DMI_D2H_WINDOW_DEBUG=%q ' \
-        "$windows_enabled" "$debug_enabled" >"$command_file"
+    printf 'DMI_RECURRING_D2H_WINDOWS=%q DMI_D2H_WINDOW_DEBUG=%q DMI_NSYS_WINDOW_SUBSET=%q ' \
+        "$windows_enabled" "$debug_enabled" "$window_subset" >"$command_file"
     printf '%q ' "$NSYS" profile \
         --trace=cuda,nvtx,osrt \
         --sample=none \
@@ -329,6 +342,7 @@ run_case() {
     DMI_ENABLE=1 \
     DMI_RECURRING_D2H_WINDOWS="$windows_enabled" \
     DMI_D2H_WINDOW_DEBUG="$debug_enabled" \
+    DMI_NSYS_WINDOW_SUBSET="$window_subset" \
     DMI_DRAIN_FLUSH_PAYLOAD_RATIO=0 \
     DMI_DRAIN_FLUSH_TASK_RATIO=0 \
     DMI_DRAIN_FLUSH_BYTE_THRESHOLD="$NORMAL_DRAIN_BYTE_THRESHOLD" \
@@ -382,19 +396,41 @@ if int(row[0]) != expected:
 PY
 }
 
-run_case normal_batching 0 0
-run_case window_scheduled 1 1
+IFS=',' read -r -a requested_cases <<<"$CASES"
+for requested_case in "${requested_cases[@]}"; do
+    case "$requested_case" in
+        normal_batching)
+            run_case normal_batching 0 0 all
+            ;;
+        window_scheduled)
+            run_case window_scheduled 1 1 all
+            ;;
+        tx_free)
+            run_case tx_free 1 1 tx_free
+            ;;
+        tx_dependency_stalled)
+            run_case tx_dependency_stalled 1 1 tx_dependency_stalled
+            ;;
+        *)
+            echo "Unsupported DMI_NSYS_CASES entry: $requested_case" >&2
+            exit 2
+            ;;
+    esac
+done
 
-"$PYTHON" "$SCRIPT_DIR/analyze_d2h_window_nsys.py" \
-    --normal "$OUT_DIR/normal_batching/trace.sqlite" \
-    --window "$OUT_DIR/window_scheduled/trace.sqlite" \
-    --window-log "$OUT_DIR/window_scheduled/training.log" \
-    --output-dir "$OUT_DIR/analysis" \
-    --require-valid-window-run
+if [[ -f "$OUT_DIR/normal_batching/trace.sqlite" && \
+      -f "$OUT_DIR/window_scheduled/trace.sqlite" ]]; then
+    "$PYTHON" "$SCRIPT_DIR/analyze_d2h_window_nsys.py" \
+        --normal "$OUT_DIR/normal_batching/trace.sqlite" \
+        --window "$OUT_DIR/window_scheduled/trace.sqlite" \
+        --window-log "$OUT_DIR/window_scheduled/training.log" \
+        --output-dir "$OUT_DIR/analysis" \
+        --require-valid-window-run
 
-"$PYTHON" "$SCRIPT_DIR/plot_d2h_window_nsys_ascii.py" \
-    --normal "$OUT_DIR/normal_batching/trace.sqlite" \
-    --window "$OUT_DIR/window_scheduled/trace.sqlite" \
-    --output "$OUT_DIR/analysis/timeline.txt"
+    "$PYTHON" "$SCRIPT_DIR/plot_d2h_window_nsys_ascii.py" \
+        --normal "$OUT_DIR/normal_batching/trace.sqlite" \
+        --window "$OUT_DIR/window_scheduled/trace.sqlite" \
+        --output "$OUT_DIR/analysis/timeline.txt"
+fi
 
 echo "Part I traces and analysis: $OUT_DIR"
