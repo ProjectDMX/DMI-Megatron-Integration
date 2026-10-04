@@ -474,6 +474,90 @@ def test_optional_measurement_callbacks_cover_full_logical_iterations(monkeypatc
     assert calls == [("start", 2), ("end", 2)]
 
 
+@pytest.mark.parametrize("phase", ["valid", "test"])
+@pytest.mark.parametrize("measurements", [False, True])
+def test_evaluate_measures_each_batch_through_loss_reduction(monkeypatch, phase, measurements):
+    """Run the actual evaluate loop with CPU tensors and a simulated schedule."""
+    import ast
+    import os
+    from pathlib import Path
+
+    monkeypatch.delenv("DMI_ENABLE", raising=False)
+    runtime = MegatronScheduleRuntime(FakePropagator())
+    runtime.enter_phase(phase, training_iteration_id_start=1, global_batch_id_start=11)
+    calls = []
+    args = SimpleNamespace(
+        dmi_enable=True, vision_pretraining=False, global_batch_size=4,
+        micro_batch_size=1, data_parallel_size=2, cuda_graph_impl="none",
+        eval_iters=5, seq_length=8, decoder_seq_length=None,
+        empty_unused_memory_level=0, consumed_valid_samples=0,
+        exit_duration_in_mins=None, sft=False,
+    )
+    if measurements:
+        runtime.configure_measurements(
+            lambda i: calls.append(("start", i, args.consumed_valid_samples)),
+            lambda i: calls.append(("end", i, args.consumed_valid_samples)),
+        )
+
+    def forward(**kwargs):
+        assert kwargs["forward_only"] is True
+        assert kwargs["num_microbatches"] == 2
+        runtime.begin_iteration(2, forward_only=True)
+        calls.append(("forward", runtime.global_batch_id))
+        runtime.end_iteration()
+        # Two microbatches with loss sums and counts.
+        return [{"loss": torch.tensor([4., 2.])} for _ in range(2)]
+
+    timer = SimpleNamespace(start=lambda **kw: None, stop=lambda: None)
+    class Timers:
+        def __call__(self, *a, **kw):
+            return timer
+        def log(self, *a):
+            pass
+
+    source = (Path(__file__).resolve().parents[1] /
+              "third_party/megatron-lm/megatron/training/training.py")
+    function = next(n for n in ast.parse(source.read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == "evaluate")
+    namespace = dict(
+        os=os, get_args=lambda: args, get_timers=Timers,
+        get_forward_backward_func=lambda: forward, has_nvidia_modelopt=False,
+        get_rerun_state_machine=lambda: SimpleNamespace(
+            get_mode=lambda: "original", set_mode=lambda mode: None),
+        RerunMode=SimpleNamespace(DISABLED="disabled"),
+        ft_integration=SimpleNamespace(on_eval_step_start=lambda: None,
+                                       on_eval_step_end=lambda: None),
+        mpu=SimpleNamespace(is_pipeline_last_stage=lambda **kw: True,
+                            get_data_parallel_group=lambda **kw: None),
+        torch=SimpleNamespace(
+            no_grad=torch.no_grad, float=torch.float, vstack=torch.vstack,
+            tensor=lambda data, **kw: torch.tensor(data, dtype=kw.get("dtype")),
+            distributed=SimpleNamespace(all_reduce=lambda *a, **kw:
+                                        calls.append(("reduce", runtime.global_batch_id - 1))),
+        ),
+    )
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+    set_active_megatron_schedule_runtime(runtime)
+    try:
+        result = namespace["evaluate"](
+            None, None, [SimpleNamespace(eval=lambda: None, train=lambda: None)],
+            None, SimpleNamespace(timers=None),
+        )
+    finally:
+        set_active_megatron_schedule_runtime(None)
+    expected = []
+    for index, iteration in enumerate(range(11, 16)):
+        if measurements:
+            expected.append(("start", iteration, index * 4))
+        expected.extend([("forward", iteration), ("reduce", iteration)])
+        if measurements:
+            expected.append(("end", iteration, (index + 1) * 4))
+    assert calls == expected
+    assert result[0]["loss"].item() == 2.
+    assert runtime.global_batch_id == 16
+    assert runtime._evaluation_measurement_id is None
+
+
 def test_iteration_boundary_flush_runs_once_after_rerun_is_accepted():
     runtime = MegatronScheduleRuntime(FakePropagator())
     calls = []

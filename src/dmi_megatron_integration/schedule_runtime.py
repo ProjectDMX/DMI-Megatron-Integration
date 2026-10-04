@@ -104,6 +104,7 @@ class MegatronScheduleRuntime:
         self._iteration_flush_logger: Callable[[int, float], None] | None = None
         self._measurement_start: Callable[[int], None] | None = None
         self._measurement_end: Callable[[int], None] | None = None
+        self._evaluation_measurement_id: int | None = None
         self.attempt_status_hook: Any | None = None
         self._attempt_status_tensor: torch.Tensor | None = None
         self.dataset_provenance_modes: dict[str, str] = {
@@ -365,6 +366,28 @@ class MegatronScheduleRuntime:
         self._attempt_statuses.clear()
         if self._measurement_start is not None:
             self._measurement_start(global_batch_id)
+
+    def begin_evaluation_iteration(self) -> None:
+        """Use the training measurement callbacks around one evaluation batch."""
+        if self._measurement_start is None:
+            return
+        if self.phase not in {"valid", "test"}:
+            raise RuntimeError("DMI evaluation measurement requires valid or test phase")
+        if self._evaluation_measurement_id is not None:
+            raise RuntimeError("DMI evaluation measurement is already active")
+        iteration = int(self.global_batch_id)
+        self._measurement_start(iteration)
+        # The schedule advances global_batch_id before evaluate() reduces losses.
+        self._evaluation_measurement_id = iteration
+
+    def finish_evaluation_iteration(self) -> None:
+        if self._measurement_end is None:
+            return
+        iteration = self._evaluation_measurement_id
+        if iteration is None:
+            raise RuntimeError("DMI evaluation measurement is not active")
+        self._measurement_end(iteration)
+        self._evaluation_measurement_id = None
 
     def begin_attempt(self, attempt_id: int) -> None:
         if self._logical_training_iteration_id is None:
@@ -1325,6 +1348,16 @@ def dmi_finish_logical_iteration() -> None:
         _active_runtime.finish_logical_iteration()
 
 
+def dmi_begin_evaluation_iteration() -> None:
+    if _active_runtime is not None:
+        _active_runtime.begin_evaluation_iteration()
+
+
+def dmi_finish_evaluation_iteration() -> None:
+    if _active_runtime is not None:
+        _active_runtime.finish_evaluation_iteration()
+
+
 def dmi_begin_attempt(attempt_id: int) -> None:
     if _active_runtime is not None:
         _active_runtime.begin_attempt(attempt_id)
@@ -1635,6 +1668,7 @@ __all__ = [
     "dmi_begin_iteration",
     "dmi_begin_attempt",
     "dmi_begin_logical_iteration",
+    "dmi_begin_evaluation_iteration",
     "dmi_begin_cuda_graph_capture",
     "dmi_abort_cuda_graph_capture",
     "dmi_abort_te_forward_capture",
@@ -1648,6 +1682,7 @@ __all__ = [
     "dmi_finish_te_forward_capture",
     "dmi_finish_attempt",
     "dmi_finish_logical_iteration",
+    "dmi_finish_evaluation_iteration",
     "dmi_current_phase",
     "dmi_local_graph_evaluation_eager",
     "dmi_force_eager_unit",
