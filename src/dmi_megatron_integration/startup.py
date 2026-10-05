@@ -1196,7 +1196,11 @@ def _install_router_topk_hooks(model: Any, *, dtype: torch.dtype, selected_outpu
             original_preprocess = module._dmi_router_topk_from_routing
             def preprocess(*args, _compute=original_preprocess, _selected=selected, **kwargs):
                 values = _compute(*args, **kwargs)
-                return [value for name, value in zip(("router_topk_expert_ids", "router_topk_weights"), values) if name in _selected]
+                outputs = tuple(value for name, value in zip(
+                    ("router_topk_expert_ids", "router_topk_weights"), values
+                ) if name in _selected)
+                # A single physical output is the tensor itself, not a container.
+                return outputs[0] if len(outputs) == 1 else outputs
             module.dmi_router_topk = _make_hook(
                 MegatronHookSpec(
                     name="router_topk",

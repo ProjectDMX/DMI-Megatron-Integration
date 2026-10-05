@@ -32,7 +32,7 @@ from tests.test_megatron_real_training_e2e import (
     (1, 1, 1, 1, 1, 2, None),
     (2, 1, 1, 2, 1, 4, None), (2, 2, 1, 1, 2, 2, None),
 ])
-def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep, etp, experts, count, graph, layer_indices=None):
+def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep, etp, experts, count, graph, layer_indices=None, router_selection="router-topk"):
     if _available_cuda_devices() < world:
         pytest.skip(f"Requires {world} available GPUs")
     if graph and experts == 1:
@@ -50,7 +50,7 @@ def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep,
     }}}))
     dp = world // (tp * pp)
     args = ["--expert-tensor-parallel-size", str(etp), "--context-parallel-size", "1",
-            "--dmi-hook-selection", "router-topk,moe-inverse-map,moe-packed-weighted-output",
+            "--dmi-hook-selection", f"{router_selection},moe-inverse-map,moe-packed-weighted-output",
             "--dmi-hook-config", str(config), "--log-interval", "1", "--split", "100,0,0",
             "--attention-dropout", "0", "--hidden-dropout", "0",
             "--attention-backend", "fused"]
@@ -86,6 +86,10 @@ def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep,
             _wait_for_exact_act_rows(client, database=database, table=table, model_id=model_id,
                                     act_name=name, expected=3 * (world // pp) * (2 if layer_indices is None else len(layer_indices)))
         rows = _read_moe_rows(model_id=model_id, database=database, table=table)
+        if router_selection == "router-topk-expert-ids":
+            # The shared reader also queries optional routing weights. They
+            # must be absent when only IDs were requested.
+            assert rows.pop("router_topk_weights") == []
         invocations = reconstruct_moe_clickhouse_rows(manifest, rows)
         assert len(invocations) == 3 * (2 if layer_indices is None else len(layer_indices))
         if layer_indices is not None:
@@ -119,6 +123,19 @@ def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep,
         for (name,) in tables:
             client.execute(f"DROP TABLE `{database}`.`{name}`")
         client.disconnect()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "te_graph"])
+@pytest.mark.parametrize("count", [1, None], ids=["sampled", "full"])
+def test_expert_ids_only_training_reconstructs_native(tmp_path, graph, count):
+    # EP reconstruction needs IDs without routing weights. Exercise the actual
+    # single-output hook through transport, storage, and reconstruction.
+    test_sampled_training_reconstructs_native(
+        tmp_path, world=2, tp=2, pp=1, ep=2, etp=1, experts=4,
+        count=count, graph=graph, router_selection="router-topk-expert-ids",
+    )
 
 
 @pytest.mark.slow

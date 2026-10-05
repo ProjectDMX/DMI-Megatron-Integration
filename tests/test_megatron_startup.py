@@ -2761,7 +2761,7 @@ def test_no_per_sample_hooks_need_no_dataset_topology_resolution():
 
 
 @pytest.mark.parametrize('selection', [{'router_topk_expert_ids'}, {'router_topk_weights'}, {'router_topk_expert_ids','router_topk_weights'}])
-def test_router_topk_outputs_independently_selected(selection):
+def test_router_topk_outputs_independently_selected(selection, monkeypatch):
     from dmi_megatron_integration.startup import _install_router_topk_hooks
     class TopKRouter(nn.Module):
         def __init__(self):
@@ -2775,10 +2775,30 @@ def test_router_topk_outputs_independently_selected(selection):
     _install_router_topk_hooks(router,dtype=torch.float32,selected_outputs=selection)
     policy=_megatron_hook_spec(router.dmi_router_topk)
     assert {output.name for output in policy.outputs}==selection
-    values=policy.preprocess(None)
-    assert len(values)==len(selection)
-    for output,value in zip(policy.outputs,values):
-        assert value.dtype==output.dtype
+    hook = router.dmi_router_topk
+    hook.spec = policy.resolve({DimSpec.BATCH: 1, DimSpec.SEQ: 1})
+    observed = []
+    runtime = SimpleNamespace(
+        should_emit=lambda hook: True,
+        prepare_output=lambda **kwargs: observed.append(kwargs),
+    )
+    hook._bind_record_runtime(
+        output_ids=range(len(policy.outputs)),
+        ring_payload=torch.empty(1, dtype=torch.uint8),
+        hook_runtime=runtime,
+        gate_tensor=None,
+        gate_value=0,
+    )
+    monkeypatch.setattr(hook, "_dispatch", lambda spec, output: None)
+    hook(None)
+    assert len(observed) == len(selection)
+    expected = dict(zip(
+        ("router_topk_expert_ids", "router_topk_weights"),
+        router._dmi_router_topk_from_routing(None),
+    ))
+    for spec, record in zip(policy.outputs, observed):
+        torch.testing.assert_close(record["output"].tensor, expected[spec.name])
+        assert record["output"].tensor.dtype == spec.dtype
 
 
 @pytest.mark.parametrize("indices,stride", [((), 1), ((1, 1), 1), ((-1,), 1), ((4,), 1), ((1.0,), 1), ((True,), 1), ((1,), 2)])
