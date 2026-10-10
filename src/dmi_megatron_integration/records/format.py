@@ -127,20 +127,46 @@ class MegatronRecordFormat:
             output_id=entry.output_id,
         )
 
+    def _bind_native_encoder(self, transport):
+        # Subclasses/custom encoders retain their public encode() implementation.
+        compile_layout = getattr(transport, "_compile_record_layout", None)
+        if type(self) is not MegatronRecordFormat or "encode" in self.__dict__ or compile_layout is None:
+            return None
+        layouts = {storage: compile_layout(self._layout_name(storage), (7, 10, 11, 14), 16)
+                   for storage in OutputStorage}
+
+        def encode_native(metadata, entry):
+            if not isinstance(metadata, MegatronRecordMetadata):
+                raise TypeError("metadata must be MegatronRecordMetadata")
+            if not isinstance(entry, ProducerPlanEntry):
+                raise TypeError("entry must be ProducerPlanEntry")
+            rows = self._row_specs(metadata, entry)
+            common = self._common_coordinates(metadata) if rows else (None,) * 12
+            if self.count_records and metadata.attempt_id >= 0 and metadata.act_name != "iteration_attempt_status":
+                key = (metadata.phase, metadata.global_batch_id, metadata.attempt_id)
+                self._expected_records[key] = self._expected_records.get(key, 0) + len(rows)
+            return (layouts[entry.storage], common, rows, entry.output_id)
+
+        return encode_native
+
     def take_expected_count(self, phase: str, batch: int, attempt: int) -> int:
         return self._expected_records.pop((phase, batch, attempt), 0)
 
-    def _rows(
-        self,
-        metadata: MegatronRecordMetadata,
-        entry: ProducerPlanEntry,
-    ) -> tuple[tuple[object, ...], ...]:
+    def _rows(self, metadata, entry):
+        # The reference/custom path uses the same splitting arithmetic, but
+        # materializes the public Python descriptor objects as before.
+        return tuple(
+            self._coordinates(metadata, sample_index=coords[0], token_start=coords[1],
+                              token_end=coords[2], dataset_id=coords[3])
+            + (PayloadSlice(offset_bytes=offset, nbytes=nbytes, storage=entry.storage,
+                            dtype=dtype, shape=shape),)
+            for coords, offset, nbytes, dtype, shape in self._row_specs(metadata, entry)
+        )
+
+    def _row_specs(self, metadata, entry):
         if entry.record_type is RecordType.PER_SAMPLE:
-            return self._per_sample_rows(metadata, entry)
-        if entry.record_type not in (
-            RecordType.PER_ITERATION,
-            RecordType.PER_EXECUTION,
-        ):
+            return self._per_sample_specs(metadata, entry)
+        if entry.record_type not in (RecordType.PER_ITERATION, RecordType.PER_EXECUTION):
             raise ValueError(f"unsupported record type: {entry.record_type!r}")
         if entry.transport_type is not TransportType.IDENTITY and not (
             entry.record_type is RecordType.PER_EXECUTION
@@ -155,63 +181,37 @@ class MegatronRecordFormat:
             if not entry.output_shape:
                 raise ValueError("unsplit Megatron scalar output must be at least 1-D")
             self._require_scalar_element_shape(entry.output_shape)
-
         per_execution = entry.record_type is RecordType.PER_EXECUTION
-        token_start = -1 if per_execution else int(metadata.token_start)
-        token_end = -1 if per_execution else int(metadata.token_start) + 1
-        value = self._payload_slice(
-            entry,
-            offset_bytes=0,
-            nbytes=self._entry_bytes(entry),
-            shape=entry.output_shape,
-        )
-        return (
-            self._coordinates(
-                metadata,
-                sample_index=-1,
-                token_start=token_start,
-                token_end=token_end,
-                dataset_id=-1,
-            )
-            + (value,),
-        )
+        start = -1 if per_execution else int(metadata.token_start)
+        end = -1 if per_execution else int(metadata.token_start) + 1
+        payload = self._payload_values(entry, offset_bytes=0, nbytes=self._entry_bytes(entry),
+                                       shape=entry.output_shape)
+        return (((-1, start, end, -1), *payload),)
 
-    def _per_sample_rows(
-        self,
-        metadata: MegatronRecordMetadata,
-        entry: ProducerPlanEntry,
-    ) -> tuple[tuple[object, ...], ...]:
+    def _per_sample_rows(self, metadata, entry):
+        return self._rows(metadata, entry)
+
+    def _per_sample_specs(self, metadata, entry):
         counts = self._record_counts(metadata, entry)
         self._validate_per_sample_shape(entry, counts)
         if metadata.dataset_ids and len(metadata.dataset_ids) != len(counts):
             raise ValueError("dataset_ids length must match the record count")
         datasets = metadata.dataset_ids or (0,) * len(counts)
-
-        rows: list[tuple[object, ...]] = []
+        rows = []
         packed_offset = 0
         active_index = 0
-        for sample_index, (valid_count, dataset_id) in enumerate(
-            zip(counts, datasets)
-        ):
+        start = int(metadata.token_start)
+        for sample_index, (valid_count, dataset_id) in enumerate(zip(counts, datasets)):
             if valid_count <= 0:
                 continue
-            value, packed_offset, active_index = self._sample_payload_slice(
-                entry,
-                sample_index=sample_index,
-                valid_count=valid_count,
-                packed_offset=packed_offset,
-                active_index=active_index,
+            dataset_id = int(dataset_id)
+            if not -1 <= dataset_id < 1 << 31:
+                raise ValueError("dataset_id is outside the supported Int32 range")
+            payload, packed_offset, active_index = self._sample_payload_values(
+                entry, sample_index=sample_index, valid_count=valid_count,
+                packed_offset=packed_offset, active_index=active_index,
             )
-            rows.append(
-                self._coordinates(
-                    metadata,
-                    sample_index=sample_index,
-                    token_start=int(metadata.token_start),
-                    token_end=int(metadata.token_start) + valid_count,
-                    dataset_id=dataset_id,
-                )
-                + (value,)
-            )
+            rows.append(((sample_index, start, start + valid_count, dataset_id), *payload))
         return tuple(rows)
 
     @staticmethod
@@ -262,7 +262,7 @@ class MegatronRecordFormat:
             return (1,)
         return (1,) * max(0, int(entry.output_shape[0]))
 
-    def _sample_payload_slice(
+    def _sample_payload_values(
         self,
         entry: ProducerPlanEntry,
         *,
@@ -270,7 +270,7 @@ class MegatronRecordFormat:
         valid_count: int,
         packed_offset: int,
         active_index: int,
-    ) -> tuple[PayloadSlice, int, int]:
+    ) -> tuple[tuple, int, int]:
         element_size = entry.element_size
         if entry.storage in (OutputStorage.SCALAR_FLOAT, OutputStorage.SCALAR_INT):
             self._validate_scalar_dtype(entry.storage, entry.dtype)
@@ -289,7 +289,7 @@ class MegatronRecordFormat:
                     "transport"
                 )
             return (
-                self._payload_slice(
+                self._payload_values(
                     entry,
                     offset_bytes=offset_bytes,
                     nbytes=element_size,
@@ -307,7 +307,7 @@ class MegatronRecordFormat:
             row_shape = entry.output_shape[1:]
             row_bytes = int(prod(row_shape)) * element_size
             return (
-                self._payload_slice(
+                self._payload_values(
                     entry,
                     offset_bytes=sample_index * row_bytes,
                     nbytes=row_bytes,
@@ -320,7 +320,7 @@ class MegatronRecordFormat:
         if entry.transport_type is TransportType.PREFIX_STRIP:
             row_bytes = int(entry.transport_args[0])
             row_shape = entry.output_shape[1:]
-            value = self._payload_slice(
+            value = self._payload_values(
                 entry,
                 offset_bytes=active_index * row_bytes,
                 nbytes=row_bytes,
@@ -334,7 +334,7 @@ class MegatronRecordFormat:
         ):
             feature_bytes = int(entry.transport_args[0])
             nbytes = valid_count * feature_bytes
-            value = self._payload_slice(
+            value = self._payload_values(
                 entry,
                 offset_bytes=packed_offset,
                 nbytes=nbytes,
@@ -346,23 +346,33 @@ class MegatronRecordFormat:
             f"unsupported per-sample Megatron transport: {entry.transport_type.value}"
         )
 
+    def _sample_payload_slice(self, entry, **kwargs):
+        values, packed_offset, active_index = self._sample_payload_values(entry, **kwargs)
+        offset, nbytes, dtype, shape = values
+        return (PayloadSlice(offset_bytes=offset, nbytes=nbytes, storage=entry.storage,
+                             dtype=dtype, shape=shape), packed_offset, active_index)
+
     @classmethod
-    def _payload_slice(
-        cls,
-        entry: ProducerPlanEntry,
-        *,
-        offset_bytes: int,
-        nbytes: int | None,
-        shape: tuple[int, ...],
-    ) -> PayloadSlice:
+    def _payload_values(cls, entry, *, offset_bytes, nbytes, shape):
         cls._validate_scalar_dtype(entry.storage, entry.dtype)
-        return PayloadSlice(
-            offset_bytes=int(offset_bytes),
-            nbytes=None if nbytes is None else int(nbytes),
-            storage=entry.storage,
-            dtype=entry.dtype,
-            shape=shape if entry.storage is OutputStorage.TENSOR else (),
-        )
+        offset_bytes = int(offset_bytes)
+        nbytes = None if nbytes is None else int(nbytes)
+        shape = tuple(int(dim) for dim in shape) if entry.storage is OutputStorage.TENSOR else ()
+        if offset_bytes < 0:
+            raise ValueError("PayloadSlice.offset_bytes must be non-negative")
+        if nbytes is not None and nbytes < 0:
+            raise ValueError("PayloadSlice.nbytes must be non-negative")
+        if sum(dim == -1 for dim in shape) > 1 or any(dim < -1 for dim in shape):
+            raise ValueError("PayloadSlice.shape supports at most one -1")
+        if entry.dtype is None:
+            raise ValueError("PayloadSlice requires dtype")
+        return (offset_bytes, nbytes, entry.dtype, shape)
+
+    @classmethod
+    def _payload_slice(cls, entry, **kwargs):
+        offset, nbytes, dtype, shape = cls._payload_values(entry, **kwargs)
+        return PayloadSlice(offset_bytes=offset, nbytes=nbytes, storage=entry.storage,
+                            dtype=dtype, shape=shape)
 
     @staticmethod
     def _validate_scalar_dtype(storage: OutputStorage, dtype: torch.dtype) -> None:
@@ -382,18 +392,9 @@ class MegatronRecordFormat:
         if any(dimension < 0 for dimension in shape) or prod(shape) != 1:
             raise ValueError("Megatron scalar output must contain exactly one value per row")
 
-    def _coordinates(
-        self,
-        metadata: MegatronRecordMetadata,
-        *,
-        sample_index: int,
-        token_start: int,
-        token_end: int,
-        dataset_id: int,
-    ) -> tuple[object, ...]:
+    def _common_coordinates(self, metadata):
         attempt_id = int(metadata.attempt_id)
         invocation_id = int(metadata.invocation_id)
-        dataset_id = int(dataset_id)
         initial_weight = (attempt_id == -1 and metadata.direction == "iter"
                           and metadata.act_name in {"query_projection_weight",
                               "key_projection_weight", "router_projection_weight"})
@@ -401,26 +402,18 @@ class MegatronRecordFormat:
             raise ValueError("attempt_id is outside the supported Int32 range")
         if not 0 <= invocation_id < 1 << 31:
             raise ValueError("invocation_id is outside the supported Int32 range")
+        return (metadata.model_id, metadata.act_name, metadata.direction, metadata.phase,
+                int(metadata.global_batch_id), int(metadata.dp_rank), int(metadata.microbatch_id),
+                int(metadata.layer_no), int(metadata.shard_rank), attempt_id, invocation_id,
+                self.producer_rank)
+
+    def _coordinates(self, metadata, *, sample_index, token_start, token_end, dataset_id):
+        common = self._common_coordinates(metadata)
+        dataset_id = int(dataset_id)
         if not -1 <= dataset_id < 1 << 31:
             raise ValueError("dataset_id is outside the supported Int32 range")
-        return (
-            metadata.model_id,
-            metadata.act_name,
-            metadata.direction,
-            metadata.phase,
-            int(metadata.global_batch_id),
-            int(metadata.dp_rank),
-            int(metadata.microbatch_id),
-            int(sample_index),
-            int(metadata.layer_no),
-            int(metadata.shard_rank),
-            int(token_start),
-            int(token_end),
-            attempt_id,
-            invocation_id,
-            dataset_id,
-            self.producer_rank,
-        )
+        return (*common[:7], int(sample_index), *common[7:9], int(token_start), int(token_end),
+                *common[9:11], dataset_id, common[11])
 
     @staticmethod
     def _layout_name(storage: OutputStorage) -> str:

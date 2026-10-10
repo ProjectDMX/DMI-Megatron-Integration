@@ -50,13 +50,13 @@ def test_tp2_rank_local_packed_payloads_with_changing_counts(tp_rank, graph_mode
                 iteration_hooks=(), metadata_context=metadata,
             )
             reservations = []
-            original_reserve = runtime._transport.reserve_record
+            original_submit = runtime._combined_submit
 
-            def record_reserve(items):
+            def record_submit(items, descriptors, *, submit_oversized):
                 reservations.append(tuple(items))
-                return original_reserve(items)
+                return original_submit(items, descriptors, submit_oversized=submit_oversized)
 
-            monkeypatch.setattr(runtime._transport, "reserve_record", record_reserve)
+            monkeypatch.setattr(runtime, "_combined_submit", record_submit)
             global_input = torch.arange(8 * 2 * 4, dtype=torch.float32).reshape(8, 2, 4)
             local_input = global_input[tp_rank * 4:(tp_rank + 1) * 4].to("cuda")
             expected = {}

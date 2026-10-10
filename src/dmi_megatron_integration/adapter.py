@@ -159,6 +159,8 @@ class _ProducerSemantics:
         default=None, repr=False, compare=False,
     )
     eager_nbytes: Callable[[], int] | None = field(default=None, repr=False, compare=False)
+    eager_transport_args: tuple[int, ...] | None = field(default=None, repr=False, compare=False)
+    requires_valid_count: bool | None = field(default=None, repr=False, compare=False)
 
     @property
     def signature(self) -> tuple[object, ...]:
@@ -1059,21 +1061,36 @@ class MegatronAdaptor:
         output_spec: TransportSpec,
         output: HookOutput,
     ) -> StepReservation:
-        entry = ProducerPlanEntry.from_output(
+        # Only prepare_output's non-capture branch calls this method. Capture
+        # builders/replay retain from_output(), emit_prepared_output(), and
+        # the original metadata path.
+        entry, input_bytes = ProducerPlanEntry._from_eager_output(
             output_id=semantics.output_id,
             output_spec=output_spec,
             output=output,
+            transport_args=(semantics.eager_transport_args
+                            if semantics.eager_transport_args is not None
+                            else ProducerPlanBuilder._transport_args(output_spec)),
         )
         if semantics.eager_nbytes is not None:
             nbytes = int(semantics.eager_nbytes())
             if entry.transport_type is not TransportType.SEGMENTED_PACK:
                 raise ValueError("Explicit eager byte sizing requires segmented transport")
             row_bytes = entry.transport_args[0]
-            if nbytes < 0 or nbytes % row_bytes or nbytes > output.tensor.numel() * output.tensor.element_size():
+            if nbytes < 0 or nbytes % row_bytes or nbytes > input_bytes:
                 raise ValueError("Invalid sampled output byte count")
             entry = replace(entry, output_shape=(nbytes // row_bytes, *entry.input_shape[1:]),
                             reservation_upper_bytes=nbytes)
-        return self.emit_prepared_output(entry, semantics, output)
+        ctx = self.current_context
+        if ctx is None:
+            raise RuntimeError("Megatron DMI hook emitted without a schedule event")
+        reservation_bytes = (_align_up(input_bytes)
+                             if entry.transport_type is TransportType.IDENTITY
+                             else self._resolved_output_bytes(entry, semantics, self._event_packing))
+        return self.record_runtime._emit_prepared_output(
+            entry, self._record_metadata(ctx, semantics, eager=True), output,
+            reservation_bytes=reservation_bytes,
+        )
 
     def emit_prepared_output(
         self,
@@ -1330,25 +1347,33 @@ class MegatronAdaptor:
         self,
         ctx: MegatronTrainingContext,
         semantic: _ProducerSemantics,
+        *,
+        eager: bool = False,
     ) -> MegatronRecordMetadata:
-        required_fields = required_record_metadata_fields(
-            record_type=semantic.record_type,
-            need_token_range=semantic.need_token_range,
-            transport_type=semantic.transport_type,
-            dynamic_dataset_provenance=bool(ctx.dataset_ids),
-        )
+        if semantic.requires_valid_count is not None:
+            needs_counts = semantic.requires_valid_count
+            needs_datasets = semantic.record_type is RecordType.PER_SAMPLE and bool(ctx.dataset_ids)
+        else:
+            required_fields = required_record_metadata_fields(
+                record_type=semantic.record_type,
+                need_token_range=semantic.need_token_range,
+                transport_type=semantic.transport_type,
+                dynamic_dataset_provenance=bool(ctx.dataset_ids),
+            )
+            needs_counts = MegatronMetadataField.VALID_COUNT in required_fields
+            needs_datasets = MegatronMetadataField.DATASET_ID in required_fields
         if semantic.record_type is RecordType.PER_SAMPLE:
             dp_rank = ctx.dp_rank
             valid_counts = (
                 ctx._packing.counts_for(
                     semantic.tp_sequence_start, semantic.tp_sequence_length,
                 ).counts
-                if MegatronMetadataField.VALID_COUNT in required_fields
+                if needs_counts
                 else ()
             )
             dataset_ids = (
                 ctx.dataset_ids
-                if MegatronMetadataField.DATASET_ID in required_fields
+                if needs_datasets
                 else ()
             )
             token_start = ctx.token_start if semantic.need_token_range else 0
@@ -1458,6 +1483,14 @@ class MegatronAdaptor:
             ),
             eager_nbytes=next(output.eager_nbytes for output in configured.policy.outputs
                               if output.name == output_spec.name),
+            eager_transport_args=ProducerPlanBuilder._transport_args(output_spec),
+            requires_valid_count=(MegatronMetadataField.VALID_COUNT in
+                required_record_metadata_fields(
+                    record_type=configured.policy.record_type,
+                    need_token_range=bool(configured.policy.need_token_range),
+                    transport_type=output_spec.transport_type,
+                    dynamic_dataset_provenance=False,
+                )),
         )
 
     def _remember_plan(
@@ -1673,13 +1706,31 @@ class MegatronAdaptor:
             values = [raw] if len(physical.outputs) == 1 else list(raw)
             if len(values) != len(physical.outputs):
                 raise ValueError("Megatron hook preprocessing output count mismatch")
+            enrich = (self._enrich_eager_output
+                      if self.hook_runtime.mode is HookRuntimeMode.EAGER_IMMEDIATE
+                      and not self.hook_runtime.te_capture_session_active
+                      else self._enrich_output)
             enriched = [
-                self._enrich_output(hook, spec, value)
+                enrich(hook, spec, value)
                 for spec, value in zip(physical.outputs, values)
             ]
             return enriched[0] if len(enriched) == 1 else tuple(enriched)
 
         return preprocess
+
+    def _enrich_eager_output(
+        self, hook: HookPointV1, spec: TransportSpec, value: Any,
+    ) -> Any:
+        # A bare tensor has no producer metadata to validate/preserve. Build
+        # its final wrapper once. Tuple/custom metadata follows the old path.
+        if isinstance(value, torch.Tensor) and spec.transport_type is TransportType.SEQ_PREFIX_PACK:
+            valid = self._current_valid_count(hook)
+            direction = self._hook_phase(hook).name.lower()
+            prefix = getattr(hook, f"valid_count_prefix_{direction}", None)
+            if prefix is None:
+                raise RuntimeError("SEQ_PREFIX_PACK requires a metadata-owned valid-count prefix")
+            return HookOutput(value, (valid, prefix))
+        return self._enrich_output(hook, spec, value)
 
     def _enrich_output(
         self,
