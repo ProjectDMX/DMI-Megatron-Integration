@@ -159,7 +159,7 @@ def test_layer_filtered_ep_reconstructs_native(tmp_path, graph, pp, count, exper
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 @pytest.mark.parametrize("graph", [False, True], ids=["eager", "te_graph"])
-@pytest.mark.parametrize("world,tp,etp,count", [(1, 1, 1, 1), (2, 2, 2, 1), (2, 2, 2, 3)])
+@pytest.mark.parametrize("world,tp,etp,count", [(1, 1, 1, 1), (1, 1, 1, 2), (2, 2, 2, 1), (2, 2, 2, 3)])
 def test_virtual_source_sampling_reconstructs_native(tmp_path, graph, world, tp, etp, count):
     # Token-shard units per TP source (EP == 1): TP1 shards one source; TP2/ETP2
     # shards each SP source and keeps the selected shards' rows on both partials.

@@ -2502,7 +2502,8 @@ def setup_megatron_dmi(
                 or getattr(model_config, "moe_pad_expert_input_to_capacity", False)):
             raise ValueError("EP source sampling requires dropless, unpadded, non-fused alltoall")
         source_count = (_parallel_world(parallel_state_module, "get_expert_model_parallel_world_size")
-                        * _parallel_world(parallel_state_module, "get_expert_tensor_parallel_world_size"))
+                        * _parallel_world(parallel_state_module, "get_expert_tensor_parallel_world_size")
+                        * getattr(source_sampling, "virtual_sources", 1))
         source_sampling.select(source_sampling.iteration_origin, source_count)
     requires_ep_topology_manifest = bool(
         {"moe-inverse-map", "moe-packed-weighted-output"} & selected_hooks
