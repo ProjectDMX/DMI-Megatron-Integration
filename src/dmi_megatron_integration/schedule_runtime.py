@@ -506,6 +506,10 @@ class MegatronScheduleRuntime:
         if self.record_format is not None and not self._full_iteration_capture_active:
             self.record_format.count_records = True
         self._configure_active_metadata_fields()
+        allowed = getattr(self.adaptor, "eager_direct_packed_allowed", None)
+        self.propagator.context.direct_packed_iteration = bool(
+            allowed is not None and not self._full_iteration_capture_active and allowed(self.phase)
+        )
         metadata_preloaded = self._full_iteration_metadata_preloaded
         if metadata_preloaded:
             self.propagator.context.begin_iteration(active_num_microbatches, clear_buffers=False)
@@ -727,6 +731,11 @@ class MegatronScheduleRuntime:
 
     def _clear_transient_schedule_state(self) -> None:
         if self.adaptor is not None:
+            static_runtime = _static_batch_runtime(self.adaptor)
+            if static_runtime is not None:
+                static_runtime.finish_static_microbatch()
+            if hasattr(self.adaptor, "set_direct_packed_microbatch"):
+                self.adaptor.set_direct_packed_microbatch(None)
             self.adaptor.clear_current_event()
         self.current_event = None
         self.active = False
@@ -818,13 +827,24 @@ class MegatronScheduleRuntime:
         if not self.active or self.current_event is None:
             return
         event = self.current_event
-        self.propagator.enter_scope(event.direction, event.scope_id, event.microbatch_id)
+        adaptor = self.adaptor
+        allowed = getattr(adaptor, "eager_direct_packed_allowed", None)
+        direct = bool(allowed is not None and allowed(self.phase))
+        context = self.propagator.context
+        context.skip_packed_current_copies = direct
+        try:
+            self.propagator.enter_scope(event.direction, event.scope_id, event.microbatch_id)
+        finally:
+            context.skip_packed_current_copies = False
+        if allowed is not None:
+            adaptor.set_direct_packed_microbatch(event.microbatch_id if direct else None)
         self._set_adaptor_event_if_needed(event)
 
     def end_iteration(self) -> None:
         if not self.active:
             return
         self.propagator.end_iteration()
+        self.propagator.context.direct_packed_iteration = False
         self._clear_transient_schedule_state()
         if not self._full_iteration_capture_active and (
             self.phase != "train" or self._logical_training_iteration_id is None
@@ -900,20 +920,43 @@ class MegatronScheduleRuntime:
                 )
             )
             return
-        ctx = MegatronTrainingContext(
-            global_batch_id=int(self.global_batch_id),
-            microbatch_id=int(event.microbatch_id),
-            valid_counts=self._valid_counts_for_microbatch(event.microbatch_id),
-            dataset_ids=self._dataset_ids_for_microbatch(event.microbatch_id),
-            attempt_id=self.current_attempt_id,
-            direction=str(event.direction),
-            phase=str(self.phase),
-            dp_rank=int(self.dp_rank),
-            shard_rank=int(self.shard_rank),
-            token_start=int(self.token_start),
-            _packing=self.propagator.context.prepared_packing(event.microbatch_id),
-        )
+        packing = self.propagator.context.prepared_packing(event.microbatch_id)
+        if (packing is not None and _static_batch_runtime(adaptor) is not None
+                and self._has_metadata_field("valid_count")):
+            # Static fast path: every field below is already normalized here.
+            ctx = MegatronTrainingContext._trusted(
+                global_batch_id=int(self.global_batch_id),
+                microbatch_id=int(event.microbatch_id),
+                valid_counts=packing.global_counts.counts,
+                dataset_ids=self._dataset_ids_for_microbatch(event.microbatch_id),
+                attempt_id=int(self.current_attempt_id),
+                direction=str(event.direction),
+                phase=str(self.phase),
+                scope_id=0,
+                dp_rank=int(self.dp_rank),
+                shard_rank=int(self.shard_rank),
+                token_start=int(self.token_start),
+                model_id=None,
+                _packing=packing,
+            )
+        else:
+            ctx = MegatronTrainingContext(
+                global_batch_id=int(self.global_batch_id),
+                microbatch_id=int(event.microbatch_id),
+                valid_counts=self._valid_counts_for_microbatch(event.microbatch_id),
+                dataset_ids=self._dataset_ids_for_microbatch(event.microbatch_id),
+                attempt_id=self.current_attempt_id,
+                direction=str(event.direction),
+                phase=str(self.phase),
+                dp_rank=int(self.dp_rank),
+                shard_rank=int(self.shard_rank),
+                token_start=int(self.token_start),
+                _packing=packing,
+            )
         adaptor.set_current_event(ctx)
+        static_runtime = _static_batch_runtime(adaptor)
+        if static_runtime is not None:
+            static_runtime.begin_static_microbatch(ctx)
 
     def _submit_iteration_metadata(self, attempt_id: int, status: int, weights_updated: bool) -> None:
         if self.record_format is None:
@@ -972,6 +1015,13 @@ class MegatronScheduleRuntime:
 
 
 _active_runtime: MegatronScheduleRuntime | None = None
+
+
+def _static_batch_runtime(adaptor: Any) -> Any | None:
+    hook_runtime = getattr(adaptor, "hook_runtime", None)
+    if getattr(hook_runtime, "eager_static_batch_enabled", False):
+        return hook_runtime
+    return None
 
 
 def set_active_megatron_schedule_runtime(runtime: MegatronScheduleRuntime | None) -> None:

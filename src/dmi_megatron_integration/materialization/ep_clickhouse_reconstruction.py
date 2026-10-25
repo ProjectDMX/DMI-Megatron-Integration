@@ -372,10 +372,22 @@ def reconstruct_moe_clickhouse_rows(
     from ..hooks.source_sampling import EP_OUTPUT, SourceSampling
     sampling_config = manifest.hook_capture.get(EP_OUTPUT, {}).get("source_sampling")
     sampling = SourceSampling.from_dict(sampling_config) if sampling_config is not None else None
+    virtual_sources = 1 if sampling is None else getattr(sampling, "virtual_sources", 1)
     for key in sorted(key_sets[0], key=key_order):
         topology = manifest.topology_for_layer(key.layer_no)
         selected_sources = None
-        if sampling is not None:
+        selected_shards = None
+        if sampling is not None and virtual_sources > 1:
+            # Units are source-major: unit u is shard u % V of ordered source u // V.
+            selected_shards = []
+            for group in topology.dispatch_groups:
+                ordered = topology.ordered_sources(group)
+                selected_shards.extend(
+                    (ordered[u // virtual_sources], u % virtual_sources)
+                    for u in sampling.select(key.global_batch_id, len(ordered) * virtual_sources)
+                )
+            selected_sources = sorted({rank for rank, _ in selected_shards})
+        elif sampling is not None:
             selected_sources = []
             for group in topology.dispatch_groups:
                 ordered = topology.ordered_sources(group)
@@ -403,6 +415,8 @@ def reconstruct_moe_clickhouse_rows(
             reconstruct_moe_invocation(
                 topology,
                 selected_sources=selected_sources,
+                selected_shards=selected_shards,
+                virtual_sources=virtual_sources,
                 expert_id_shards=expert_id_shards,
                 weight_shards=weight_shards if _ROUTER_WEIGHTS in grouped else None,
                 inverse_map_shards=tuple(

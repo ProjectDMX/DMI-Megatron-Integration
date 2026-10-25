@@ -15,6 +15,7 @@ import warnings
 
 import torch
 from dmi.api.v1 import HookOutput
+from dmi.hooks.record import plain_eager_execution
 
 from .selection import hook_enabled_in_phase
 
@@ -50,6 +51,10 @@ class SourceSampling:
     args: Mapping[str, Any]
     iteration_field: str = "global_batch_id"
     iteration_origin: int = 1
+    # >1 splits each TP source's local tokens into contiguous token shards that
+    # act as sampling units (source-major); only valid with EP == 1 (Megatron
+    # dmi_virtual_source_counts).
+    virtual_sources: int = 1
 
     def __post_init__(self):
         if not isinstance(self.function, str) or not self.function:
@@ -58,6 +63,9 @@ class SourceSampling:
             raise ValueError("source sampling iteration_field must be global_batch_id")
         if not isinstance(self.iteration_origin, int) or isinstance(self.iteration_origin, bool):
             raise TypeError("source sampling iteration_origin must be an integer")
+        if (not isinstance(self.virtual_sources, int) or isinstance(self.virtual_sources, bool)
+                or self.virtual_sources < 1):
+            raise ValueError("source sampling virtual_sources must be a positive integer")
         if not isinstance(self.args, Mapping):
             raise TypeError("source sampling args must be a mapping")
         # Persist exactly the same JSON-compatible arguments on both ends.
@@ -67,14 +75,19 @@ class SourceSampling:
     def from_dict(cls, value):
         if not isinstance(value, Mapping):
             raise TypeError("source_sampling must be a mapping")
-        unknown = set(value) - {"function", "args", "iteration_field", "iteration_origin"}
+        unknown = set(value) - {"function", "args", "iteration_field", "iteration_origin",
+                                "virtual_sources"}
         if unknown:
             raise ValueError(f"Unknown source_sampling fields: {sorted(unknown)}")
         return cls(**value)
 
     def to_dict(self):
-        return dict(function=self.function, args=dict(self.args),
-                    iteration_field=self.iteration_field, iteration_origin=self.iteration_origin)
+        value = dict(function=self.function, args=dict(self.args),
+                     iteration_field=self.iteration_field, iteration_origin=self.iteration_origin)
+        # Omitted by default so EP-source manifests stay byte-identical.
+        if self.virtual_sources != 1:
+            value["virtual_sources"] = self.virtual_sources
+        return value
 
     def select(self, global_batch_id: int, num_sources: int) -> tuple[int, ...]:
         selected = tuple(_load_selector(self.function)(
@@ -123,6 +136,58 @@ def segment_ranges(row_counts: torch.Tensor, selected_units: torch.Tensor,
                        out=starts.view(row_counts.shape[0], -1))
 
 
+class _GraphedSegmentRanges:
+    """segment_ranges replayed from one CUDA graph per fixed shape and buffers.
+
+    The graph reads a static copy of the counts plus the fixed selected/starts/
+    ends buffers, so one call is a copy and a replay instead of several eager
+    ops. CPU tensors, tracing/profiling/stream capture (plain_eager_execution),
+    or a failed capture use segment_ranges directly; a new counts shape/device or different buffer
+    objects capture a new graph.
+    """
+
+    def __init__(self):
+        self.key = None
+        self.graph = None
+        self.counts = None
+        self.failed = False
+
+    def __call__(self, row_counts, selected_units, starts, ends):
+        if self.failed or not row_counts.is_cuda or not plain_eager_execution():
+            return segment_ranges(row_counts, selected_units, starts, ends)
+        key = self.key
+        if (key is None or key[0] is not selected_units or key[1] is not starts
+                or key[2] is not ends or key[3] != row_counts.shape
+                or key[4] != row_counts.device):
+            key = (selected_units, starts, ends, row_counts.shape, row_counts.device)
+            self.key = self.graph = self.counts = None
+            try:
+                self.counts, self.graph = self._capture(row_counts, selected_units, starts, ends)
+            except Exception:  # capture unsupported here: keep the eager ops
+                self.failed = True
+                return segment_ranges(row_counts, selected_units, starts, ends)
+            self.key = key
+        self.counts.copy_(row_counts)
+        self.graph.replay()
+
+    @staticmethod
+    def _capture(row_counts, selected_units, starts, ends):
+        counts = torch.empty_like(row_counts, memory_format=torch.contiguous_format)
+        counts.copy_(row_counts)
+        current = torch.cuda.current_stream(row_counts.device)
+        warmup = torch.cuda.Stream(device=row_counts.device)
+        warmup.wait_stream(current)
+        with torch.cuda.stream(warmup):
+            segment_ranges(counts, selected_units, starts, ends)
+        current.wait_stream(warmup)
+        graph = torch.cuda.CUDAGraph()
+        # thread_local: capture must not be invalidated by CUDA calls on the
+        # DMI drain thread.
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            segment_ranges(counts, selected_units, starts, ends)
+        return counts, graph
+
+
 class ExpertSourceCapture:
     """Eager EP preprocessing with explicit GPU counts and CPU reservation sizing."""
 
@@ -133,9 +198,12 @@ class ExpertSourceCapture:
         self.selected = None
         self.starts = self.ends = None
         self.selected_cpu = None
+        self._selected_np = None
         self._batch = None
         self._count = None
         self._nbytes = None
+        self._segment_ranges = _GraphedSegmentRanges()
+        self._feature_bytes = None
 
     def enabled(self):
         hook = self.hook
@@ -159,21 +227,39 @@ class ExpertSourceCapture:
                 raise ValueError("Source selector must return a fixed number of units")
             self._count = len(selection)
             self.selected_cpu = torch.tensor(selection, dtype=torch.int64)
+            self._selected_np = self.selected_cpu.numpy()
             if self.selected is None:
                 self.selected = torch.empty(self._count, dtype=torch.int64, device=values.device)
                 self.starts = torch.empty(blocks * self._count, dtype=torch.int64, device=values.device)
                 self.ends = torch.empty_like(self.starts)
-            self.selected.copy_(self.selected_cpu)
+            if self.selected.is_cuda:
+                # Pinned and stream-ordered: no host wait for the upload.
+                self.selected.copy_(self.selected_cpu.pin_memory(), non_blocking=True)
+            else:
+                self.selected.copy_(self.selected_cpu)
             self._batch = ctx.global_batch_id
-        cpu_counts = self.dispatcher.num_global_tokens_per_local_expert
+        virtual_sources = getattr(self.policy, "virtual_sources", 1)
+        if virtual_sources > 1:
+            sources = getattr(self.dispatcher, "tp_size", 1) * getattr(self.dispatcher, "ep_size", 1)
+            if units != virtual_sources * sources:
+                raise ValueError("Virtual-source counts do not match the configured shard count")
+            cpu_counts = self.dispatcher.dmi_source_counts_cpu
+            if cpu_counts is None:
+                raise ValueError("Virtual-source sampling requires the synchronized CPU shard counts")
+        else:
+            cpu_counts = self.dispatcher.num_global_tokens_per_local_expert
         if cpu_counts.device.type != "cpu" or cpu_counts.numel() != blocks * units:
             raise ValueError("Source sampling requires the synchronized CPU dispatch counts")
-        selected_rows = int(cpu_counts.reshape(units, blocks).index_select(0, self.selected_cpu).sum())
-        feature_bytes = values.element_size()
-        for dim in values.shape[1:]:
-            feature_bytes *= dim
-        self._nbytes = selected_rows * feature_bytes
-        segment_ranges(row_counts, self.selected, self.starts, self.ends)
+        # Same sum as index_select(0, selected).sum(), without CPU tensor ops.
+        selected_rows = int(cpu_counts.numpy().reshape(units, blocks)[self._selected_np].sum())
+        feature = self._feature_bytes
+        if feature is None or feature[0] != values.shape or feature[1] != values.dtype:
+            feature_bytes = values.element_size()
+            for dim in values.shape[1:]:
+                feature_bytes *= dim
+            self._feature_bytes = feature = (values.shape, values.dtype, feature_bytes)
+        self._nbytes = selected_rows * feature[2]
+        self._segment_ranges(row_counts, self.selected, self.starts, self.ends)
         return HookOutput(values, (self.starts, self.ends))
 
     def output_nbytes(self):

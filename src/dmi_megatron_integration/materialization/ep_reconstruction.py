@@ -249,6 +249,8 @@ def reconstruct_moe_invocation(
     inverse_map_shards: Sequence[InverseMapShard],
     packed_output_shards: Sequence[PackedWeightedOutputShard],
     selected_sources: Sequence[int] | None = None,
+    selected_shards: Sequence[tuple[int, int]] | None = None,
+    virtual_sources: int = 1,
 ) -> ReconstructedMoEInvocation:
     """Reconstruct one logical MoE invocation for the supported CP=1 path."""
 
@@ -296,6 +298,14 @@ def reconstruct_moe_invocation(
     retained_sources = producer_ranks if selected_sources is None else set(selected_sources)
     if not retained_sources.issubset(producer_ranks):
         raise ValueError("Selected sources are outside the dispatch topology")
+    # Virtual sources: (source rank, contiguous local-token shard) sampling units.
+    retained_shards = None if selected_shards is None else set(selected_shards)
+    if retained_shards is not None and (
+        virtual_sources < 2
+        or any(rank not in retained_sources or not 0 <= shard < virtual_sources
+               for rank, shard in retained_shards)
+    ):
+        raise ValueError("Selected shards are outside the selected sources or shard count")
     for name, records in (
         ("expert-ID", ids_by_rank),
         ("inverse-map", inverse_by_rank),
@@ -391,12 +401,27 @@ def reconstruct_moe_invocation(
         ):
             raise ValueError(f"Captured inverse map disagrees with routing on rank {producer_rank}")
 
+        if retained_shards is not None and (
+            tuple(source_flat_indices) != tuple(range(int(ids.shape[0])))
+            or int(ids.shape[0]) % virtual_sources
+        ):
+            raise ValueError(
+                "Virtual-source reconstruction requires unpadded local tokens divisible by the shard count"
+            )
         flat_ids = ids_i64.reshape(-1).to(device="cpu")
         source_routes[producer_rank] = [
             (producer_rank, original_route_index, int(flat_ids[original_route_index].item()))
             for original_route_index in route_order.to(device="cpu").tolist()
         ]
         source_shapes[producer_rank] = (int(ids.shape[0]), int(ids.shape[1]))
+
+    def retained_token(producer_rank: int, token_index: int) -> bool:
+        if producer_rank not in retained_sources:
+            return False
+        if retained_shards is None:
+            return True
+        shard_tokens = source_shapes[producer_rank][0] // virtual_sources
+        return (producer_rank, token_index // shard_tokens) in retained_shards
 
     ep_rank_by_global_rank: dict[int, int] = {}
     dispatch_index_by_global_rank: dict[int, int] = {}
@@ -458,7 +483,10 @@ def reconstruct_moe_invocation(
             common_layout,
             key=lambda route: local_expert_position[route[2]],
         )
-        common_layout = [route for route in common_layout if route[0] in retained_sources]
+        common_layout = [
+            route for route in common_layout
+            if retained_token(route[0], route[1] // topology.top_k)
+        ]
         partials: list[torch.Tensor] = []
         for producer_rank in etp_group:
             packed_record = packed_by_rank[producer_rank]
@@ -494,8 +522,8 @@ def reconstruct_moe_invocation(
     expected_route_keys = {
         (producer_rank, route_index)
         for producer_rank, (token_count, top_k) in source_shapes.items()
-        if producer_rank in retained_sources
         for route_index in range(token_count * top_k)
+        if retained_token(producer_rank, route_index // top_k)
     }
     if set(route_outputs) != expected_route_keys:
         missing = sorted(expected_route_keys.difference(route_outputs))
@@ -522,6 +550,8 @@ def reconstruct_moe_invocation(
         token_count, top_k = source_shapes[producer_rank]
         domain_rows = rows_by_dense_dp.setdefault(ids_record.dense_dp_rank, [])
         for token_index, coordinate in enumerate(ids_record.token_coordinates):
+            if not retained_token(producer_rank, token_index):
+                continue
             route_rows = torch.stack(
                 [
                     route_outputs[(producer_rank, token_index * top_k + slot)]

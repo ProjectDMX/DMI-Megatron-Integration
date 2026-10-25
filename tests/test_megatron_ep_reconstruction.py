@@ -204,6 +204,67 @@ def test_etp_partials_sum_in_common_packed_row_order() -> None:
     )
 
 
+def test_etp_virtual_source_shards_keep_only_selected_source_shard() -> None:
+    # ETP2/EP1, four tokens per source, two shards per source: keep shard 0 of
+    # source rank 1. Packed rows are expert-major, then source, then token.
+    key = MoEExecutionKey("controlled", "train", 8, 0, 0, 4, "fwd")
+    topology = MoEParallelTopology(
+        context_parallel_size=1,
+        top_k=1,
+        global_expert_to_ep_rank=(0, 0),
+        local_expert_order_by_ep_rank={0: (0, 1)},
+        ep_groups=((0,), (1,)),
+        etp_groups=((0, 1),),
+        dispatch_groups=((0, 1),),
+        dense_dp_rank_by_global_rank={0: 0, 1: 1},
+        expert_dp_rank_by_global_rank={0: 0, 1: 0},
+    )
+    ids = {0: [0, 1, 0, 1], 1: [1, 0, 0, 1]}
+    coordinates = {
+        rank: tuple(SourceTokenCoordinate(20, rank, token) for token in range(4))
+        for rank in ids
+    }
+
+    def inverse(rank):
+        return torch.argsort(torch.tensor(ids[rank]), stable=True)
+
+    # Selected rows: expert 0 gets (rank 1, token 1); expert 1 gets (rank 1, token 0).
+    partials = (
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        torch.tensor([[10.0, 20.0], [30.0, 40.0]]),
+    )
+    shards = dict(
+        expert_id_shards=tuple(
+            RouterExpertIdsShard(key, rank, rank, coordinates[rank],
+                                 torch.tensor(ids[rank]).unsqueeze(1))
+            for rank in ids
+        ),
+        inverse_map_shards=tuple(InverseMapShard(key, rank, inverse(rank)) for rank in ids),
+        packed_output_shards=tuple(
+            PackedWeightedOutputShard(key, rank, partials[rank]) for rank in ids
+        ),
+    )
+    result = reconstruct_moe_invocation(
+        topology, selected_sources=(1,), selected_shards=((1, 0),), virtual_sources=2, **shards
+    )
+
+    assert [domain.dense_dp_rank for domain in result.source_domains] == [1]
+    domain = result.source_domains[0]
+    assert domain.token_coordinates == coordinates[1][:2]
+    torch.testing.assert_close(
+        domain.weighted_outputs, torch.tensor([[[33.0, 44.0]], [[11.0, 22.0]]])
+    )
+    with pytest.raises(ValueError, match="Packed row count"):
+        reconstruct_moe_invocation(
+            topology, selected_sources=(1,), selected_shards=((1, 0), (1, 1)),
+            virtual_sources=2, **shards,
+        )
+    with pytest.raises(ValueError, match="Selected shards"):
+        reconstruct_moe_invocation(
+            topology, selected_sources=(0,), selected_shards=((1, 0),), virtual_sources=2, **shards
+        )
+
+
 def test_expert_dp_dispatch_groups_remain_isolated() -> None:
     key = MoEExecutionKey("controlled", "train", 9, 0, 0, 5, "fwd")
     topology = MoEParallelTopology(

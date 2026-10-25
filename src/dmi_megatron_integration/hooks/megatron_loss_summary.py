@@ -92,3 +92,7 @@ __all__ = [
     "per_sample_loss_from_token_loss",
     "per_segment_loss_from_token_loss",
 ]
+
+# Fixed-shape tensor ops only (no host sync or data-dependent shapes): the
+# eager static fast path may replay it as one captured CUDA graph.
+per_sample_loss_from_token_loss._dmi_graph_safe = True

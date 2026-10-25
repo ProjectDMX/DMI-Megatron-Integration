@@ -32,7 +32,7 @@ from tests.test_megatron_real_training_e2e import (
     (1, 1, 1, 1, 1, 2, None),
     (2, 1, 1, 2, 1, 4, None), (2, 2, 1, 1, 2, 2, None),
 ])
-def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep, etp, experts, count, graph, layer_indices=None, router_selection="router-topk"):
+def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep, etp, experts, count, graph, layer_indices=None, router_selection="router-topk", virtual=1):
     if _available_cuda_devices() < world:
         pytest.skip(f"Requires {world} available GPUs")
     if graph and experts == 1:
@@ -44,7 +44,8 @@ def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep,
     oracle_dir = tmp_path / "oracle"
     manifest_path = tmp_path / "topology.json"
     config = tmp_path / "hooks.yaml"
-    policy = SourceSampling(BUILTIN_ROUND_ROBIN, {"count": count}) if count is not None else None
+    policy = (SourceSampling(BUILTIN_ROUND_ROBIN, {"count": count}, virtual_sources=virtual)
+              if count is not None else None)
     config.write_text(yaml.safe_dump({"hooks": {EP_OUTPUT: {
         "source_sampling": policy.to_dict() if policy else None,
     }}}))
@@ -53,7 +54,7 @@ def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep,
             "--dmi-hook-selection", f"{router_selection},moe-inverse-map,moe-packed-weighted-output",
             "--dmi-hook-config", str(config), "--log-interval", "1", "--split", "100,0,0",
             "--attention-dropout", "0", "--hidden-dropout", "0",
-            "--attention-backend", "fused"]
+            "--attention-backend", os.environ.get("DMI_E2E_ATTENTION_BACKEND", "fused")]
     if layer_indices is not None:
         args += ["--dmi-layer-indices", *map(str, layer_indices),
                  "--dmi-no-recompute-hook", "moe-packed-weighted-output"]
@@ -99,14 +100,19 @@ def test_sampled_training_reconstructs_native(tmp_path: Path, world, tp, pp, ep,
         for invocation in invocations:
             layer, batch = invocation.key.layer_no, invocation.key.global_batch_id
             topology = manifest.topology_for_layer(layer)
-            selected = {topology.ordered_sources(group)[u] for group in topology.dispatch_groups
-                        for u in (policy.select(batch, len(group)) if policy else range(len(group)))}
+            # Units are source-major (source, token shard); virtual == 1 is one shard per source.
+            selected = {(topology.ordered_sources(group)[u // virtual], u % virtual)
+                        for group in topology.dispatch_groups
+                        for u in (policy.select(batch, len(group) * virtual) if policy
+                                  else range(len(group) * virtual))}
             expected_tokens = set()
-            for rank in selected:
+            for rank, shard in selected:
                 dp_rank = topology.dense_dp_rank_by_global_rank[rank]
                 tp_rank = next(group.index(rank) for group in manifest.tp_groups if rank in group)
                 local = oracle[rank][layer][batch - 1].reshape(-1, 64)
-                expected_tokens.update((dp_rank, tp_rank * local.shape[0] + i) for i in range(local.shape[0]))
+                shard_len = local.shape[0] // virtual
+                expected_tokens.update((dp_rank, tp_rank * local.shape[0] + i)
+                                       for i in range(shard * shard_len, (shard + 1) * shard_len))
             observed = set()
             for domain in invocation.source_domains:
                 group = next(group for group in manifest.tp_groups
@@ -148,3 +154,16 @@ def test_layer_filtered_ep_reconstructs_native(tmp_path, graph, pp, count, exper
     test_sampled_training_reconstructs_native(tmp_path, world=2, tp=1, pp=pp,
         ep=2 if pp == 1 else 1, etp=1, experts=experts, count=count, graph=graph,
         layer_indices=(1,))
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "te_graph"])
+@pytest.mark.parametrize("world,tp,etp,count", [(1, 1, 1, 1), (2, 2, 2, 1), (2, 2, 2, 3)])
+def test_virtual_source_sampling_reconstructs_native(tmp_path, graph, world, tp, etp, count):
+    # Token-shard units per TP source (EP == 1): TP1 shards one source; TP2/ETP2
+    # shards each SP source and keeps the selected shards' rows on both partials.
+    test_sampled_training_reconstructs_native(
+        tmp_path, world=world, tp=tp, pp=1, ep=1, etp=etp, experts=4,
+        count=count, graph=graph, virtual=4,
+    )

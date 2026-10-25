@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import accumulate
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -284,6 +284,21 @@ class DMIMetadataContext:
                 self._source_use_events = [torch.cuda.Event(external=True)
                                           for _ in range(self.max_num_microbatches)]
         self._active_field_names = frozenset(self.field_specs)
+        # Set per scope by the schedule runtime: eager packed producers then
+        # read the source rows directly, so the packed-count copies are skipped.
+        self.skip_packed_current_copies = False
+        self._source_views: dict[tuple[str, int], torch.Tensor] = {}
+        # Packing depends only on the counts; numpy views write pinned staging
+        # without building a temporary tensor per field and microbatch.
+        self._packing_cache: dict[tuple[int, ...], _PreparedPacking] = {}
+        self._pinned_numpy: dict[tuple[str, int], Any] = {}
+        # Set per iteration by the schedule runtime when eager packed producers
+        # read count tensors directly: counts then come from a value-keyed GPU
+        # cache instead of a per-microbatch upload into the source rows.
+        self.direct_packed_iteration = False
+        self._direct_count_cache: dict[tuple[int, ...], dict[str, torch.Tensor]] = {}
+        self._cpu_numpy: dict[tuple[str, int], Any] = {}
+        self._direct_microbatches: dict[int, dict[str, torch.Tensor]] = {}
 
     def register_valid_count_prefix(self, *, tp_local: bool = False) -> str:
         """Bind a required packing variant before capture; buffers remain stable."""
@@ -357,6 +372,7 @@ class DMIMetadataContext:
             return
         self._prepared_packings.clear()
         self._scope_microbatches.clear()
+        self._direct_microbatches.clear()
         if self._uploads_pending or self._sources_used:
             stream = torch.cuda.current_stream(self.device)
             for index in self._uploads_pending:
@@ -395,6 +411,23 @@ class DMIMetadataContext:
                 if cpu_fields is None or name not in cpu_fields
                 else cpu_fields[name]
             )
+            if (self.direct_packed_iteration and name == "valid_count"
+                    and isinstance(cpu_value_source, torch.Tensor)
+                    and not cpu_value_source.is_cuda and cpu_value_source.dtype == spec.dtype):
+                # Direct iterations: write the CPU row through a cached numpy view.
+                row = self._cpu_numpy.get((name, microbatch_id))
+                if row is None:
+                    row = self._cpu_numpy[(name, microbatch_id)] = (
+                        self._source_cpu_buffers[name][microbatch_id].view(-1).numpy())
+                values = cpu_value_source.reshape(-1).numpy()
+                if values.size > row.size:
+                    raise ValueError(
+                        f"DMI CPU metadata field {name!r} has too many elements: "
+                        f"{values.size} > {row.size}"
+                    )
+                row[:] = 0
+                row[: values.size] = values
+                continue
             cpu_target = self._source_cpu_buffers[name][microbatch_id]
             cpu_target.zero_()
             cpu_value = self._normalize_cpu_field_value(cpu_value_source, spec)
@@ -424,19 +457,61 @@ class DMIMetadataContext:
     def _prepare_cpu_packing(self, microbatch_id: int) -> None:
         if "valid_count" not in self._active_field_names:
             return
-        packing = _PreparedPacking(_prepare_valid_counts(self.source_cpu("valid_count", microbatch_id)))
-        sequence_length = self.dims.get(DimSpec.SEQ, self.dims.get(DimSpec.SEQ.value))
-        if sequence_length is not None and any(
-            count > int(sequence_length) for count in packing.global_counts.counts
-        ):
-            raise ValueError("valid count exceeds configured sequence length")
-        if self.tp_sequence_sharded_enabled:
-            packing.counts_for(self.tp_sequence_start, self.tp_sequence_length)
+        counts = self.source_cpu("valid_count", microbatch_id)
+        packing = self._packing_cache.get(counts)
+        if packing is None:
+            packing = _PreparedPacking(_prepare_valid_counts(counts))
+            sequence_length = self.dims.get(DimSpec.SEQ, self.dims.get(DimSpec.SEQ.value))
+            if sequence_length is not None and any(
+                count > int(sequence_length) for count in packing.global_counts.counts
+            ):
+                raise ValueError("valid count exceeds configured sequence length")
+            if self.tp_sequence_sharded_enabled:
+                packing.counts_for(self.tp_sequence_start, self.tp_sequence_length)
+            if len(self._packing_cache) >= 4096:
+                self._packing_cache.clear()
+            self._packing_cache[counts] = packing
         self._prepared_packings[microbatch_id] = packing
 
     def _upload_prepared_counts(self, microbatch_id: int) -> None:
         if "valid_count" not in self._pinned_count_buffers or "valid_count" not in self._active_field_names:
             return
+        if self.direct_packed_iteration and self.device.type == "cuda":
+            self._direct_microbatches[microbatch_id] = self._direct_counts_for(
+                self._prepared_packings[microbatch_id])
+            return
+        self._upload_source_counts(microbatch_id)
+
+    def _direct_counts_for(self, packing: _PreparedPacking) -> dict[str, torch.Tensor]:
+        key = packing.global_counts.counts
+        tensors = self._direct_count_cache.get(key)
+        if tensors is not None:
+            return tensors
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("CPU packing metadata must be prepared/uploaded before graph capture/replay")
+        tensors = {}
+        for name in ("valid_count", "tp_seq_sharded_valid_count"):
+            if name not in self._pinned_count_buffers:
+                continue
+            counts = (packing.global_counts if name == "valid_count" else
+                      packing.counts_for(self.tp_sequence_start, self.tp_sequence_length))
+            fields = ((name, counts.counts),)
+            if name in self._prefix_variants:
+                fields += ((name + "_prefix", counts.prefix),)
+            for field_name, values in fields:
+                row = self._source_buffers[field_name][0]
+                tensor = torch.zeros_like(row)
+                tensor[: len(values)].copy_(torch.tensor(values, dtype=torch.int64), non_blocking=False)
+                tensors[field_name] = tensor
+        if len(self._direct_count_cache) >= 1024:
+            self._direct_count_cache.clear()
+        self._direct_count_cache[key] = tensors
+        return tensors
+
+    def direct_count(self, name: str, microbatch_id: int) -> torch.Tensor:
+        return self._direct_microbatches[microbatch_id][name]
+
+    def _upload_source_counts(self, microbatch_id: int) -> None:
         packing = self._prepared_packings[microbatch_id]
         stream = None
         if self.device.type == "cuda":
@@ -461,7 +536,10 @@ class DMIMetadataContext:
                 fields += ((name + "_prefix", counts.prefix),)
             for field_name, values in fields:
                 staging = self._pinned_count_buffers[field_name][microbatch_id]
-                staging.copy_(torch.tensor(values, dtype=torch.int64, device="cpu"))
+                staging_values = self._pinned_numpy.get((field_name, microbatch_id))
+                if staging_values is None:
+                    staging_values = self._pinned_numpy[(field_name, microbatch_id)] = staging.numpy()
+                staging_values[:] = values
                 self._source_buffers[field_name][microbatch_id].copy_(staging, non_blocking=True)
         if stream is not None:
             self._upload_events[microbatch_id].record(stream)
@@ -480,21 +558,31 @@ class DMIMetadataContext:
         direction_idx = self._direction_index(direction)
         self._check_scope_id(scope_id)
         self._check_microbatch_id(microbatch_id)
+        if not self.skip_packed_current_copies and self._direct_microbatches.pop(microbatch_id, None) is not None:
+            # This scope reads the current buffers: populate the source rows now.
+            self._upload_source_counts(microbatch_id)
+        elif (self.skip_packed_current_copies and microbatch_id in self._direct_microbatches
+              and self._active_field_names == {"valid_count"}):
+            # Counts come from the value cache: no source rows to wait for,
+            # copy, or protect for this scope.
+            self._scope_microbatches[(self._direction_index(direction), scope_id)] = microbatch_id
+            return
         stream = torch.cuda.current_stream(self.device) if self._upload_events else None
         if stream is not None and microbatch_id in self._uploads_pending:
             stream.wait_event(self._upload_events[microbatch_id])
+        skip_packed = self.skip_packed_current_copies
         for name in self._active_field_names:
-            if name not in self._current_buffers:
+            if name not in self._current_buffers or (skip_packed and name == "valid_count"):
                 continue
             self._current_buffers[name][direction_idx, scope_id].copy_(
                 self._source_buffers[name][microbatch_id]
             )
-        if self.tp_sequence_sharded_enabled:
+        if self.tp_sequence_sharded_enabled and not skip_packed:
             local = self._current_buffers["tp_seq_sharded_valid_count"][
                 direction_idx, scope_id
             ]
             local.copy_(self._source_buffers["tp_seq_sharded_valid_count"][microbatch_id])
-        for name in self._prefix_variants:
+        for name in () if skip_packed else self._prefix_variants:
             prefix_name = name + "_prefix"
             self._current_buffers[prefix_name][direction_idx, scope_id].copy_(
                 self._source_buffers[prefix_name][microbatch_id],
@@ -521,6 +609,14 @@ class DMIMetadataContext:
             raise KeyError(f"Unknown DMI metadata field {name!r}")
         self._check_allocated_microbatch_id(microbatch_id)
         return self._source_buffers[name][microbatch_id]
+
+    def source_view(self, name: str, microbatch_id: int) -> torch.Tensor:
+        """Cached ``source(name, microbatch_id)``; source buffers never move."""
+        key = (name, microbatch_id)
+        view = self._source_views.get(key)
+        if view is None:
+            view = self._source_views[key] = self.source(name, microbatch_id)
+        return view
 
     def source_cpu_tensor(self, name: str, microbatch_id: int) -> torch.Tensor:
         if name not in self._source_cpu_buffers:

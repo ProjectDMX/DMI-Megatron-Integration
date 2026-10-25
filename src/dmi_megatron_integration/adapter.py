@@ -8,7 +8,9 @@ from typing import Any, Callable, Mapping, Sequence
 import weakref
 
 import torch
+from dmi.hooks import point as _hook_point
 from dmi.hooks.producer_plan import _align_up, _dtype_element_size, _payload_alignment
+from dmi.hooks.record import _as_hook_output, _normalize_outputs
 
 from dmi.api.v1 import (
     HookOutput,
@@ -60,6 +62,14 @@ class MegatronTrainingContext:
     token_start: int = 0
     model_id: str | None = None
     _packing: _PreparedPacking | None = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def _trusted(cls, **fields: Any) -> "MegatronTrainingContext":
+        """Schedule-runtime constructor for already normalized fields."""
+        ctx = object.__new__(cls)
+        for name in cls.__dataclass_fields__:
+            object.__setattr__(ctx, name, fields.get(name, cls.__dataclass_fields__[name].default))
+        return ctx
 
     def __post_init__(self) -> None:
         counts = _normalize_int_tuple(self.valid_counts)
@@ -379,6 +389,98 @@ class _CapturedPlanState:
 
 
 @dataclass(frozen=True)
+class _StaticStep:
+    """One planned hook firing: its own preprocessing and (output index, slot) pairs."""
+
+    hook: HookPointV1
+    preprocess: Callable[..., Any] | None
+    output_count: int
+    slots: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class _StaticLaunch:
+    """Native launcher whose slots were bound once at plan confirmation."""
+
+    steps: tuple[_StaticStep, ...]
+    launcher: Any
+    fire: Callable[[int, torch.Tensor], None]
+    set_counts: Callable[[int, int, int], None]
+    packed_slots: tuple[tuple[int, HookPointV1], ...]
+
+
+class _GraphedPreprocess:
+    """Replay a graph-safe, fixed-shape hook preprocess as one CUDA graph.
+
+    Inputs are copied into captured buffers; outputs are the captured buffers,
+    consumed by producers already ordered on the same stream. Any other input
+    shape or dtype runs the original function eagerly.
+    """
+
+    def __init__(self, fn: Callable[..., Any]) -> None:
+        self.fn = fn
+        self.graph = None
+        self.inputs: tuple[torch.Tensor, ...] = ()
+        self.outputs: Any = None
+
+    def __call__(self, *inputs: Any) -> Any:
+        if self.graph is None:
+            if not inputs or not all(isinstance(x, torch.Tensor) and x.is_cuda for x in inputs):
+                return self.fn(*inputs)
+            self._capture(inputs)
+        captured = self.inputs
+        if len(inputs) != len(captured) or any(
+            x.shape != c.shape or x.dtype != c.dtype for x, c in zip(inputs, captured)
+        ):
+            return self.fn(*inputs)
+        for target, value in zip(captured, inputs):
+            target.copy_(value)
+        self.graph.replay()
+        return self.outputs
+
+    def _capture(self, inputs: tuple[torch.Tensor, ...]) -> None:
+        self.inputs = tuple(x.detach().clone() for x in inputs)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            self.fn(*self.inputs)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        # Thread-local capture: MIND's drain thread keeps using its own stream.
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            self.outputs = self.fn(*self.inputs)
+        self.graph = graph
+
+
+@dataclass(frozen=True)
+class _StaticBatchPlan:
+    """Confirmed eager output order for one (phase, direction, scope) event."""
+
+    plan: ProducerPlan
+    hook_ids: tuple[int, ...]
+    output_ids: tuple[int, ...]
+    launch: _StaticLaunch | None = None
+    replay_cache: dict = field(default_factory=dict, compare=False)
+
+
+_MISSING = object()
+
+
+def _native_extension():
+    try:
+        from dmi.transport.native import _load_extension
+        return _load_extension()
+    except Exception:  # no native backend: the per-hook path remains
+        return None
+
+
+def _MONITORING_DEBUG() -> bool:
+    return bool(_hook_point._MONITORING_DEBUG)
+
+
+
+
+@dataclass(frozen=True)
 class MegatronHookBinding:
     hook: HookPointV1
     scope_id: int = 0
@@ -433,13 +535,43 @@ class InvocationIdAllocator:
         token_start: int,
         record_type: RecordType,
     ) -> int:
+        key = self._key(
+            model_id=model_id, phase=phase, global_batch_id=global_batch_id,
+            attempt_id=attempt_id, dp_rank=dp_rank, microbatch_id=microbatch_id,
+            direction=direction, output_id=output_id, layer_no=layer_no,
+            shard_rank=shard_rank, token_start=token_start, record_type=record_type,
+        )
+        invocation_id = self._next_by_key.get(key, 0)
+        self._next_by_key[key] = invocation_id + 1
+        return invocation_id
+
+    def is_first(self, **allocation: Any) -> bool:
+        """Whether ``allocate(**allocation)`` would return 0, without allocating."""
+        return self._key(**allocation) not in self._next_by_key
+
+    def _key(
+        self,
+        *,
+        model_id: str,
+        phase: str,
+        global_batch_id: int,
+        attempt_id: int,
+        dp_rank: int,
+        microbatch_id: int,
+        direction: str,
+        output_id: int,
+        layer_no: int,
+        shard_rank: int,
+        token_start: int,
+        record_type: RecordType,
+    ) -> tuple[object, ...]:
         prefix = (str(model_id), str(phase), int(global_batch_id), int(attempt_id))
         if self._active is None or prefix != self._active:
             raise RuntimeError(
                 "DMI invocation allocation does not match the active attempt: "
                 f"active={self._active!r}, row={prefix!r}"
             )
-        key = (
+        return (
             *prefix,
             int(dp_rank),
             int(microbatch_id),
@@ -450,9 +582,6 @@ class InvocationIdAllocator:
             int(token_start),
             int(record_type),
         )
-        invocation_id = self._next_by_key.get(key, 0)
-        self._next_by_key[key] = invocation_id + 1
-        return invocation_id
 
     def end_attempt(self, *, attempt_id: int) -> None:
         if self._active is None:
@@ -479,6 +608,280 @@ class MegatronHookRuntime:
         self._capture_semantics: list[_ProducerSemantics] | None = None
         self._capture_events: list[MegatronEventCoordinates] | None = None
         self._te_capture_session_active = False
+        # Opt-in eager static batch: one reservation per non-train microbatch
+        # once two consecutive microbatches emit the same static outputs.
+        self.eager_static_batch_enabled = False
+        self._static_plans: dict[tuple[str, str, int], _StaticBatchPlan] = {}
+        self._static_candidates: dict[tuple[str, str, int], tuple] = {}
+        self._static_ineligible: set[tuple[str, str, int]] = set()
+        self._static_recording: list | None = None
+        self._static_recording_key: tuple[str, str, int] | None = None
+        self._static_armed: _StaticBatchPlan | None = None
+        self._static_cursor = 0
+        self._static_step = 0
+        self._static_bound_counts = None
+        # HookPointV1 fast-path entry; set only while a static batch is armed.
+        self.fast_forward = None
+
+    def reset_static_batches(self) -> None:
+        self._static_plans.clear()
+        self._static_candidates.clear()
+        self._static_ineligible.clear()
+        self._static_recording = None
+        self._static_recording_key = None
+        self._static_armed = None
+        self._static_cursor = 0
+        self._static_step = 0
+        self._static_bound_counts = None
+        self.fast_forward = None
+
+    def begin_static_microbatch(self, ctx: MegatronTrainingContext) -> None:
+        """Reserve a confirmed static plan before this microbatch's forward.
+
+        Unconfirmed events record their eager outputs instead. Train phases,
+        capture sessions, and oversized or skipped batches use the per-hook path.
+        """
+
+        self.finish_static_microbatch()
+        if (
+            ctx.phase == "train"
+            or self.mode is not HookRuntimeMode.EAGER_IMMEDIATE
+            or self._capture_builder is not None
+            or self._te_capture_session_active
+        ):
+            return
+        key = (ctx.phase, ctx.direction, ctx.scope_id)
+        static = self._static_plans.get(key)
+        if static is None:
+            if key not in self._static_ineligible:
+                self._static_recording = []
+                self._static_recording_key = key
+            return
+        reservation = self._submit_static_batch(static, ctx)
+        if reservation in (StepReservation.OVERSIZED, StepReservation.SKIPPED):
+            return
+        self._static_armed = static
+        self._static_cursor = 0
+        self._static_step = 0
+        if static.launch is not None and not _MONITORING_DEBUG():
+            # Graph-like eager path: hooks only run their own preprocessing
+            # and launch producers into the slots reserved above.
+            # Rebind counts only when this microbatch's count tensors changed
+            # (value-cached direct counts repeat across microbatches).
+            context = self.adaptor._metadata_context
+            counts = None if context is None else context._direct_microbatches.get(
+                self.adaptor._direct_packed_microbatch)
+            if counts is None or counts is not self._static_bound_counts:
+                set_counts = static.launch.set_counts
+                for slot, hook in static.launch.packed_slots:
+                    valid, prefix = self.adaptor._packed_meta(hook)
+                    set_counts(slot, valid.data_ptr(), prefix.data_ptr())
+                self._static_bound_counts = counts
+            self.fast_forward = self._fast_forward
+
+    def finish_static_microbatch(self) -> None:
+        armed = self._static_armed
+        if armed is not None:
+            self._static_armed = None
+            self.fast_forward = None
+            if self._static_cursor != len(armed.output_ids):
+                raise RuntimeError(
+                    "DMI eager static batch reserved "
+                    f"{len(armed.output_ids)} outputs but {self._static_cursor} fired"
+                )
+            return
+        recording = self._static_recording
+        if recording is None:
+            return
+        key = self._static_recording_key
+        self._static_recording = None
+        self._static_recording_key = None
+        signature = tuple(recording)
+        if not signature or any(item is None for item in signature):
+            self._static_candidates.pop(key, None)
+            self._mark_static_ineligible(key, "non-static output")
+            return
+        candidate = self._static_candidates.pop(key, None)
+        if candidate is None:
+            self._static_candidates[key] = signature
+            return
+        if candidate != signature:
+            self._mark_static_ineligible(key, "outputs changed between microbatches")
+            return
+        hooks, output_indices, entries, semantics = zip(*signature)
+        plan = ProducerPlan(tuple(entries))
+        self.adaptor._remember_plan(plan, semantics)
+        launch = self._build_static_launch(hooks, output_indices, entries)
+        self._static_plans[key] = _StaticBatchPlan(
+            plan, tuple(id(hook) for hook in hooks), tuple(item.output_id for item in semantics),
+            launch=launch,
+        )
+        print(f"DMI_EAGER_STATIC_BATCH_PLAN phase={key[0]} direction={key[1]} "
+              f"scope={key[2]} outputs={len(entries)} fast_launch={launch is not None}",
+              flush=True)
+
+    def _mark_static_ineligible(self, key: tuple[str, str, int], reason: str) -> None:
+        self._static_ineligible.add(key)
+        print(f"DMI_EAGER_STATIC_BATCH_INELIGIBLE phase={key[0]} direction={key[1]} "
+              f"scope={key[2]} reason={reason}", flush=True)
+
+    def _record_static_output(
+        self,
+        hook: HookPointV1,
+        output_index: int,
+        semantics: _ProducerSemantics,
+        output_spec: TransportSpec,
+        output: HookOutput,
+    ) -> None:
+        if semantics.eager_nbytes is not None or output_spec.transport_type not in (
+            TransportType.IDENTITY, TransportType.SEQ_PREFIX_PACK,
+        ):
+            self._static_recording.append(None)
+            return
+        entry, _ = ProducerPlanEntry._from_eager_output(
+            output_id=semantics.output_id,
+            output_spec=output_spec,
+            output=output,
+            transport_args=(semantics.eager_transport_args
+                            if semantics.eager_transport_args is not None
+                            else ProducerPlanBuilder._transport_args(output_spec)),
+        )
+        self._static_recording.append((hook, int(output_index), entry, semantics))
+
+    def _consume_static_output(
+        self, armed: _StaticBatchPlan, hook: HookPointV1, output_id: int, output: HookOutput,
+    ) -> StepReservation:
+        # Descriptors are already queued, so a mismatch cannot fall back.
+        index = self._static_cursor
+        if index >= len(armed.output_ids):
+            raise RuntimeError("DMI eager static batch received an unplanned output")
+        entry = armed.plan.entries[index]
+        tensor = output.tensor
+        if (
+            armed.output_ids[index] != output_id
+            or armed.hook_ids[index] != id(hook)
+            or tensor.shape != entry.input_shape
+            or tensor.dtype != entry.dtype
+        ):
+            raise RuntimeError(
+                f"DMI eager static batch output {index} does not match the reserved plan"
+            )
+        self._static_cursor = index + 1
+        return StepReservation.RESERVED
+
+    def _build_static_launch(self, hooks, output_indices, entries) -> "_StaticLaunch | None":
+        """Bind native producer slots per planned output; None keeps the per-hook path."""
+        engine = getattr(getattr(self.adaptor.record_runtime, "_transport", None), "_ring_engine", None)
+        launcher_type = getattr(_native_extension(), "StaticLauncher", None)
+        if engine is None or launcher_type is None:
+            return None
+        launcher = launcher_type(engine)
+        steps, packed_slots = [], []
+        for hook, output_index, entry in zip(hooks, output_indices, entries):
+            info = self.adaptor._fast_hook_info.get(id(hook))
+            packed = entry.transport_type is TransportType.SEQ_PREFIX_PACK
+            if (info is None or not info[2] or hook._ring_payload is None
+                    or "_dispatch" in vars(hook)
+                    or type(hook)._dispatch is not HookPointV1._dispatch
+                    or (packed and id(hook) not in self.adaptor._eager_packed_info)):
+                # Custom dispatch, a real sequence-shard narrow, or unbound
+                # packing metadata keeps the per-hook path.
+                return None
+            gate = hook._gate_tensor
+            slot = launcher.add(
+                packed, list(entry.input_shape), entry.dtype, hook._ring_payload.device.index,
+                int(entry.input_shape[1]) if packed else 0,
+                int(entry.transport_args[0]) if packed else 0,
+                0 if gate is None else gate.data_ptr(), int(hook._gate_value),
+            )
+            if packed:
+                packed_slots.append((slot, hook))
+            if steps and steps[-1][0] is hook and output_index > steps[-1][2][-1][0]:
+                steps[-1][2].append((output_index, slot))
+            else:
+                preprocess = info[0]
+                if getattr(preprocess, "_dmi_graph_safe", False):
+                    preprocess = _GraphedPreprocess(preprocess)
+                steps.append((hook, (preprocess, info[1]), [(output_index, slot)]))
+        return _StaticLaunch(
+            steps=tuple(_StaticStep(hook, pre[0], pre[1], tuple(pairs)) for hook, pre, pairs in steps),
+            launcher=launcher,
+            fire=launcher.launch,
+            set_counts=launcher.set_counts,
+            packed_slots=tuple(packed_slots),
+        )
+
+    def _fast_forward(self, hook: HookPointV1, inputs: tuple) -> bool:
+        index = self._static_step
+        steps = self._static_armed.launch.steps
+        if index >= len(steps) or steps[index].hook is not hook:
+            # Not the next planned firing: the normal path decides (no-op
+            # for non-emitting hooks, an error for a genuine plan mismatch).
+            return False
+        step = steps[index]
+        if step.preprocess is None:
+            values = inputs
+            if len(values) != step.output_count:
+                raise ValueError(
+                    f"HookPointV1 expected {step.output_count} outputs, got {len(values)}"
+                )
+        else:
+            values = _normalize_outputs(step.preprocess(*inputs), step.output_count)
+        fire = self._static_armed.launch.fire
+        for output_index, slot in step.slots:
+            value = values[output_index]
+            # The native slot checks device, dtype and shape before launching.
+            fire(slot, value if isinstance(value, torch.Tensor) else _as_hook_output(value).tensor)
+        self._static_cursor += len(step.slots)
+        self._static_step = index + 1
+        return True
+
+    def _submit_static_batch(
+        self, static: _StaticBatchPlan, ctx: MegatronTrainingContext,
+    ) -> StepReservation:
+        """One reservation for the whole microbatch; cached like a graph replay.
+
+        The first microbatch of each packing key uses the public replay path
+        (encoding, sizing, capacity check); later ones reuse its reservation
+        items and descriptor rows, refreshing only the batch/microbatch ids.
+        """
+        adaptor = self.adaptor
+        runtime = adaptor.record_runtime
+        transport = getattr(runtime, "_transport", None)
+        submit = getattr(runtime, "_combined_submit", None)
+        if (
+            submit is None or _MONITORING_DEBUG()
+            or getattr(runtime, "_native_encode", None) is None
+            or ctx.phase == "train"
+        ):
+            return adaptor.prepare_replay(static.plan, ctx, plan_direction=ctx.direction)
+        if transport.null_offload:
+            return StepReservation.SKIPPED
+        key = (ctx.model_id, ctx.phase, ctx.direction, ctx.attempt_id, ctx.dp_rank,
+               ctx.shard_rank, ctx.token_start, ctx.valid_counts, ctx.dataset_ids)
+        cached = static.replay_cache.get(key, _MISSING)
+        launcher = None if static.launch is None else static.launch.launcher
+        if cached is _MISSING:
+            cached = static.replay_cache[key] = adaptor._static_replay_template(
+                static.plan, ctx, launcher)
+            return cached[0] if cached[1] is None else cached[1]
+        result, _, items, templates, total_rows, template_id = cached
+        if result is StepReservation.OVERSIZED:
+            return result
+        batch, microbatch = ctx.global_batch_id, ctx.microbatch_id
+        record_format = runtime._format
+        if record_format.count_records and ctx.attempt_id >= 0 and total_rows:
+            counts = record_format._expected_records
+            count_key = (ctx.phase, batch, ctx.attempt_id)
+            counts[count_key] = counts.get(count_key, 0) + total_rows
+        if template_id is not None:
+            # Native template: one call patches the ids, reserves and pushes.
+            return StepReservation(launcher.submit(template_id, batch, microbatch))
+        descriptors = tuple(
+            (layout, (*head, batch, dp_rank, microbatch, *tail), rows, output_id)
+            for layout, head, dp_rank, tail, rows, output_id in templates
+        )
+        return StepReservation(submit(items, descriptors, submit_oversized=False))
 
     def begin_capture_plan(
         self,
@@ -655,14 +1058,20 @@ class MegatronHookRuntime:
                 # No reservation/metadata/producer: same no-dispatch return as
                 # the existing CPU-direct path, before recording graph entries.
                 return StepReservation.OVERSIZED
+        armed = self._static_armed
+        if armed is not None:
+            return self._consume_static_output(armed, hook, int(output_id), output)
         semantics = self.adaptor._configured_hook(hook).output_semantics[output_index]
         builder = self._capture_builder
         if builder is None:
-            return self.adaptor.emit_immediate_output(
+            reservation = self.adaptor.emit_immediate_output(
                 semantics=semantics,
                 output_spec=output_spec,
                 output=output,
             )
+            if self._static_recording is not None:
+                self._record_static_output(hook, output_index, semantics, output_spec, output)
+            return reservation
         entry = builder.record_output(
             output_id=int(output_id),
             output_spec=output_spec,
@@ -737,6 +1146,25 @@ class MegatronAdaptor:
         self.hook_runtime = MegatronHookRuntime(self)
         self.iteration_hook_runtime = MegatronIterationHookRuntime(self)
         self.invocation_allocator: InvocationIdAllocator | None = None
+        self._metadata_context: DMIMetadataContext | None = None
+        # Per hook: (raw preprocess, output count, launchable without the
+        # sequence-shard narrow), recorded when its wrapper is built.
+        self._fast_hook_info: dict[int, tuple] = {}
+        # Per packed hook: [valid attr, prefix attr, source field, source
+        # prefix field, last validated valid tensor, last validated prefix].
+        self._eager_packed_info: dict[int, list] = {}
+        self._direct_packed_consumers: tuple[HookPointV1, ...] = ()
+        self._direct_packed_phase_ok: dict[str, bool] = {}
+        self.eager_direct_packed_enabled = False
+        self._direct_packed_microbatch: int | None = None
+        # Graph-replay reservation templates (see _prepare_cached_replay), the
+        # native launcher that submits them, and the invocation allocations
+        # recorded while one template is built.
+        self._replay_templates: dict[tuple, tuple] = {}
+        self._emit_templates: dict[tuple, tuple] = {}
+        self._eager_entries: dict[tuple, tuple] = {}
+        self._replay_launcher: Any = _MISSING
+        self._invocation_log: list | None = None
 
     def begin_capture_plan(
         self,
@@ -824,6 +1252,16 @@ class MegatronAdaptor:
         self.configured_hooks = []
         self._configured_by_hook = {}
         self._plan_states_by_id.clear()
+        self._replay_templates.clear()
+        self._emit_templates.clear()
+        self._eager_entries.clear()
+        self.hook_runtime.reset_static_batches()
+        self._metadata_context = metadata_context
+        self._fast_hook_info = {}
+        self._eager_packed_info = {}
+        self._direct_packed_phase_ok = {}
+        self._direct_packed_microbatch = None
+        direct_consumers = []
         for binding in bindings:
             hook = binding.hook
             policy = self._hook_policy(hook)
@@ -837,6 +1275,20 @@ class MegatronAdaptor:
                 is_iteration=is_iteration,
                 active_input_layout=active_input_layout,
             )
+            if not is_iteration and any(
+                output.transport_type is TransportType.SEQ_PREFIX_PACK for output in policy.outputs
+            ):
+                direction = self._hook_phase(hook).name.lower()
+                field_name = ("tp_seq_sharded_valid_count"
+                              if policy.shard_policy is ShardPolicy.TP_SEQUENCE_SHARDED
+                              else "valid_count")
+                self._eager_packed_info[id(hook)] = [
+                    f"valid_count_{direction}", f"valid_count_prefix_{direction}",
+                    field_name, field_name + "_prefix", None, None,
+                ]
+            if MegatronMetadataField.VALID_COUNT in policy.preprocess_metadata_fields:
+                # Reads the current valid-count buffers itself, not via producers.
+                direct_consumers.append(hook)
             if metadata_context is not None and not is_iteration:
                 phase = self._hook_phase(hook)
                 for metadata_field in policy.binding_metadata_fields:
@@ -913,6 +1365,7 @@ class MegatronAdaptor:
             ))
             self.configured_hooks[-1] = configured
             self._configured_by_hook[id(hook)] = configured
+        self._direct_packed_consumers = tuple(direct_consumers)
         retain_recompute = any(
             item.policy.record_type in (RecordType.PER_SAMPLE, RecordType.PER_EXECUTION)
             and not self._hook_suppress_recompute(item.hook)
@@ -1023,6 +1476,37 @@ class MegatronAdaptor:
         if self.invocation_allocator is not None:
             self.invocation_allocator.end_attempt(attempt_id=attempt_id)
 
+    def configure_eager_direct_packed_metadata(self, enabled: bool) -> None:
+        self.eager_direct_packed_enabled = bool(enabled)
+        self._direct_packed_phase_ok = {}
+
+    def eager_direct_packed_allowed(self, phase: str) -> bool:
+        """Whether this eager scope may skip the current packed-count copies.
+
+        Only non-train phases outside capture, and only when no enabled hook
+        reads the current valid-count buffers directly.
+        """
+        if not self.eager_direct_packed_enabled or phase == "train" or self._metadata_context is None:
+            return False
+        runtime = self.hook_runtime
+        if (runtime.mode is not HookRuntimeMode.EAGER_IMMEDIATE
+                or runtime._capture_builder is not None or runtime.te_capture_session_active):
+            return False
+        allowed = self._direct_packed_phase_ok.get(phase)
+        if allowed is None:
+            allowed = self._direct_packed_phase_ok[phase] = not any(
+                hook.enabled and hook_enabled_in_phase(hook, phase)
+                for hook in self._direct_packed_consumers
+            )
+        return allowed
+
+    def set_direct_packed_microbatch(self, microbatch_id: int | None) -> None:
+        self._direct_packed_microbatch = microbatch_id
+
+    def configure_eager_static_batch(self, enabled: bool) -> None:
+        self.hook_runtime.reset_static_batches()
+        self.hook_runtime.eager_static_batch_enabled = bool(enabled)
+
     def set_current_event(self, ctx: MegatronTrainingContext) -> None:
         self.current_context = ctx
         self._event_packing = ctx._packing
@@ -1064,6 +1548,30 @@ class MegatronAdaptor:
         # Only prepare_output's non-capture branch calls this method. Capture
         # builders/replay retain from_output(), emit_prepared_output(), and
         # the original metadata path.
+        ctx = self.current_context
+        tensor = output.tensor
+        if ctx is not None and isinstance(tensor, torch.Tensor):
+            # The entry and reservation bytes depend only on these inputs; a
+            # repeat skips rebuilding them (first use runs every check below).
+            nbytes = None if semantics.eager_nbytes is None else int(semantics.eager_nbytes())
+            key = (id(semantics), id(output_spec), tensor.shape, tensor.dtype, nbytes,
+                   ctx.valid_counts)
+            cached = self._eager_entries.get(key)
+            if cached is None or cached[0] is not semantics or cached[1] is not output_spec:
+                entry, reservation_bytes = self._build_eager_entry(
+                    semantics, output_spec, output, nbytes, ctx)
+                if len(self._eager_entries) >= 4096:
+                    self._eager_entries.clear()
+                self._eager_entries[key] = cached = (semantics, output_spec, entry, reservation_bytes)
+            _, _, entry, reservation_bytes = cached
+            reservation = self._emit_cached(entry, semantics, ctx, output, reservation_bytes,
+                                            key=key)
+            if reservation is not None:
+                return reservation
+            return self.record_runtime._emit_prepared_output(
+                entry, self._record_metadata(ctx, semantics, eager=True), output,
+                reservation_bytes=reservation_bytes,
+            )
         entry, input_bytes = ProducerPlanEntry._from_eager_output(
             output_id=semantics.output_id,
             output_spec=output_spec,
@@ -1092,6 +1600,114 @@ class MegatronAdaptor:
             reservation_bytes=reservation_bytes,
         )
 
+    def _build_eager_entry(
+        self,
+        semantics: _ProducerSemantics,
+        output_spec: TransportSpec,
+        output: HookOutput,
+        nbytes: int | None,
+        ctx: MegatronTrainingContext,
+    ) -> tuple[ProducerPlanEntry, int]:
+        """The eager entry and reservation bytes, with the general path's checks."""
+        entry, input_bytes = ProducerPlanEntry._from_eager_output(
+            output_id=semantics.output_id,
+            output_spec=output_spec,
+            output=output,
+            transport_args=(semantics.eager_transport_args
+                            if semantics.eager_transport_args is not None
+                            else ProducerPlanBuilder._transport_args(output_spec)),
+        )
+        if nbytes is not None:
+            if entry.transport_type is not TransportType.SEGMENTED_PACK:
+                raise ValueError("Explicit eager byte sizing requires segmented transport")
+            row_bytes = entry.transport_args[0]
+            if nbytes < 0 or nbytes % row_bytes or nbytes > input_bytes:
+                raise ValueError("Invalid sampled output byte count")
+            entry = replace(entry, output_shape=(nbytes // row_bytes, *entry.input_shape[1:]),
+                            reservation_upper_bytes=nbytes)
+        reservation_bytes = (_align_up(input_bytes)
+                             if entry.transport_type is TransportType.IDENTITY
+                             else self._resolved_output_bytes(entry, semantics, self._event_packing))
+        return entry, reservation_bytes
+
+    def _emit_cached(
+        self,
+        entry: ProducerPlanEntry,
+        semantics: _ProducerSemantics,
+        ctx: MegatronTrainingContext,
+        output: HookOutput,
+        reservation_bytes: int,
+        *,
+        key: tuple,
+    ) -> StepReservation | None:
+        """Eager emits that differ only in batch/microbatch ids reuse one template.
+
+        The key holds the full eager entry (shapes, dtype, sampled rows, bound)
+        and its reservation bytes, so any size change misses. A hit submits the
+        template first and allocates invocation ids and record counts only when
+        it reserved; an oversized hit has changed nothing and runs the general
+        path (descriptor push plus CPU-direct payload). A miss runs the general
+        path's steps and keeps a template only when every row has the expected
+        id cells and invocation id 0. Returns None for the general path.
+        """
+        runtime = self.record_runtime
+        transport = getattr(runtime, "_transport", None)
+        if (
+            _MONITORING_DEBUG() or transport is None or transport.null_offload
+            or getattr(runtime, "_combined_submit", None) is None
+            or getattr(runtime, "_native_encode", None) is None
+        ):
+            return None
+        launcher = self._replay_template_launcher()
+        if launcher is None:
+            return None
+        # ``key`` (hook, output spec, tensor shape/dtype, sampled bytes, valid
+        # counts) determines the entry and reservation bytes.
+        key = (key, ctx.model_id, ctx.phase, ctx.direction, ctx.attempt_id, ctx.dp_rank,
+               ctx.shard_rank, ctx.token_start, ctx.dataset_ids)
+        batch, microbatch = ctx.global_batch_id, ctx.microbatch_id
+        cached = self._emit_templates.get(key)
+        if cached is not None and cached[0] is semantics:
+            _, template_id, counted_rows, allocations = cached
+            calls = [dict(allocation, global_batch_id=int(batch), microbatch_id=int(microbatch))
+                     for allocation in allocations]
+            allocator = self.invocation_allocator
+            if calls and not all(allocator.is_first(**call) for call in calls):
+                return None
+            reservation = StepReservation(launcher.submit(template_id, batch, microbatch))
+            if reservation is StepReservation.OVERSIZED:
+                return None
+            for call in calls:
+                allocator.allocate(**call)
+            record_format = runtime._format
+            if record_format.count_records and ctx.attempt_id >= 0 and counted_rows:
+                counts = record_format._expected_records
+                count_key = (ctx.phase, batch, ctx.attempt_id)
+                counts[count_key] = counts.get(count_key, 0) + counted_rows
+            return reservation
+        self._invocation_log = []
+        try:
+            metadata = self._record_metadata(ctx, semantics, eager=True)
+        finally:
+            log, self._invocation_log = self._invocation_log, None
+        descriptor = runtime._encode_submission(metadata, entry)
+        items = runtime._reservation_items((entry,), (reservation_bytes,))
+        _, common, rows, _ = descriptor
+        if (all(invocation_id == 0 for _, invocation_id in log) and rows
+                and common[4] == batch and common[6] == microbatch):
+            template_id = launcher.add_template(
+                items, (descriptor,), transport._compiled_record_schema, 4, 6)
+            counted_rows = (len(rows) if metadata.act_name != "iteration_attempt_status" else 0)
+            if len(self._emit_templates) >= 4096:
+                self._emit_templates.clear()
+            self._emit_templates[key] = (semantics, template_id, counted_rows,
+                                         tuple(allocation for allocation, _ in log))
+        reservation = StepReservation(runtime._combined_submit(
+            items, (descriptor,), submit_oversized=True))
+        if reservation is StepReservation.OVERSIZED:
+            transport.submit_record_cpu_direct(output, entry)
+        return reservation
+
     def emit_prepared_output(
         self,
         entry: ProducerPlanEntry,
@@ -1113,6 +1729,7 @@ class MegatronAdaptor:
         output_spec: TransportSpec,
         output: HookOutput,
     ) -> StepReservation:
+        self._require_no_static_batch()
         ctx = self.current_iteration_context
         if ctx is None:
             raise RuntimeError("Megatron DMI iteration hook requires an explicit context")
@@ -1195,15 +1812,19 @@ class MegatronAdaptor:
         live_direction: HookPhase | str | None = None,
         expected_plan: ProducerPlan | None = None,
     ) -> StepReservation:
+        self._require_no_static_batch()
         replay_ctx = self.current_context if ctx is None else ctx
         if replay_ctx is None:
             raise RuntimeError("Megatron DMI replay requires an active schedule event")
+        live = replay_ctx.direction if live_direction is None else live_direction
+        if ctx is None and expected_plan is None:
+            reservation = self._prepare_cached_replay(plan, replay_ctx, plan_direction, live)
+            if reservation is not None:
+                return reservation
         selected = self._select_replay_plan(
             plan,
             plan_direction=plan_direction,
-            live_direction=(
-                replay_ctx.direction if live_direction is None else live_direction
-            ),
+            live_direction=live,
             expected_plan=expected_plan,
         )
         if not selected.entries:
@@ -1216,6 +1837,109 @@ class MegatronAdaptor:
         metadata = tuple(self._record_metadata(replay_ctx, item) for item in state.semantics)
         return self.record_runtime.prepare_replay(selected, metadata, reservation_bytes=sizes)
 
+    def _prepare_cached_replay(
+        self,
+        plan: ProducerPlan,
+        ctx: MegatronTrainingContext,
+        plan_direction: HookPhase | str,
+        live_direction: HookPhase | str,
+    ) -> StepReservation | None:
+        """Reuse one graph replay's reservation for replays that differ only in ids.
+
+        As in _submit_static_batch, the first replay of each key runs the
+        general path (selection, sizing, capacity check, encoding) and keeps its
+        reservation items and descriptors as a native template; later replays
+        patch only the batch and microbatch ids. A template is kept and reused
+        only while every record gets invocation id 0, so recomputation replays
+        (ids >= 1) keep the general path. Returns None for the general path.
+        """
+        runtime = self.record_runtime
+        transport = getattr(runtime, "_transport", None)
+        if (
+            _MONITORING_DEBUG() or transport is None or transport.null_offload
+            or getattr(runtime, "_combined_submit", None) is None
+            or getattr(runtime, "_native_encode", None) is None
+        ):
+            return None
+        launcher = self._replay_template_launcher()
+        if launcher is None:
+            return None
+        key = (id(plan), self.normalize_direction(plan_direction),
+               self.normalize_direction(live_direction), ctx.model_id, ctx.phase,
+               ctx.attempt_id, ctx.dp_rank, ctx.shard_rank, ctx.token_start,
+               ctx.valid_counts, ctx.dataset_ids)
+        cached = self._replay_templates.get(key)
+        if cached is not None and cached[0] is plan:
+            _, result, template_id, counted_rows, allocations = cached
+            if result is StepReservation.OVERSIZED:
+                return result
+            batch, microbatch = ctx.global_batch_id, ctx.microbatch_id
+            if allocations:
+                allocator = self.invocation_allocator
+                calls = [dict(allocation, global_batch_id=int(batch), microbatch_id=int(microbatch))
+                         for allocation in allocations]
+                if not all(allocator.is_first(**call) for call in calls):
+                    return None
+                for call in calls:
+                    allocator.allocate(**call)
+            record_format = runtime._format
+            if record_format.count_records and ctx.attempt_id >= 0 and counted_rows:
+                counts = record_format._expected_records
+                count_key = (ctx.phase, batch, ctx.attempt_id)
+                counts[count_key] = counts.get(count_key, 0) + counted_rows
+            return StepReservation(launcher.submit(template_id, batch, microbatch))
+        # Miss: the general path's steps in its order (selection, sizing,
+        # capacity check, metadata, encoding, reservation items, submit). The
+        # template is registered before the submit, and only when every
+        # descriptor has rows with the expected id cells and every invocation
+        # id is 0; otherwise this replay is simply not cached.
+        selected = self._select_replay_plan(
+            plan, plan_direction=plan_direction, live_direction=live_direction,
+            expected_plan=None,
+        )
+        if not selected.entries:
+            return None
+        state = self._plan_state(selected)
+        total, sizes = state.sizing.resolve((ctx._packing,) * len(selected.entries))
+        if self._plan_is_oversized(selected, total):
+            self._remember_replay_template(key, (plan, StepReservation.OVERSIZED, None, 0, ()))
+            return StepReservation.OVERSIZED
+        self._invocation_log = []
+        try:
+            metadata = tuple(self._record_metadata(ctx, item) for item in state.semantics)
+        finally:
+            log, self._invocation_log = self._invocation_log, None
+        descriptors = tuple(runtime._encode_submission(item, entry)
+                            for item, entry in zip(metadata, selected.entries))
+        items = runtime._reservation_items(selected.entries, sizes)
+        batch, microbatch = ctx.global_batch_id, ctx.microbatch_id
+        if all(invocation_id == 0 for _, invocation_id in log) and all(
+            rows and common[4] == batch and common[6] == microbatch
+            for _, common, rows, _ in descriptors
+        ):
+            template_id = launcher.add_template(
+                items, descriptors, transport._compiled_record_schema, 4, 6)
+            counted_rows = sum(
+                len(rows) for (_, _, rows, _), item in zip(descriptors, metadata)
+                if item.act_name != "iteration_attempt_status")
+            self._remember_replay_template(
+                key, (plan, StepReservation.RESERVED, template_id, counted_rows,
+                      tuple(allocation for allocation, _ in log)))
+        return StepReservation(runtime._combined_submit(items, descriptors, submit_oversized=False))
+
+    def _remember_replay_template(self, key: tuple, value: tuple) -> None:
+        if len(self._replay_templates) >= 4096:
+            self._replay_templates.clear()
+        self._replay_templates[key] = value
+
+    def _replay_template_launcher(self) -> Any:
+        if self._replay_launcher is _MISSING:
+            engine = getattr(getattr(self.record_runtime, "_transport", None), "_ring_engine", None)
+            launcher_type = getattr(_native_extension(), "StaticLauncher", None)
+            self._replay_launcher = (
+                None if engine is None or launcher_type is None else launcher_type(engine))
+        return self._replay_launcher
+
     def prepare_full_iteration_replay(
         self,
         plan: MegatronFullIterationPlan,
@@ -1223,6 +1947,7 @@ class MegatronAdaptor:
         *,
         expected_plan: MegatronFullIterationPlan | None = None,
     ) -> StepReservation:
+        self._require_no_static_batch()
         if len(contexts) != plan.output_count:
             raise ValueError("Megatron full-iteration replay context count mismatch")
         if expected_plan is not None:
@@ -1251,6 +1976,43 @@ class MegatronAdaptor:
         return self.record_runtime.prepare_replay(
             plan.producer_plan, metadata, reservation_bytes=sizes,
         )
+
+    def _static_replay_template(self, plan: ProducerPlan, ctx: MegatronTrainingContext,
+                                launcher: Any = None):
+        """Reserve one static microbatch through the public path and keep its parts.
+
+        Returns (result, early_result, items, templates, total_rows, template_id).
+        Templates hold each descriptor with the batch and microbatch ids
+        factored out; ``template_id`` names the same template registered in
+        the native launcher, when one is given.
+        """
+        runtime = self.record_runtime
+        state = self._plan_state(plan)
+        total, sizes = state.sizing.resolve((ctx._packing,) * len(plan.entries))
+        if self._plan_is_oversized(plan, total):
+            return (StepReservation.OVERSIZED, StepReservation.OVERSIZED, None, None, 0, None)
+        metadata = tuple(self._record_metadata(ctx, item) for item in state.semantics)
+        descriptors = tuple(runtime._encode_submission(item, entry)
+                            for item, entry in zip(metadata, plan.entries))
+        items = runtime._reservation_items(plan.entries, sizes)
+        result = StepReservation(runtime._combined_submit(
+            items, descriptors, submit_oversized=False))
+        templates, total_rows = [], 0
+        for item, descriptor in zip(metadata, descriptors):
+            layout, common, rows, output_id = descriptor
+            if common[4] != ctx.global_batch_id or common[6] != ctx.microbatch_id:
+                raise RuntimeError("unexpected Megatron record coordinate layout")
+            templates.append((layout, tuple(common[:4]), common[5], tuple(common[7:]),
+                              rows, output_id))
+            total_rows += len(rows)
+        template_id = None if launcher is None else launcher.add_template(
+            items, descriptors, runtime._transport._compiled_record_schema, 4, 6)
+        return (result, None, items, tuple(templates), total_rows, template_id)
+
+    def _require_no_static_batch(self) -> None:
+        # Another reservation would interleave with the queued static batch.
+        if self.hook_runtime._static_armed is not None:
+            raise RuntimeError("DMI reservation requested inside an eager static batch")
 
     def _plan_is_oversized(self, plan: ProducerPlan, total_bytes: int) -> bool:
         capacities = self.engine.ring_capacities()
@@ -1435,7 +2197,7 @@ class MegatronAdaptor:
             or ctx.phase != "train"
         ):
             return 0
-        return allocator.allocate(
+        allocation = dict(
             model_id=model_id,
             phase=str(ctx.phase),
             global_batch_id=int(ctx.global_batch_id),
@@ -1449,6 +2211,10 @@ class MegatronAdaptor:
             token_start=token_start,
             record_type=semantic.record_type,
         )
+        invocation_id = allocator.allocate(**allocation)
+        if self._invocation_log is not None:
+            self._invocation_log.append((allocation, invocation_id))
+        return invocation_id
 
     def _producer_semantics(
         self,
@@ -1653,6 +2419,7 @@ class MegatronAdaptor:
             )
             for item in physical.outputs
         ) and not sequence_sharded:
+            self._fast_hook_info[id(hook)] = (original, len(physical.outputs), True)
             return original
 
         sequence_parallel_enabled = False
@@ -1671,6 +2438,18 @@ class MegatronAdaptor:
             )
             assert tp_sequence_start is not None
             assert tp_sequence_length is not None
+        # TP=1: the local interval is the whole sequence, so narrow is a no-op.
+        full_sequence = (
+            sequence_sharded and int(tp_sequence_start) == 0
+            and global_sequence_length is not None
+            and int(tp_sequence_length) == int(global_sequence_length)
+        )
+        # The static fast launch checks the planned input shape, which covers
+        # the sequence-length check; only a real narrow needs the wrapper.
+        self._fast_hook_info[id(hook)] = (
+            original, len(physical.outputs),
+            not sequence_sharded or sequence_parallel_enabled or full_sequence,
+        )
 
         def preprocess(*inputs: Any) -> Any:
             adjusted_inputs = inputs
@@ -1691,7 +2470,7 @@ class MegatronAdaptor:
                         f"expected {expected_length}, got "
                         f"{tuple(int(value) for value in input_tensor.shape)}"
                     )
-                if not sequence_parallel_enabled:
+                if not sequence_parallel_enabled and not full_sequence:
                     input_tensor = input_tensor.narrow(
                         0, int(tp_sequence_start), int(tp_sequence_length)
                     )
@@ -1718,12 +2497,40 @@ class MegatronAdaptor:
 
         return preprocess
 
+    def _packed_meta(self, hook: HookPointV1) -> tuple[torch.Tensor, torch.Tensor]:
+        """(valid_count, prefix) device tensors for an eager packed producer."""
+        info = self._eager_packed_info[id(hook)]
+        microbatch = self._direct_packed_microbatch
+        if microbatch is not None:
+            context = self._metadata_context
+            if microbatch in context._direct_microbatches:
+                return (context.direct_count(info[2], microbatch),
+                        context.direct_count(info[3], microbatch))
+            return (context.source_view(info[2], microbatch),
+                    context.source_view(info[3], microbatch))
+        valid = getattr(hook, info[0], None)
+        prefix = getattr(hook, info[1], None)
+        if valid is not info[4] or prefix is not info[5]:
+            # Validate once per bound tensor object, not per call.
+            if not isinstance(valid, torch.Tensor) or valid.dtype is not torch.int64:
+                raise TypeError("SEQ_PREFIX_PACK requires int64 valid-count context")
+            if prefix is None:
+                raise RuntimeError(
+                    "SEQ_PREFIX_PACK requires a metadata-owned valid-count prefix"
+                )
+            if not isinstance(prefix, torch.Tensor):
+                raise TypeError("HookOutput producer metadata must contain only tensors")
+            info[4], info[5] = valid, prefix
+        return valid, prefix
+
     def _enrich_eager_output(
         self, hook: HookPointV1, spec: TransportSpec, value: Any,
     ) -> Any:
         # A bare tensor has no producer metadata to validate/preserve. Build
         # its final wrapper once. Tuple/custom metadata follows the old path.
         if isinstance(value, torch.Tensor) and spec.transport_type is TransportType.SEQ_PREFIX_PACK:
+            if id(hook) in self._eager_packed_info:
+                return HookOutput._trusted(value, self._packed_meta(hook))
             valid = self._current_valid_count(hook)
             direction = self._hook_phase(hook).name.lower()
             prefix = getattr(hook, f"valid_count_prefix_{direction}", None)

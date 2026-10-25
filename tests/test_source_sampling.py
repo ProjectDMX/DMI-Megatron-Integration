@@ -302,3 +302,189 @@ def test_reader_decodes_empty_sampled_records(shape):
     assert decoded.shape == shape and decoded.dtype == torch.bfloat16
     with pytest.raises(ValueError, match="zero-size"):
         MegatronTrainingReader.torch_decode("torch.bfloat16", (2, 4), b"")
+
+
+def test_virtual_sources_config_roundtrip_and_default_manifest_unchanged():
+    default = SourceSampling(BUILTIN_ROUND_ROBIN, {"count": 1})
+    assert "virtual_sources" not in default.to_dict()
+    virtual = SourceSampling(BUILTIN_ROUND_ROBIN, {"count": 1}, virtual_sources=8)
+    assert virtual.to_dict()["virtual_sources"] == 8
+    assert SourceSampling.from_dict(virtual.to_dict()) == virtual
+    for bad in (0, -1, True, 2.0):
+        with pytest.raises(ValueError, match="virtual_sources"):
+            SourceSampling(BUILTIN_ROUND_ROBIN, {"count": 1}, virtual_sources=bad)
+
+
+def _shard_capture(counts, virtual_sources):
+    policy = SourceSampling(BUILTIN_ROUND_ROBIN, {"count": 1}, virtual_sources=virtual_sources)
+    dispatcher = SimpleNamespace(dmi_source_counts_cpu=counts.clone(),
+                                 num_global_tokens_per_local_expert=None)
+    capture = ExpertSourceCapture(policy, dispatcher)
+    ctx = SimpleNamespace(global_batch_id=1)
+    capture.hook = SimpleNamespace(_hook_runtime=SimpleNamespace(adaptor=SimpleNamespace(current_context=ctx)))
+    return capture, ctx
+
+
+def test_virtual_source_ranges_select_exactly_one_token_shard():
+    from megatron.core.transformer.moe.moe_utils import permute
+    from megatron.core.transformer.moe.token_dispatcher import dmi_virtual_source_counts
+    tokens, experts, topk, shards = 32, 6, 2, 8
+    generator = torch.Generator().manual_seed(0)
+    choice = torch.rand(tokens, experts, generator=generator).topk(topk, dim=1).indices
+    routing_map = torch.zeros(tokens, experts, dtype=torch.bool).scatter_(1, choice, True)
+    token_ids = torch.arange(tokens, dtype=torch.float32).unsqueeze(1).repeat(1, 3)
+    values = permute(token_ids, routing_map, num_out_tokens=tokens * topk)[0].contiguous()
+    counts = dmi_virtual_source_counts(routing_map, shards)
+    assert counts.shape == (shards, experts) and counts.dtype == torch.int64
+    assert counts.sum(0).tolist() == routing_map.sum(0).tolist()
+    capture, ctx = _shard_capture(counts, shards)
+    shard_len = tokens // shards
+    for batch in range(1, shards + 2):
+        ctx.global_batch_id = batch
+        output = capture(values, counts.T)
+        shard = (batch - 1) % shards
+        starts, ends = (t.tolist() for t in output.producer_meta)
+        captured = [int(r[0]) for s, e in zip(starts, ends) for r in values[s:e]]
+        expected = [t for expert in range(experts) for t in range(shard * shard_len, (shard + 1) * shard_len)
+                    if routing_map[t, expert]]
+        assert captured == expected
+        assert capture.output_nbytes() == len(expected) * values.shape[1] * values.element_size()
+
+
+def test_virtual_source_ranges_select_one_shard_of_one_tp_source():
+    # ETP2/EP1: units are source-major (source rank, token shard); packed rows
+    # are expert-major, then TP source, then ascending token within the source.
+    from megatron.core.transformer.moe.token_dispatcher import dmi_virtual_source_counts
+    sources, tokens, experts, topk, shards = 2, 16, 5, 2, 4
+    generator = torch.Generator().manual_seed(1)
+    maps = []
+    for _ in range(sources):
+        choice = torch.rand(tokens, experts, generator=generator).topk(topk, dim=1).indices
+        maps.append(torch.zeros(tokens, experts, dtype=torch.bool).scatter_(1, choice, True))
+    rows = [(src, t) for e in range(experts) for src in range(sources)
+            for t in range(tokens) if maps[src][t, e]]
+    values = torch.tensor(rows, dtype=torch.float32)
+    counts = torch.cat([dmi_virtual_source_counts(m, shards) for m in maps])
+    capture, ctx = _shard_capture(counts, shards)
+    capture.dispatcher.tp_size, capture.dispatcher.ep_size = sources, 1
+    shard_len = tokens // shards
+    for batch in range(1, sources * shards + 2):
+        ctx.global_batch_id = batch
+        output = capture(values, counts.T)
+        unit = (batch - 1) % (sources * shards)
+        src, shard = divmod(unit, shards)
+        starts, ends = (t.tolist() for t in output.producer_meta)
+        captured = [tuple(int(v) for v in r) for s_, e_ in zip(starts, ends) for r in values[s_:e_]]
+        expected = [(src, t) for e in range(experts)
+                    for t in range(shard * shard_len, (shard + 1) * shard_len) if maps[src][t, e]]
+        assert captured == expected
+        assert capture.output_nbytes() == len(expected) * values.shape[1] * values.element_size()
+
+
+def test_virtual_source_capture_requires_matching_cpu_counts():
+    counts = torch.ones(4, 3, dtype=torch.int64)
+    capture, _ = _shard_capture(counts, 8)
+    with pytest.raises(ValueError, match="shard count"):
+        capture(torch.zeros(12, 2), counts.T)
+    capture, _ = _shard_capture(counts, 4)
+    capture.dispatcher.dmi_source_counts_cpu = None
+    with pytest.raises(ValueError, match="CPU shard counts"):
+        capture(torch.zeros(12, 2), counts.T)
+
+
+def test_virtual_source_counts_reject_indivisible_tokens():
+    from megatron.core.transformer.moe.token_dispatcher import dmi_virtual_source_counts
+    with pytest.raises(ValueError, match="divisible"):
+        dmi_virtual_source_counts(torch.zeros(10, 4, dtype=torch.bool), 8)
+
+
+class MoEAlltoAllTokenDispatcher(SimpleNamespace):
+    pass
+
+
+@pytest.mark.parametrize("tp,ep,fused,drop,pad,error", [
+    (1, 1, False, False, False, None),
+    (2, 1, False, False, False, None),
+    (1, 2, False, False, False, "EP == 1"),
+    (1, 1, True, False, False, "unfused"),
+    (1, 1, False, True, False, "unfused"),
+    (1, 1, False, False, True, "unfused"),
+])
+def test_configure_virtual_sources_rejects_unsupported_layouts(tp, ep, fused, drop, pad, error):
+    from dmi_megatron_integration.startup import _configure_virtual_sources
+    dispatcher = MoEAlltoAllTokenDispatcher(tp_size=tp, ep_size=ep, drop_and_pad=drop, dmi_virtual_sources=1)
+    config = SimpleNamespace(moe_permute_fusion=fused, moe_router_padding_for_quantization=pad)
+    if error is None:
+        _configure_virtual_sources(dispatcher, config, 8)
+        assert dispatcher.dmi_virtual_sources == 8
+    else:
+        with pytest.raises(ValueError, match=error):
+            _configure_virtual_sources(dispatcher, config, 8)
+    with pytest.raises(ValueError, match="AlltoAll"):
+        _configure_virtual_sources(SimpleNamespace(), config, 8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU graph replay test")
+def test_virtual_source_counts_replay_in_cuda_graph():
+    from megatron.core.transformer.moe.token_dispatcher import dmi_virtual_source_counts
+    routing_map = torch.zeros(16, 4, dtype=torch.bool, device="cuda")
+    out = torch.empty(8, 4, dtype=torch.int64, device="cuda")
+    with torch.cuda.stream(torch.cuda.Stream()):
+        out.copy_(dmi_virtual_source_counts(routing_map, 8))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out.copy_(dmi_virtual_source_counts(routing_map, 8))
+    for seed in range(3):
+        cpu = torch.rand(16, 4, generator=torch.Generator().manual_seed(seed)) > 0.5
+        routing_map.copy_(cpu)
+        graph.replay()
+        assert out.cpu().tolist() == cpu.view(8, 2, 4).sum(1).tolist()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graphed_segment_ranges_matches_eager_for_changing_counts_shapes_and_selection():
+    from dmi_megatron_integration.hooks.source_sampling import _GraphedSegmentRanges
+    graphed = _GraphedSegmentRanges()
+    generator = torch.Generator().manual_seed(0)
+    for blocks, units, picks in ((64, 8, (3,)), (64, 8, (3,)), (64, 8, (0, 5)), (16, 4, (1, 2, 3))):
+        selected = torch.tensor(picks, dtype=torch.int64, device="cuda")
+        starts = torch.empty(blocks * len(picks), dtype=torch.int64, device="cuda")
+        ends = torch.empty_like(starts)
+        want_starts, want_ends = torch.empty_like(starts), torch.empty_like(ends)
+        for _ in range(4):
+            counts = torch.randint(0, 50, (blocks, units), generator=generator).cuda()
+            graphed(counts, selected, starts, ends)
+            segment_ranges(counts, selected, want_starts, want_ends)
+            assert torch.equal(starts, want_starts) and torch.equal(ends, want_ends)
+    assert graphed.graph is not None and not graphed.failed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graphed_segment_ranges_uses_eager_ops_inside_a_capture():
+    from dmi_megatron_integration.hooks.source_sampling import _GraphedSegmentRanges
+    graphed = _GraphedSegmentRanges()
+    counts = torch.arange(16, dtype=torch.int64, device="cuda").reshape(8, 2)
+    selected = torch.tensor([1], dtype=torch.int64, device="cuda")
+    starts = torch.empty(8, dtype=torch.int64, device="cuda"); ends = torch.empty_like(starts)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graphed(counts, selected, starts, ends)
+    graph.replay(); torch.cuda.synchronize()
+    want_starts, want_ends = torch.empty_like(starts), torch.empty_like(ends)
+    segment_ranges(counts, selected, want_starts, want_ends)
+    assert torch.equal(starts, want_starts) and torch.equal(ends, want_ends)
+    assert graphed.graph is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graphed_segment_ranges_keeps_eager_ops_under_profiler():
+    from dmi_megatron_integration.hooks.source_sampling import _GraphedSegmentRanges
+    graphed = _GraphedSegmentRanges()
+    counts = torch.arange(16, dtype=torch.int64, device="cuda").reshape(8, 2)
+    selected = torch.tensor([1], dtype=torch.int64, device="cuda")
+    starts = torch.empty(8, dtype=torch.int64, device="cuda"); ends = torch.empty_like(starts)
+    with torch.profiler.profile() as prof:
+        graphed(counts, selected, starts, ends)
+    assert graphed.graph is None
+    assert any("cumsum" in event.name for event in prof.events())

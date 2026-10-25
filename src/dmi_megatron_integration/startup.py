@@ -114,6 +114,12 @@ class MegatronDMIConfig:
     drain_flush_byte_threshold: int = 0
     drain_flush_entry_threshold: int = 0
     drain_flush_timeout_us: int = 0
+    # 0 keeps the native drain poll timeout (RingConfig default, 100 us).
+    drain_poll_timeout_us: int = 0
+    # Opt-in: reserve each confirmed static non-train microbatch in one call.
+    eager_static_batch: bool = False
+    # Opt-in: eager non-train packed producers read source metadata directly.
+    eager_direct_packed_metadata: bool = False
     flush_every_n_train_iters: int = 0
     vocab_logits_top_k: int | None = None
     topology_manifest_path: str | None = None
@@ -441,6 +447,24 @@ def resolve_megatron_dmi_config(
                 0,
                 int,
             )
+        ),
+        drain_poll_timeout_us=int(
+            _env_value(
+                args,
+                "dmi_drain_poll_timeout_us",
+                environ,
+                "DMI_DRAIN_POLL_TIMEOUT_US",
+                0,
+                int,
+            )
+        ),
+        eager_static_batch=bool(
+            getattr(args, "dmi_eager_static_batch", None)
+            if getattr(args, "dmi_eager_static_batch", None) is not None
+            else (_env_bool(environ, "DMI_EAGER_STATIC_BATCH") or False)
+        ),
+        eager_direct_packed_metadata=bool(
+            _env_bool(environ, "DMI_EAGER_DIRECT_PACKED_METADATA") or False
         ),
         flush_every_n_train_iters=int(
             _env_value(
@@ -1325,6 +1349,18 @@ def _install_moe_inverse_map_hooks(model: Any, capture_layers: tuple[int, ...] |
             dispatcher.dmi_moe_inverse_map = existing
 
 
+def _configure_virtual_sources(dispatcher: Any, config: Any, virtual_sources: int) -> None:
+    """Enable contiguous-token-shard sampling units per TP source on an EP == 1 dispatcher."""
+    if dispatcher.__class__.__name__ != "MoEAlltoAllTokenDispatcher":
+        raise ValueError("Virtual-source sampling requires the AlltoAll dispatcher")
+    if int(dispatcher.ep_size) != 1:
+        raise ValueError("Virtual-source sampling requires EP == 1; use EP source sampling instead")
+    if (getattr(config, "moe_permute_fusion", False) or dispatcher.drop_and_pad
+            or getattr(config, "moe_router_padding_for_quantization", False)):
+        raise ValueError("Virtual-source sampling requires unfused, dropless, unpadded permutation")
+    dispatcher.dmi_virtual_sources = int(virtual_sources)
+
+
 def _install_moe_packed_weighted_output_hooks(model: Any, source_sampling: SourceSampling | None = None, capture_layers: tuple[int, ...] | None = None) -> None:
     roots = model if isinstance(model, list) else [model]
     for root in roots:
@@ -1332,6 +1368,10 @@ def _install_moe_packed_weighted_output_hooks(model: Any, source_sampling: Sourc
             if module.__class__.__name__ != "MoELayer":
                 continue
             dispatcher = module.token_dispatcher
+            # Every layer gets the same unit shape so graph output slots stay uniform.
+            virtual_sources = getattr(source_sampling, "virtual_sources", 1)
+            if source_sampling is not None and virtual_sources > 1:
+                _configure_virtual_sources(dispatcher, module.config, virtual_sources)
             # TE shares backward buffers between layers with equal differentiable
             # outputs, including the tuple's non-differentiable slots. Keep those
             # slots uniform when only some layers sample. These are aliases of
@@ -2183,6 +2223,12 @@ def _build_engine(
     ring_cfg.drain_flush_byte_threshold = int(cfg.drain_flush_byte_threshold)
     ring_cfg.drain_flush_entry_threshold = int(cfg.drain_flush_entry_threshold)
     ring_cfg.drain_flush_timeout_us = int(cfg.drain_flush_timeout_us)
+    if int(cfg.drain_poll_timeout_us) < 0:
+        raise ValueError("DMI drain poll timeout must be positive")
+    if int(cfg.drain_poll_timeout_us) > 0:
+        ring_cfg.drain_poll_timeout_us = int(cfg.drain_poll_timeout_us)
+        print(f"DMI_EFFECTIVE_DRAIN_POLL_TIMEOUT_US={ring_cfg.drain_poll_timeout_us} rank={rank}",
+              flush=True)
     window_cfg = RecurringD2HWindowConfig()
     window_cfg.enabled = cfg.recurring_d2h_windows_enabled
     window_cfg.fallback_entry_threshold = cfg.d2h_window_fallback_entry_threshold
@@ -2952,6 +2998,22 @@ def setup_megatron_dmi(
             ),
             active_input_layout=active_input_layout,
         )
+        if cfg.eager_static_batch:
+            # TE graphs replay only in training mode; local/external graphs
+            # can replay during evaluation and would interleave reservations.
+            if (
+                str(getattr(args, "cuda_graph_impl", "none") or "none") == "local"
+                or bool(getattr(args, "enable_cuda_graph", False))
+                or bool(getattr(args, "external_cuda_graph", False))
+            ):
+                raise ValueError(
+                    "DMI eager static batch does not support local or external CUDA graphs"
+                )
+            adaptor.configure_eager_static_batch(True)
+            print(f"DMI_EFFECTIVE_EAGER_STATIC_BATCH=1 rank={rank}", flush=True)
+        if cfg.eager_direct_packed_metadata:
+            adaptor.configure_eager_direct_packed_metadata(True)
+            print(f"DMI_EFFECTIVE_EAGER_DIRECT_PACKED_METADATA=1 rank={rank}", flush=True)
         runtime.adaptor = adaptor
         runtime.dp_rank = _parallel_rank(parallel_state_module, "get_data_parallel_rank")
         runtime.set_attempt_status_hook(attempt_status_hook, device=setup_device)
