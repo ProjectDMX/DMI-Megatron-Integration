@@ -265,6 +265,12 @@ class MegatronOutputSpec:
             row_bytes=row_bytes,
             feature_bytes=feature_bytes,
             sizing_mode=self.sizing_mode,
+            reservation_upper_bytes=(
+                prod(output_shape) * self.element_size()
+                if (self.segment_ranges_from_preprocess
+                    and self.sizing_mode is OutputSizingMode.KNOWN_BEFORE_EXECUTION
+                    and output_shape and all(dim >= 0 for dim in output_shape)) else None
+            ),
         )
 
 

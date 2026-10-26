@@ -28,7 +28,7 @@ HOOK_SELECTION_NAMES = frozenset({
     "hidden-states", "resid_final", "moe-input", "moe-inverse-map",
     "moe-packed-weighted-output", "vocab-logits", "vocab-logits-topk",
     "loss-summary", "token-loss", "grad-norm", "q-weights", "k-weights",
-    "router-weights",
+    "router-weights", "moe-tp-complete-output",
 })
 
 

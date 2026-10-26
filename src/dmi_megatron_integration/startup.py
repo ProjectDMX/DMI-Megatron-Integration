@@ -38,6 +38,7 @@ from .adapter import (
 )
 from .hooks.selection import parse_hook_selection, resolve_phase_hook_selections, hook_enabled_in_phase, HOOK_SELECTION_NAMES
 from .hooks.source_sampling import EP_OUTPUT, ExpertSourceCapture, SourceSampling, read_source_sampling
+from .hooks import tp_complete_output
 from .hooks.megatron_loss_summary import (
     per_sample_loss_from_token_loss,
     per_segment_loss_from_token_loss,
@@ -721,8 +722,12 @@ def _validate_hook_contract(hook: HookPointV1) -> None:
         if any(output.transport_type != TransportType.IDENTITY and not (
             output.transport_type is TransportType.SEGMENTED_PACK
             and output.segment_ranges_from_preprocess
-            and output.sizing_mode is OutputSizingMode.RUNTIME_SIZED
-            and output.eager_nbytes is not None
+            and ((output.sizing_mode is OutputSizingMode.RUNTIME_SIZED
+                  and output.eager_nbytes is not None)
+                 or (output.sizing_mode is OutputSizingMode.KNOWN_BEFORE_EXECUTION
+                     and output.output_shape
+                     and all(isinstance(dim, int) and dim > 0 for dim in output.output_shape)
+                     and all(isinstance(dim, int) and dim > 0 for dim in output.input_shape)))
         ) for output in spec.outputs):
             raise ValueError("PER_EXECUTION hooks initially require IDENTITY transport")
         if spec.binding_metadata_fields:
@@ -1912,7 +1917,7 @@ def _recompute_declarations(model: Any, dist: Any) -> set[tuple[str, tuple[str, 
     builtin_names = {
         "TransformerLayer": ("hidden-states",),
         "TopKRouter": ("router-summary", "router-logits", "router-entropy", "expert-counts"),
-        "MoELayer": ("moe-input", "moe-inverse-map", "moe-packed-weighted-output"),
+        "MoELayer": ("moe-input", "moe-inverse-map", "moe-packed-weighted-output", tp_complete_output.FLAG),
     }
     for root in _model_roots(model):
         for module in root.modules():
@@ -2375,6 +2380,7 @@ def _freeze_ep_topology_manifest(
     parallel_state: Any,
     dist_module: Any,
     source_sampling: SourceSampling | None = None,
+    tp_complete_metadata: dict | None = None,
 ) -> FrozenMegatronEPTopologyManifest:
     if not _dist_ready(dist_module):
         raise RuntimeError("DMI topology manifest requires initialized torch.distributed")
@@ -2386,9 +2392,12 @@ def _freeze_ep_topology_manifest(
         parallel_state=parallel_state,
         dist_module=dist_module,
     )
-    fragment = replace(fragment, hook_capture={EP_OUTPUT: {
+    hook_capture = {EP_OUTPUT: {
         "source_sampling": source_sampling.to_dict() if source_sampling else None,
-    }})
+    }}
+    if tp_complete_metadata is not None:
+        hook_capture[tp_complete_output.NAME] = tp_complete_metadata
+    fragment = replace(fragment, hook_capture=hook_capture)
     gathered: list[Any] = [None] * int(dist_module.get_world_size())
     dist_module.all_gather_object(gathered, fragment)
     if any(not isinstance(item, MegatronEPTopologyFragment) for item in gathered):
@@ -2505,8 +2514,18 @@ def setup_megatron_dmi(
                         * _parallel_world(parallel_state_module, "get_expert_tensor_parallel_world_size")
                         * getattr(source_sampling, "virtual_sources", 1))
         source_sampling.select(source_sampling.iteration_origin, source_count)
+    tp_complete_tokens = None
+    tp_complete_sampling = None
+    if tp_complete_output.FLAG in selected_hooks:
+        tp_complete_sampling = tp_complete_output.read_token_sampling(cfg.hook_config_path)
+        tp_complete_tokens = tp_complete_output.validate_config(
+            args, model_config, tp_world,
+            _parallel_world(parallel_state_module, "get_expert_model_parallel_world_size"),
+            _parallel_world(parallel_state_module, "get_expert_tensor_parallel_world_size"),
+            cp_world, tp_complete_sampling,
+        )
     requires_ep_topology_manifest = bool(
-        {"moe-inverse-map", "moe-packed-weighted-output"} & selected_hooks
+        {"moe-inverse-map", "moe-packed-weighted-output", tp_complete_output.FLAG} & selected_hooks
     )
     if requires_ep_topology_manifest and not cfg.topology_manifest_path:
         raise ValueError(
@@ -2668,6 +2687,9 @@ def setup_megatron_dmi(
             _install_moe_inverse_map_hooks(unwrapped, capture_layers=capture_layers)
         if "moe-packed-weighted-output" in selected_hooks:
             _install_moe_packed_weighted_output_hooks(unwrapped, source_sampling, capture_layers=capture_layers)
+        if tp_complete_tokens is not None:
+            tp_complete_output.install_hooks(unwrapped, tokens=tp_complete_tokens,
+                sampling=tp_complete_sampling, capture_layers=capture_layers)
         if "router-summary" in selected_hooks:
             _install_router_summary_hooks(unwrapped, capture_layers=capture_layers)
         if "router-entropy" in selected_hooks:
@@ -3039,6 +3061,9 @@ def setup_megatron_dmi(
                 parallel_state=parallel_state_module,
                 dist_module=dist_for_rank,
                 source_sampling=source_sampling,
+                tp_complete_metadata=(tp_complete_output.capture_metadata(
+                    tp_complete_tokens, tp_complete_sampling)
+                    if tp_complete_tokens is not None else None),
             )
             if rank == 0 and host_engine is not None:
                 manifest_json = json.dumps(manifest.to_dict())

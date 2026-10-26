@@ -1757,6 +1757,12 @@ class MegatronAdaptor:
             return _align_up(prod(entry.input_shape) * entry.element_size)
         if semantic.eager_nbytes is not None:
             return _align_up(entry.reservation_upper_bytes)
+        if (entry.record_type is RecordType.PER_EXECUTION
+                and entry.transport_type is TransportType.SEGMENTED_PACK
+                and entry.output_shape and all(dim >= 0 for dim in entry.output_shape)
+                and entry.reservation_upper_bytes == prod(entry.output_shape) * entry.element_size):
+            # Explicit fixed-size ranges: offsets change, selected row count does not.
+            return _align_up(entry.reservation_upper_bytes)
         if packing is None or not packing.global_counts.counts:
             raise ValueError("packed outputs require current CPU packing metadata")
         counts = packing.counts_for(semantic.tp_sequence_start, semantic.tp_sequence_length)
