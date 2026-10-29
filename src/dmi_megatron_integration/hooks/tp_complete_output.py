@@ -98,9 +98,14 @@ class TPCompleteCapture:
         self.rows = tokens * topk
         self.selected_rows = self.rows if sampling is None else self.rows // sampling.shards * sampling.count
         self.hook = None
-        self.selected = self.starts = self.ends = None
+        self.selected = self.starts = self.ends = self.selected_counts = None
         self._batch = None
+        self._shards = None
         self._segment_ranges = _GraphedSegmentRanges()
+        # One native launch computes all segment ranges and selected counts from
+        # the routing map (resolved on first use, after the extension loads);
+        # the eager ops below remain the fallback.
+        self._native_ranges = False
 
     def __call__(self, values, routing_map, inverse_map):
         if (values.shape != (self.rows, self.hidden) or values.dtype != self.dtype
@@ -122,6 +127,22 @@ class TPCompleteCapture:
         # Each contiguous local-token shard contains exactly tokens/shards tokens,
         # each with topk routes. The distribution among experts may change, but
         # total selected rows and reservation bytes cannot change.
+        if self._native_ranges is False:
+            self._native_ranges = getattr(getattr(torch.ops, "ring", None), "mask_shard_segment_ranges", None)
+        if self._native_ranges is not None and values.is_cuda:
+            if self.starts is None:
+                self.starts = torch.empty(self.experts * policy.count, dtype=torch.int64, device=values.device)
+                self.ends = torch.empty_like(self.starts)
+                self.selected_counts = torch.empty(self.experts, dtype=torch.int64, device=values.device)
+            if values.device != self.starts.device:
+                raise ValueError("TP-complete capture cannot change device")
+            if self._batch != ctx.global_batch_id:
+                self._shards = list(policy.select(ctx.global_batch_id))
+                self._batch = ctx.global_batch_id
+            self._native_ranges(routing_map if routing_map.is_contiguous() else routing_map.contiguous(),
+                                self._shards, policy.shards, self.starts, self.ends, self.selected_counts)
+            ranges = (self.starts, self.ends)
+            return HookOutput(values, ranges), HookOutput(inverse_map, ranges), HookOutput(self.selected_counts)
         counts = routing_map.reshape(policy.shards, self.tokens // policy.shards, self.experts).sum(1, dtype=torch.int64)
         if self.selected is None:
             self.selected = torch.empty(policy.count, dtype=torch.int64, device=values.device)

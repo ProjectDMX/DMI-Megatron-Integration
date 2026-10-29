@@ -20,7 +20,8 @@ def resolve_transform(reference):
     return function
 
 
-def parse_config(document):
+def parse_config(document, *, transform_resolver=resolve_transform):
+    """Validate declarations; startup may validate references without importing analyses."""
     check_keys(document, ('signals',), 'configuration')
     if not isinstance(document.get('signals'), list):
         raise ValueError('signals must be a list')
@@ -60,7 +61,7 @@ def parse_config(document):
             from .storage import physical_columns
             physical_columns(columns)  # Validate types before creating the worker.
             outputs.append(Output(kind, identifier(output[kind]), tuple(columns)))
-        signals.append(Signal(name, tuple(item['inputs']), dict(trigger), resolve_transform(item['transform']), tuple(outputs), bool(cache)))
+        signals.append(Signal(name, tuple(item['inputs']), dict(trigger), transform_resolver(item['transform']), tuple(outputs), bool(cache)))
     return Registry(signals)
 
 

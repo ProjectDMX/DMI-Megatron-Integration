@@ -6,6 +6,15 @@ The integration package version is `0.17.1` and requires DMI `>=1.2.0,<2.0`. The
 
 For a source setup, clone this repository recursively and follow the [installation guide](docs/install.md). The guide records the tested Python, PyTorch, CUDA, and Transformer Engine stack and installs the pinned fork rather than an unrelated `megatron-core` release.
 
+## Enable hooks from Signal YAML
+
+Add `--dmi-signal-config monitoring.yaml` to the training command (or set
+`DMI_SIGNAL_CONFIG`). DMI enables the hooks required by the declared Signal inputs,
+including helper dependencies, before graph capture. Explicit hook selections are
+added to these requirements. Analysis functions still run in the separate CPU
+worker; training parameters and capture sampling remain explicit. See the
+[configuration and preview instructions](docs/SIGNALS.md#enable-capture-from-signal-yaml).
+
 ## Hook selection by training phase
 
 `--dmi-hook-selection` supplies the common selection. Override a phase with

@@ -22,7 +22,7 @@ class FakeRecords:
 
     def define_d2h_window_pattern(self, **kwargs):
         self.events.append(("define", kwargs))
-        self.counter = 0
+        self.counter = kwargs.get("initial_counter", 0)
         return True
 
     def advance_boundary(self):
@@ -116,13 +116,13 @@ def schedule_harness(monkeypatch):
         lambda *a, **kw: real_zeros(*a, **{**kw, "device": "cpu"}),
     )
 
-    def run(p, r, m, *, enabled=True, forward_only=False, multimodule=False):
+    def run(p, r, m, *, enabled=True, forward_only=False, multimodule=False, continuous_tail=False):
         runtime.configure_d2h_windows(enabled=enabled)
         monkeypatch.setattr(schedules.parallel_state, "get_pipeline_model_parallel_world_size", lambda: p)
         monkeypatch.setattr(schedules.parallel_state, "get_pipeline_model_parallel_rank", lambda: r)
         func = schedules.forward_backward_pipelining_without_interleaving
         if not forward_only:
-            dmi_prepare_d2h_windows(func, m)
+            dmi_prepare_d2h_windows(func, m, continuous_tail=continuous_tail)
         pg = schedules.ProcessGroupCollection(tp=None, cp=SimpleNamespace(size=lambda: 1))
         if multimodule:
             pg = object.__new__(schedules.MultiModuleProcessGroupCollection)
@@ -182,6 +182,92 @@ def test_no_markers_in_forward_only_or_disabled_run(schedule_harness, forward_on
     run, events, _, _ = schedule_harness
     run(2, 0, 2, enabled=enabled, forward_only=forward_only)
     assert not any(e[0] in ("open", "close", "define") for e in events)
+
+
+@pytest.mark.parametrize("p,r", [(p, r) for p in (2, 3, 4) for r in range(p)])
+@pytest.mark.parametrize("m", [1, 2, 5])
+def test_continuous_tail_has_no_receive_handoff(schedule_harness, p, r, m):
+    run, events, runtime, records = schedule_harness
+    run(p, r, m, continuous_tail=True)
+    period = events[0][1]["period"]
+    assert records.counter == period + int(r > 0)
+    if r > 0:
+        last_send = max(i for i, e in enumerate(events) if e[0] == "send_backward")
+        assert events[last_send + 1] == ("open",)
+        assert runtime._d2h_first_forward_open
+    boundary = len(events)
+    run(p, r, m, continuous_tail=True)
+    assert records.counter == 2 * period + int(r > 0)
+    assert sum(e[0] == "define" for e in events) == 1
+    if r > 0:
+        first_recv = next(i for i in range(boundary, len(events)) if events[i][0] == "recv_forward")
+        assert not any(e[0] in ("open", "close") for e in events[boundary:first_recv + 1])
+        first_fwd = next(i for i in range(first_recv, len(events)) if events[i][0] == "forward")
+        assert events[first_fwd - 1] == ("close",)
+        assert sum(e[0] == "close" for e in events[boundary:first_fwd]) == 1
+
+
+def test_tail_pattern_change_waits_for_real_close(schedule_harness):
+    run, events, runtime, records = schedule_harness
+    run(2, 1, 2, continuous_tail=True)
+    boundary = len(events)
+    run(2, 1, 3, continuous_tail=True)
+    recv = next(i for i in range(boundary, len(events)) if events[i][0] == "recv_forward")
+    definition = next(i for i in range(boundary, len(events)) if events[i][0] == "define")
+    assert not any(e[0] in ("open", "close", "define") for e in events[boundary:recv + 1])
+    assert events[definition - 1] == ("close",)
+    assert events[definition][1]["initial_counter"] == 2
+    assert events[definition][1]["period"] == 6
+    assert events[definition + 1][0] == "forward"
+    assert records.counter == 7
+
+
+def test_interrupted_tail_restarts_with_one_bootstrap(schedule_harness):
+    run, events, runtime, records = schedule_harness
+    run(2, 1, 2, continuous_tail=True)
+    runtime.interrupt_d2h_tail()
+    assert events[-1] == ("close",)
+    boundary = len(events)
+    run(2, 1, 2, continuous_tail=True)
+    assert events[boundary][0] == "define"
+    first_recv = next(i for i in range(boundary, len(events)) if events[i][0] == "recv_forward")
+    assert events[first_recv - 1] == ("open",)
+    assert records.counter == 5
+
+
+def test_graph_capture_excludes_bootstrap_from_steady_body(schedule_harness):
+    run, events, runtime, records = schedule_harness
+    runtime.prepare_d2h_windows(2, 1, 2, continuous_tail=True)
+    runtime.begin_full_iteration_capture()
+    assert events[-1] == ("open",)
+    assert records.counter == 1
+    start = len(events)
+    run(2, 1, 2, continuous_tail=True)
+    assert [e for e in events[start:] if e[0] in ("open", "close")] == [
+        ("close",), ("open",), ("close",), ("open",),
+    ]
+    runtime.finish_full_iteration_capture()
+    assert records.counter == 5
+
+
+def test_full_graph_wrapper_prepares_underlying_schedule(schedule_harness, monkeypatch):
+    _, events, runtime, _ = schedule_harness
+    monkeypatch.setattr(schedules.parallel_state, "get_pipeline_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(schedules.parallel_state, "get_pipeline_model_parallel_rank", lambda: 1)
+    wrapper = SimpleNamespace(forward_backward_func=schedules.forward_backward_pipelining_without_interleaving)
+    dmi_prepare_d2h_windows(wrapper, 2, continuous_tail=True)
+    assert events[0][0] == "define"
+    assert runtime.continuous_d2h_tail
+
+
+def test_aborted_capture_restores_live_window_state(schedule_harness):
+    _, events, runtime, records = schedule_harness
+    runtime.prepare_d2h_windows(2, 1, 2, continuous_tail=True)
+    runtime.begin_full_iteration_capture()
+    runtime.first_forward_compute_boundary()
+    assert not runtime._d2h_first_forward_open
+    runtime.abort_full_iteration_capture()
+    assert runtime._d2h_first_forward_open
 
 
 def test_multi_module_rejected_with_windows_active(schedule_harness):
@@ -263,6 +349,7 @@ def test_training_loop_prepares_before_first_call_and_retry(schedule_harness, mo
     monkeypatch.setattr(runtime_module, "dmi_begin_attempt", begin_attempt)
     monkeypatch.setattr(runtime_module, "dmi_finish_attempt", lambda status: events.append(("finish_attempt", status)))
     monkeypatch.setattr(training, "get_args", lambda: SimpleNamespace(
+        data_parallel_size=1, tensor_model_parallel_size=1,
         save_dgrads_interval=None, save_wgrads_interval=None,
         reuse_grad_buf_for_mxfp8_param_ag=False,
         seq_length=1, micro_batch_size=1, decoder_seq_length=None,

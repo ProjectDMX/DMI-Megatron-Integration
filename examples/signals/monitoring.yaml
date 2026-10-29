@@ -1,5 +1,7 @@
 # Match --table to the existing capture base table. Use phase-local current
 # iteration records; readiness is checked before the numerical function runs.
+# Pass --dmi-signal-config monitoring.yaml to training to enable grad-norm
+# automatically in the train phase. The CPU worker consumes the same YAML.
 signals:
   - name: gradient_health
     trigger:

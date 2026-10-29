@@ -89,6 +89,7 @@ class MegatronDMIConfig:
     valid_hook_selection: str | None = None
     test_hook_selection: str | None = None
     hook_config_path: str | None = None
+    signal_config_path: str | None = None
     layer_stride: int = 1
     layer_indices: tuple[int, ...] | None = None
     recompute_hook: str | None = None
@@ -288,6 +289,7 @@ def resolve_megatron_dmi_config(
     """Resolve DMI config with explicit > CLI > environment > default precedence."""
 
     environ = os.environ if environ is None else environ
+    signal_config_path = _env_value(args, "dmi_signal_config", environ, "DMI_SIGNAL_CONFIG", None)
     cli_enabled = getattr(args, "dmi_enable", None) if args is not None else None
     env_enabled = _env_bool(environ, "DMI_ENABLE")
     cli_windows = getattr(args, "dmi_recurring_d2h_windows", None)
@@ -314,12 +316,14 @@ def resolve_megatron_dmi_config(
         enabled=bool(cli_enabled if cli_enabled is not None else (env_enabled or False)),
         exact_resume=bool(getattr(args, "dmi_exact_resume", False)),
         hook_selection=str(
-            _env_value(args, "dmi_hook_selection", environ, "DMI_HOOK_SELECTION", "router-summary")
+            _env_value(args, "dmi_hook_selection", environ, "DMI_HOOK_SELECTION",
+                       "none" if signal_config_path else "router-summary")
         ),
         train_hook_selection=getattr(args, "dmi_train_hook_selection", None),
         valid_hook_selection=getattr(args, "dmi_valid_hook_selection", None),
         test_hook_selection=getattr(args, "dmi_test_hook_selection", None),
         hook_config_path=_env_value(args, "dmi_hook_config", environ, "DMI_HOOK_CONFIG", None),
+        signal_config_path=signal_config_path,
         layer_stride=int(getattr(args, "dmi_layer_stride", 1)),
         layer_indices=(tuple(args.dmi_layer_indices)
                        if getattr(args, "dmi_layer_indices", None) is not None else None),
@@ -493,7 +497,19 @@ def resolve_megatron_dmi_config(
             None,
         ),
     )
-    return explicit if explicit is not None else cfg
+    cfg = explicit if explicit is not None else cfg
+    if cfg.signal_config_path:
+        from .signals.capture import load_capture_plan, merge_capture_selections
+        plan = load_capture_plan(cfg.signal_config_path, base_table=cfg.clickhouse_table)
+        selections = merge_capture_selections(
+            plan, cfg.hook_selection, train=cfg.train_hook_selection,
+            valid=cfg.valid_hook_selection, test=cfg.test_hook_selection,
+        )
+        cfg = replace(cfg, enabled=True, hook_selection="none",
+                      train_hook_selection=selections['train'],
+                      valid_hook_selection=selections['valid'],
+                      test_hook_selection=selections['test'])
+    return cfg
 
 
 def _dist_ready(dist_module: Any) -> bool:

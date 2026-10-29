@@ -94,7 +94,11 @@ class MegatronScheduleRuntime:
         self._d2h_windows_enabled = False
         self._d2h_window_debug = False
         self._d2h_window_fallback_entry_threshold = 1
-        self._d2h_window_signature: tuple[int, int, int] | None = None
+        self._d2h_window_signature: tuple[int, int, int, bool] | None = None
+        self._d2h_pending_signature: tuple[int, int, int, bool] | None = None
+        self._d2h_first_forward_open = False
+        self._d2h_restart_pattern = False
+        self._d2h_capture_entry_first_forward_open = False
         self._d2h_window_definition_rejected = False
         self._d2h_window_unsupported_warned = False
         self._attempt_statuses: dict[int, int] = {}
@@ -129,6 +133,8 @@ class MegatronScheduleRuntime:
     def configure_d2h_windows(self, *, enabled: bool, debug: bool = False,
                              fallback_entry_threshold: int = 1) -> None:
         """Configure the recurring-window opt-in at engine startup."""
+        if not enabled:
+            self.interrupt_d2h_tail()
         self._d2h_windows_enabled = bool(enabled)
         self._d2h_window_debug = bool(debug)
         self._d2h_window_fallback_entry_threshold = fallback_entry_threshold
@@ -140,30 +146,81 @@ class MegatronScheduleRuntime:
         return (self._d2h_windows_enabled and self.phase == "train"
                 and self._d2h_window_signature is not None)
 
-    def prepare_d2h_windows(self, pp_size: int, pp_rank: int, num_microbatches: int) -> None:
+    def prepare_d2h_windows(self, pp_size: int, pp_rank: int, num_microbatches: int,
+                            *, continuous_tail: bool = True) -> None:
         """Install a pattern before the schedule, only when its signature changes."""
         if (not self._d2h_windows_enabled or self.phase != "train"
                 or self._d2h_window_definition_rejected):
             return
-        signature = (int(pp_size), int(pp_rank), int(num_microbatches))
-        if signature == self._d2h_window_signature:
+        signature = (int(pp_size), int(pp_rank), int(num_microbatches),
+                     bool(continuous_tail and pp_rank > 0))
+        if signature == self._d2h_window_signature and not self._d2h_restart_pattern:
+            self._d2h_pending_signature = None
             return
-        period, windows = non_interleaved_d2h_window_pattern(*signature)
+        if self._d2h_first_forward_open:
+            # Preserve this occurrence through the next receive. Switch only
+            # after its real CLOSE, immediately before first forward compute.
+            self._d2h_pending_signature = signature
+            return
+        self._install_d2h_pattern(signature, initial_counter=0)
+
+    def _install_d2h_pattern(self, signature, *, initial_counter: int) -> None:
+        period, windows = non_interleaved_d2h_window_pattern(*signature[:3])
         accepted = self.adaptor.record_runtime.define_d2h_window_pattern(
-            period=period, windows=windows, initial_counter=0,
+            period=period, windows=windows, initial_counter=initial_counter,
         )
         if self._d2h_window_debug:
             print(
                 "[DMI] d2h_window define "
                 f"iteration={self.global_batch_id} attempt={self.current_attempt_id} "
                 f"P={signature[0]} r={signature[1]} M={signature[2]} "
-                f"W={len(windows)} period={period} accepted={accepted}",
+                f"W={len(windows)} period={period} accepted={accepted} "
+                f"continuous_tail={signature[3]}",
                 flush=True,
             )
         if accepted:
             self._d2h_window_signature = signature
+            self._d2h_restart_pattern = False
         else:
             self._d2h_window_definition_rejected = True
+
+    @property
+    def continuous_d2h_tail(self) -> bool:
+        return bool(self.d2h_windows_active and self._d2h_window_signature[3])
+
+    def first_forward_receive_boundary(self) -> None:
+        """Bootstrap once; a tail already open keeps its occurrence and grant."""
+        if not self.d2h_windows_active:
+            return
+        if not self.continuous_d2h_tail or not self._d2h_first_forward_open:
+            self.adaptor.record_runtime.advance_boundary()
+            self._d2h_first_forward_open = self.continuous_d2h_tail
+
+    def first_forward_compute_boundary(self) -> None:
+        if not self.d2h_windows_active:
+            return
+        self.adaptor.record_runtime.advance_boundary()
+        self._d2h_first_forward_open = False
+        if self._d2h_pending_signature is not None:
+            signature = self._d2h_pending_signature
+            self._d2h_pending_signature = None
+            self._install_d2h_pattern(signature, initial_counter=2)
+
+    def last_backward_send_boundary(self) -> None:
+        if not self.continuous_d2h_tail:
+            return
+        if self._d2h_first_forward_open:
+            raise RuntimeError("DMI first-forward window is already open")
+        self.adaptor.record_runtime.advance_boundary()
+        self._d2h_first_forward_open = True
+
+    def interrupt_d2h_tail(self) -> None:
+        """End an occurrence when leaving the repeating training schedule."""
+        if self._d2h_first_forward_open:
+            self.adaptor.record_runtime.advance_boundary()
+            self._d2h_first_forward_open = False
+            self._d2h_restart_pattern = True
+        self._d2h_pending_signature = None
 
     def warn_d2h_windows_unsupported(self) -> None:
         if self._d2h_windows_enabled and not self._d2h_window_unsupported_warned:
@@ -488,7 +545,8 @@ class MegatronScheduleRuntime:
             self._measurement_end(completed_iteration)
 
     def begin_iteration(self, active_num_microbatches: int, *, forward_only: bool = False) -> None:
-        del forward_only
+        if forward_only:
+            self.interrupt_d2h_tail()
         if (
             self.phase == "train"
             and self._phase_open
@@ -548,6 +606,7 @@ class MegatronScheduleRuntime:
             self.seal_current_phase()
 
         if self._d2h_windows_enabled and (self.phase == "train") != (phase == "train"):
+            self.interrupt_d2h_tail()
             started = time.perf_counter()
             self.adaptor.record_runtime.set_d2h_window_suspended(phase != "train")
             print(f"[DMI] d2h phase switch rank={self.producer_rank} "
@@ -570,6 +629,7 @@ class MegatronScheduleRuntime:
             return
         if self.record_format is not None and (self.active or self._active_attempt_id is not None):
             raise RuntimeError("Cannot seal a phase with active capture or an unfinished attempt")
+        self.interrupt_d2h_tail()
         self._submit_phase_metadata("exit")
         self._submit_eval_boundary("exit")
         if self.phase in self._next_phase_global_batch_id:
@@ -584,6 +644,10 @@ class MegatronScheduleRuntime:
     ) -> None:
         if self._full_iteration_capture_active:
             raise RuntimeError("Megatron DMI full-iteration capture is already active")
+        # Bootstrap is outside torch.cuda.graph, never repeated by replay.
+        if self.continuous_d2h_tail:
+            self.first_forward_receive_boundary()
+        self._d2h_capture_entry_first_forward_open = self._d2h_first_forward_open
         self._full_iteration_capture_active = True
         if self.record_format is not None:
             self._count_records_before_capture = self.record_format.count_records
@@ -604,6 +668,9 @@ class MegatronScheduleRuntime:
         self._full_iteration_capture_valid_counts = None
 
     def abort_full_iteration_capture(self) -> None:
+        if self._full_iteration_capture_active:
+            # Capture recorded, but did not execute, its boundary kernels.
+            self._d2h_first_forward_open = self._d2h_capture_entry_first_forward_open
         self.finish_full_iteration_capture()
 
     def full_iteration_contexts(
@@ -1339,7 +1406,8 @@ def non_interleaved_d2h_window_pattern(
     return 2 * count, tuple((2 * i + 1, 2 * i + 2) for i in range(count))
 
 
-def dmi_prepare_d2h_windows(forward_backward_func: Any, num_microbatches: int) -> None:
+def dmi_prepare_d2h_windows(forward_backward_func: Any, num_microbatches: int,
+                           *, continuous_tail: bool = True) -> None:
     """Prepare only for Megatron's selected non-interleaved training schedule."""
     runtime = _active_runtime
     if runtime is None or not runtime._d2h_windows_enabled:
@@ -1350,6 +1418,10 @@ def dmi_prepare_d2h_windows(forward_backward_func: Any, num_microbatches: int) -
         forward_backward_pipelining_without_interleaving,
     )
 
+    # FullCudaGraphWrapper retains the original schedule in this attribute.
+    forward_backward_func = getattr(forward_backward_func, "forward_backward_func",
+                                    forward_backward_func)
+
     if forward_backward_func is forward_backward_pipelining_with_interleaving:
         runtime.warn_d2h_windows_unsupported()
         return
@@ -1359,6 +1431,7 @@ def dmi_prepare_d2h_windows(forward_backward_func: Any, num_microbatches: int) -
         parallel_state.get_pipeline_model_parallel_world_size(),
         parallel_state.get_pipeline_model_parallel_rank(),
         num_microbatches,
+        continuous_tail=continuous_tail,
     )
 
 
@@ -1369,6 +1442,26 @@ def dmi_d2h_windows_active() -> bool:
 def dmi_advance_d2h_boundary() -> None:
     if dmi_d2h_windows_active():
         _active_runtime.adaptor.record_runtime.advance_boundary()
+
+
+def dmi_first_forward_receive_boundary() -> None:
+    if _active_runtime is not None:
+        _active_runtime.first_forward_receive_boundary()
+
+
+def dmi_first_forward_compute_boundary() -> None:
+    if _active_runtime is not None:
+        _active_runtime.first_forward_compute_boundary()
+
+
+def dmi_last_backward_send_boundary() -> None:
+    if _active_runtime is not None:
+        _active_runtime.last_backward_send_boundary()
+
+
+def dmi_interrupt_d2h_tail() -> None:
+    if _active_runtime is not None:
+        _active_runtime.interrupt_d2h_tail()
 
 
 def dmi_guard_schedule_supported(config: Any, forward_only: bool) -> None:
@@ -1671,6 +1764,8 @@ def dmi_prepare_full_iteration_replay(
         _active_runtime.record_format.count_records = True
     contexts = _active_runtime.full_iteration_contexts(plan, valid_counts_by_microbatch)
     decision = _active_runtime.adaptor.prepare_full_iteration_replay(plan, contexts)
+    if _active_runtime.continuous_d2h_tail:
+        _active_runtime.first_forward_receive_boundary()
     return decision is StepReservation.OVERSIZED
 
 

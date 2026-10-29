@@ -1,8 +1,53 @@
 # Storage-side Signals
 
-Signals are implemented in `src/dmi_megatron_integration/signals/`. They run on a
-CPU worker. Existing Hook configuration controls capture and preprocessing;
-Signals do not accept hook inputs or run inside the training process.
+Signals are implemented in `src/dmi_megatron_integration/signals/`. Their analysis
+functions run on a CPU worker and consume stored rows. Training can optionally
+read the same YAML to enable the capture hooks needed by those inputs.
+
+## Enable capture from Signal YAML
+
+Add `--dmi-signal-config monitoring.yaml` to an existing Megatron training command,
+or set `DMI_SIGNAL_CONFIG=monitoring.yaml`. This enables DMI and resolves capture
+requirements before the model's hooks and CUDA graphs are installed. Training
+parameters (model, batches, data, distributed layout, checkpoints) remain in the
+existing training configuration. The CPU analysis worker is started separately
+with the same YAML as described below.
+
+For example, [`monitoring.yaml`](../examples/signals/monitoring.yaml) requests
+`grad_norm` from the scalar table in training iterations. It enables `grad-norm`
+for training and no payload hooks for validation/test; it does not implicitly
+enable the usual `router-summary` default. Preview without starting training:
+
+```bash
+python -m dmi_megatron_integration.signals.capture examples/signals/monitoring.yaml
+```
+
+The resolver follows each root's inputs through recursively referenced
+`on_demand` Signals, including joins, and unions the required hooks by phase.
+Unused helpers are ignored. In the configured capture table and its
+`_scalar_float`/`_scalar_int` tables, declare `where.act_name` as a literal name,
+`{eq: name}`, or `{in: [name, ...]}`. For multiple capture sources in a join,
+qualify each predicate with its source alias, such as `r.act_name`. Unknown
+observations and ambiguous capture inputs fail before training. Other physical
+tables are treated as external, derived, or runtime metadata inputs; the resolver
+does not infer their producers. `--dmi-clickhouse-table` (or
+`DMI_CLICKHOUSE_TABLE`) must match the YAML's capture base table. The preview
+accepts the equivalent `--table` option.
+
+Inputs scoped to the current event inherit its phase; an explicit `scope.phase`
+can narrow it. Historical/unscoped inputs conservatively require all phases
+unless their own scope specifies a phase. Consumer filters are not pushed through
+helper functions. Analysis cadence, iteration cutoffs, and layer filters remain
+query settings; they do not silently reduce capture. Hooks retain their existing
+firing sites and model/distributed compatibility requirements.
+
+Explicit common/phase hook selections are resolved with their usual override
+rules, then unioned with the YAML requirements. `none` adds nothing; it cannot
+disable a required YAML hook. Sampling and preprocessing settings remain explicit
+in `--dmi-hook-config`; existing topology and capture-layer settings still apply.
+Keep those settings consistent with the analysis's input requirements. Capture
+planning validates transform references but does not import or execute user
+functions; the worker resolves them when it starts.
 
 ## Run the worker
 
